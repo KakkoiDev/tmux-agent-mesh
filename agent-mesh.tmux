@@ -45,7 +45,17 @@ if [[ -f "$CURRENT_DIR/pi-extension/index.ts" ]]; then
     _link_if_stale "$CURRENT_DIR/pi-extension" "$HOME/.pi/agent/extensions/tmux-agent-mesh"
 fi
 
-# Initialize the status option so #{@agent-mesh-status} is never unset.
+# Initialize the status option so #{@agent-mesh-status} is never unset, then
+# populate it from the current mailbox.
 # Placement in status-right is left to the user: tmux-agent-tracker already
-# rewrites that string, and two plugins editing it is a clobber.
+# rewrites that string, and two plugins editing it is a clobber. Opt in with
+# ./install.sh --status-bar.
 tmux set -gq @agent-mesh-status ""
+"$SCRIPTS_DIR/mesh.sh" refresh >/dev/null 2>&1 || true
+
+# prefix + m: roster with pending counts, jump to a pane.
+tmux bind-key "${KEYBINDING:-m}" run-shell "$SCRIPTS_DIR/mesh.sh menu"
+
+# Reap agents whose pane died. session_shutdown does not fire when a pane is
+# killed, so for every harness this is the only cleanup path.
+tmux set-hook -g pane-died "run-shell -b '$SCRIPTS_DIR/mesh.sh cleanup'"
