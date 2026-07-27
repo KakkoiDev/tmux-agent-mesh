@@ -60,6 +60,11 @@ source_mesh_functions() {
         /^case "\$\{1:-\}"/, /^esac$/ { next }
         { print }
     ' "$SCRIPTS_DIR/mesh.sh")"
+
+    # mesh.sh derives SCRIPTS_DIR from BASH_SOURCE, which under eval points at
+    # the .bats file. Left clobbered it breaks a second source_mesh_functions
+    # call and anything reading $SCRIPTS_DIR/mesh.sh (cmd_menu).
+    SCRIPTS_DIR="$PROJECT_ROOT/scripts"
 }
 
 # ── fixtures ─────────────────────────────────────────────────────────

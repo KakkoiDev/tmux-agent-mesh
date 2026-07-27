@@ -204,7 +204,26 @@ _mock_tmux_pane() {
     TMUX_PANE=%99
     run cmd_name reviewer
     [[ "$status" -ne 0 ]]
-    [[ "$output" == *"cannot identify this session"* ]]
+    [[ "$output" == *"no agent registered for pane"* ]]
+}
+
+@test "alias labels an agent other than the caller" {
+    insert_agent s1 claude "" %42
+    run cmd_alias %42 scout
+    [[ "$status" -eq 0 ]]
+    [[ "$(get_alias s1)" == "scout" ]]
+}
+
+@test "alias fails on an unknown ref" {
+    run cmd_alias nosuch scout
+    [[ "$status" -ne 0 ]]
+}
+
+@test "alias exits 2 on an ambiguous ref" {
+    insert_agent abc111 claude
+    insert_agent abc222 claude
+    run cmd_alias abc scout
+    [[ "$status" -eq 2 ]]
 }
 
 @test "name rejects the reserved human alias" {
