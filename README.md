@@ -218,6 +218,31 @@ For Pi, run `pi` in a pane, let it go fully idle, then send to it. It must start
 a turn on its own with `delivered_via = 'pi-push'`. This is the case the other
 three harnesses cannot do.
 
+## Verification status
+
+What has actually been run, as opposed to written against documentation.
+
+| Harness | Hooks fire | Delivery claimed | Continuation observed |
+|---|---|---|---|
+| Claude Code | yes | yes, `claude:turn-end` | **yes**, agent produced an unprompted second response |
+| Pi | yes (interactive only) | yes, `pi:push` | **yes**, woke from fully idle with no keystrokes |
+| Gemini CLI | yes, payload matches docs incl. `stop_hook_active` | yes, `gemini:turn-end` | **no**: Gemini crashed on an unrelated model-routing error mid-test |
+| Codex | **no** | not reached | not reached |
+
+Also verified with real agents: mesh and `tmux-agent-tracker` coexist on the same
+`Stop` event (mesh blocked and tracker still recorded the session), and an agent
+discovered and used the CLI from the injected context alone, without being told
+the command.
+
+**Codex is unverified.** The shipped binary contains `hooks.json`, `SessionStart`
+and `stop_hook_active`, so support exists, but a project-level
+`.codex/hooks.json` never fired on codex-cli 0.144.3 across every permutation
+tried: with and without `--dangerously-bypass-hook-trust`, with
+`features.hooks=true` via both `-c` and `config.toml`, in a non-git directory.
+Project hooks appear to require a *trusted repo*, which is granted interactively.
+The Codex adapter is written and unit-tested against the documented payload, but
+treat it as untested until someone confirms it against a trusted repo.
+
 ## Known limitations
 
 - **Idle Claude Code, Codex and Gemini agents do not wake.** Mail waits for the
