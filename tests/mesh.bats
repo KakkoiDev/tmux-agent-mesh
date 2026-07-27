@@ -110,6 +110,57 @@ teardown() {
     agent_exists b
 }
 
+# Format-aware tmux mock. Real tmux resolves each #{...} independently, so a
+# dead pane yields empty fields rather than an error: asking for
+# '#{session_name}:#{window_index}.#{pane_index}' returns the literal ":.".
+# The mock must reproduce that per-format, otherwise these tests pass against
+# the very bug they exist to catch.
+_mock_tmux_pane() {
+    local live_pane="$1"
+    eval '
+    tmux() {
+        local fmt="${!#}" requested=""
+        case "$*" in
+            *display-message*) ;;
+            *) return 1 ;;
+        esac
+        # -t <target> is the argument before the format
+        requested=$(printf "%s\n" "$@" | grep -m1 "^%" || true)
+        if [[ "$requested" == "'"$live_pane"'" ]]; then
+            fmt="${fmt//\#\{pane_id\}/$requested}"
+            fmt="${fmt//\#\{session_name\}/work}"
+            fmt="${fmt//\#\{window_index\}/2}"
+            fmt="${fmt//\#\{pane_index\}/1}"
+        else
+            fmt="${fmt//\#\{pane_id\}/}"
+            fmt="${fmt//\#\{session_name\}/}"
+            fmt="${fmt//\#\{window_index\}/}"
+            fmt="${fmt//\#\{pane_index\}/}"
+        fi
+        printf "%s\n" "$fmt"
+    }'
+}
+
+@test "register stores no target for a pane tmux does not know" {
+    _mock_tmux_pane %7
+    cmd_register --session s1 --harness claude --pane %99
+    [[ "$(msql "SELECT COALESCE(tmux_target,'') FROM agents WHERE session_id='s1';")" == "" ]]
+}
+
+@test "register stores the target when tmux confirms the pane" {
+    _mock_tmux_pane %7
+    cmd_register --session s1 --harness claude --pane %7
+    [[ "$(msql "SELECT tmux_target FROM agents WHERE session_id='s1';")" == "work:2.1" ]]
+}
+
+@test "the degenerate target ':.' resolves to nothing" {
+    _mock_tmux_pane %7
+    cmd_register --session s1 --harness claude --pane %98
+    cmd_register --session s2 --harness claude --pane %99
+    run _resolve_ref ":."
+    [[ "$status" -eq 1 ]]
+}
+
 @test "register applies an alias when given" {
     cmd_register --session s1 --harness claude --alias reviewer
     [[ "$(get_alias s1)" == "reviewer" ]]

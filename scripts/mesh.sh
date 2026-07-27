@@ -245,9 +245,15 @@ cmd_register() {
         *) _die "register: unknown harness '$harness'" ;;
     esac
 
-    local target=""
+    # tmux answers display-message for a dead pane with empty fields, yielding
+    # the degenerate target ":.". Storing that makes ":." a live address that
+    # resolves to an arbitrary agent, so echo pane_id back and only trust the
+    # target when it identifies the pane we asked about.
+    local target="" info=""
     if [[ -n "$pane" ]]; then
-        target=$(tmux display-message -p -t "$pane" '#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null || true)
+        info=$(tmux display-message -p -t "$pane" \
+            '#{pane_id}|#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null || true)
+        [[ "${info%%|*}" == "$pane" ]] && target="${info#*|}"
     fi
     [[ -n "$cwd" ]] || cwd="$PWD"
     local project
