@@ -6,10 +6,18 @@ set -euo pipefail
 SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPTS_DIR/helpers.sh"
 
+# Every override is MESH_-prefixed on purpose. tmux-agent-tracker reads a bare
+# $DB, so an unprefixed name here points tracker at mesh.db and its hooks die
+# with "no such table: sessions". Namespaced names cannot collide.
 MESH_DIR="${MESH_DIR:-$HOME/.tmux-agent-mesh}"
-DB="${DB:-$MESH_DIR/mesh.db}"
-NOTIFY_DIR="${NOTIFY_DIR:-$MESH_DIR/notify}"
-DELIVERY_LOG="${DELIVERY_LOG:-$MESH_DIR/delivery.log}"
+MESH_DB="${MESH_DB:-$MESH_DIR/mesh.db}"
+MESH_NOTIFY_DIR="${MESH_NOTIFY_DIR:-$MESH_DIR/notify}"
+MESH_DELIVERY_LOG="${MESH_DELIVERY_LOG:-$MESH_DIR/delivery.log}"
+
+# Internal short names, never read from the environment.
+DB="$MESH_DB"
+NOTIFY_DIR="$MESH_NOTIFY_DIR"
+DELIVERY_LOG="$MESH_DELIVERY_LOG"
 
 # Reserved session_id for the human participant.
 HUMAN_ID="human"
@@ -712,8 +720,11 @@ _update_status() {
     n=$(sql "SELECT COUNT(*) FROM messages WHERE delivered_at IS NULL;" 2>/dev/null || echo 0)
     [[ "${n:-0}" -gt 0 ]] && s="${ICON_MAIL:-@}${n}"
     tmux set -gq @agent-mesh-status "$s" 2>/dev/null || true
-    printf '%s' "$s" > "$MESH_DIR/status_cache.tmp" 2>/dev/null \
-        && mv -f "$MESH_DIR/status_cache.tmp" "$MESH_DIR/status_cache" 2>/dev/null || true
+    # A failed redirect writes to stderr, and harnesses surface hook stderr to
+    # the user. Status caching is cosmetic, so it must stay silent.
+    { printf '%s' "$s" > "$MESH_DIR/status_cache.tmp" \
+        && mv -f "$MESH_DIR/status_cache.tmp" "$MESH_DIR/status_cache"; } 2>/dev/null || true
+    return 0
 }
 
 _fire_mail_hook() {
@@ -914,6 +925,78 @@ _hook_turn_end() {
     [[ -n "$text" ]] || return 0
     _bump_streak "$sid"
     _emit_continuation "$harness" "$text" || true
+    return 0
+}
+
+# Pi has no turn-end continuation, so its extension drives delivery from an
+# fs watcher instead. Policy still lives here rather than in TypeScript, so
+# one bats suite covers every harness.
+#
+#   push          the watcher woke us; this forces a turn, so it burns budget
+#   before-start  a user prompt is starting; free, and it resets the budget
+cmd_pi_deliver() {
+    _need_jq
+    local sid="" mode="push"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --session) sid="${2:-}"; shift ;;
+            --mode)    mode="${2:-push}"; shift ;;
+            *) _die "pi-deliver: unknown flag '$1'" ;;
+        esac
+        shift
+    done
+    [[ -n "$sid" ]] || _die "pi-deliver: --session is required"
+    _mesh_enabled || return 0
+    [[ "${PI_DELIVERY:-push}" == "off" ]] && return 0
+
+    case "$mode" in
+        before-start)
+            # Deliberately does NOT reset the streak. before_agent_start fires
+            # on every turn including the ones mesh itself triggers via
+            # sendUserMessage, so resetting here would clear the budget after
+            # each push and it could never fire. Only real typing resets it,
+            # via `reset-streak` from pi.on("input").
+            cmd_drain --session "$sid" --via pi-before-start
+            ;;
+        push)
+            # Only the watcher path can wake an idle agent, so only it needs a
+            # budget. In before-start mode the watcher stays silent.
+            [[ "${PI_DELIVERY:-push}" == "push" ]] || return 0
+            local streak
+            streak=$(_block_streak "$sid")
+            [[ "$streak" -ge "${MAX_BLOCKS:-3}" ]] && return 0
+            local pending
+            pending=$(sql "SELECT COUNT(*) FROM messages WHERE to_session='$(sql_esc "$sid")' AND delivered_at IS NULL;")
+            [[ "${pending:-0}" -eq 0 ]] && return 0
+            local text
+            text=$(cmd_drain --session "$sid" --via pi-push)
+            [[ -n "$text" ]] || return 0
+            _bump_streak "$sid"
+            printf '%s' "$text"
+            ;;
+        *) _die "pi-deliver: unknown mode '$mode'" ;;
+    esac
+    return 0
+}
+
+# Clears the continuation budget. Called when a human actually types.
+#
+# The other three harnesses do not need this. Claude Code does not re-fire
+# UserPromptSubmit for a Stop-block continuation, so its budget accumulates
+# correctly. Codex and Gemini do re-prompt themselves, but both report
+# stop_hook_active, which _hook_turn_end honours as a stronger guard. Pi has
+# neither, so its extension has to say when input was human.
+cmd_reset_streak() {
+    local sid=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --session) sid="${2:-}"; shift ;;
+            *) _die "reset-streak: unknown flag '$1'" ;;
+        esac
+        shift
+    done
+    [[ -n "$sid" ]] || sid=$(_self_session "")
+    _reset_streak "$sid"
     return 0
 }
 
@@ -1365,6 +1448,8 @@ case "${1:-}" in
     reply)          shift; cmd_reply "$@" ;;
     inbox)          shift; cmd_inbox "$@" ;;
     drain)          shift; cmd_drain "$@" ;;
+    pi-deliver)     shift; cmd_pi_deliver "$@" ;;
+    reset-streak)   shift; cmd_reset_streak "$@" ;;
     recv)           shift; cmd_recv "$@" ;;
     watch)          shift; cmd_watch "$@" ;;
     dispatch)       shift; cmd_dispatch "$@" ;;
@@ -1374,7 +1459,15 @@ case "${1:-}" in
     status-bar)     shift; cmd_status_bar "$@" ;;
     refresh)        shift; cmd_refresh "$@" ;;
     cleanup)        shift; cmd_cleanup "$@" ;;
-    hook)           shift; cmd_hook "$@" ;;
+    # A harness hook must never fail the agent's turn. An unreadable or corrupt
+    # database, a missing dependency, or a bug in here costs the user their
+    # messages; it must not cost them their session. Claude Code also reads a
+    # non-zero hook exit as an error worth showing, so swallow and log instead.
+    hook)
+        shift
+        cmd_hook "$@" || _debug_log "hook failed, suppressed to protect the turn"
+        exit 0
+        ;;
     doctor)         shift; cmd_doctor "$@" ;;
     selftest)       shift; cmd_selftest "$@" ;;
     ""|-h|--help)

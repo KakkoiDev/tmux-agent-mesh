@@ -7,10 +7,16 @@ MESH_BIN="$SCRIPTS_DIR/mesh.sh"
 
 setup_test_env() {
     TEST_TMPDIR=$(mktemp -d)
+    # MESH_-prefixed on purpose: a bare DB would also be read by
+    # tmux-agent-tracker. See the note at the top of mesh.sh.
     export MESH_DIR="$TEST_TMPDIR"
-    export DB="$MESH_DIR/mesh.db"
-    export NOTIFY_DIR="$MESH_DIR/notify"
-    export DELIVERY_LOG="$MESH_DIR/delivery.log"
+    export MESH_DB="$MESH_DIR/mesh.db"
+    export MESH_NOTIFY_DIR="$MESH_DIR/notify"
+    export MESH_DELIVERY_LOG="$MESH_DIR/delivery.log"
+    # Short aliases for test assertions only, never read by mesh.sh.
+    export DB="$MESH_DB"
+    export NOTIFY_DIR="$MESH_NOTIFY_DIR"
+    export DELIVERY_LOG="$MESH_DELIVERY_LOG"
     export TMUX_PANE=""
 
     # Config defaults, normally sourced from the tmux option cache
