@@ -319,7 +319,7 @@ body_of()     { msql "SELECT body FROM messages WHERE id=$1;"; }
 @test "drain stamps delivered_at and the mode" {
     cmd_send --from A --to bravo --message "x"
     cmd_drain --session B --via stop-block >/dev/null
-    [[ "$(msql "SELECT delivered_via FROM messages WHERE id=1;")" == "stop-block" ]]
+    [[ "$(msql "SELECT delivered_via FROM messages WHERE id=1;")" == "claude:turn-end" ]]
     [[ "$(msql "SELECT delivered_at IS NOT NULL FROM messages WHERE id=1;")" == "1" ]]
 }
 
@@ -335,6 +335,27 @@ body_of()     { msql "SELECT body FROM messages WHERE id=$1;"; }
     cmd_drain --session B --via stop-block >/dev/null
     [[ "$(wc -l < "$DELIVERY_LOG" | tr -d ' ')" == "1" ]]
     jq -e '.to == "B" and .via == "stop-block"' < "$DELIVERY_LOG"
+}
+
+# The audit log is forensic: when a message goes missing you need to know which
+# harness delivered it and by which mechanism. A hardcoded "stop-block" labelled
+# a Gemini AfterAgent delivery with a Claude/Codex concept. Observed live.
+@test "delivered_via names the harness and the mechanism" {
+    cmd_send --from A --to bravo --message "x" >/dev/null
+    _hook_turn_end claude B '{}' >/dev/null
+    [[ "$(msql "SELECT delivered_via FROM messages WHERE id=1;")" == "claude:turn-end" ]]
+}
+
+@test "delivered_via distinguishes gemini from claude" {
+    cmd_send --from A --to bravo --message "x" >/dev/null
+    _hook_turn_end gemini B '{}' >/dev/null
+    [[ "$(msql "SELECT delivered_via FROM messages WHERE id=1;")" == "gemini:turn-end" ]]
+}
+
+@test "delivered_via distinguishes the prompt path from the turn-end path" {
+    cmd_send --from A --to bravo --message "x" >/dev/null
+    _hook_prompt codex B >/dev/null
+    [[ "$(msql "SELECT delivered_via FROM messages WHERE id=1;")" == "codex:prompt" ]]
 }
 
 @test "drain emits nothing when the mesh is disabled" {
@@ -490,7 +511,7 @@ body_of()     { msql "SELECT body FROM messages WHERE id=$1;"; }
     cmd_send --from A --to bravo --message "queued earlier"
     run _hook_prompt claude B
     echo "$output" | jq -e '.hookSpecificOutput.additionalContext | contains("queued earlier")'
-    [[ "$(msql "SELECT delivered_via FROM messages WHERE id=1;")" == "next-prompt" ]]
+    [[ "$(msql "SELECT delivered_via FROM messages WHERE id=1;")" == "claude:prompt" ]]
 }
 
 @test "prompt hook resets the block streak" {

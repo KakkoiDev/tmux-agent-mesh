@@ -235,6 +235,6 @@ state, mesh rows are messages, so dropping them needs the explicit `--reset`.
 bats tests/
 ```
 
-224 tests. Bats cannot watch a harness parse hook output, so each delivery path
+227 tests. Bats cannot watch a harness parse hook output, so each delivery path
 also has a real two-pane manual test recorded in the README. Three of the bugs
 found so far were invisible to bats and only appeared when a real agent ran.

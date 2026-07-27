@@ -30,7 +30,7 @@ pending_for() { msql "SELECT COUNT(*) FROM messages WHERE to_session='$1' AND de
 @test "pi-deliver push stamps the pi-push mode" {
     cmd_send --from A --to pusher --message "x"
     cmd_pi_deliver --session P --mode push >/dev/null
-    [[ "$(msql "SELECT delivered_via FROM messages WHERE id=1;")" == "pi-push" ]]
+    [[ "$(msql "SELECT delivered_via FROM messages WHERE id=1;")" == "pi:push" ]]
 }
 
 @test "pi-deliver push emits nothing with an empty mailbox" {
@@ -89,7 +89,7 @@ pending_for() { msql "SELECT COUNT(*) FROM messages WHERE to_session='$1' AND de
 @test "pi-deliver before-start stamps its own mode" {
     cmd_send --from A --to pusher --message "x"
     cmd_pi_deliver --session P --mode before-start >/dev/null
-    [[ "$(msql "SELECT delivered_via FROM messages WHERE id=1;")" == "pi-before-start" ]]
+    [[ "$(msql "SELECT delivered_via FROM messages WHERE id=1;")" == "pi:before-start" ]]
 }
 
 # Regression: before_agent_start also fires for the turns mesh itself triggers

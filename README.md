@@ -192,7 +192,7 @@ tmux-agent-tracker, and setting it would point tracker at the wrong database.
 bats tests/
 ```
 
-224 tests across five suites. Bats cannot watch a harness parse hook output, so
+227 tests across five suites. Bats cannot watch a harness parse hook output, so
 each delivery path also has a real two-pane manual test.
 
 ### Two-pane manual test

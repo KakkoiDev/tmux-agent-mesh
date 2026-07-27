@@ -889,7 +889,7 @@ _hook_prompt() {
     command -v jq >/dev/null 2>&1 || return 0
 
     local text
-    text=$(cmd_drain --session "$sid" --via next-prompt)
+    text=$(cmd_drain --session "$sid" --via "$harness:prompt")
     [[ -n "$text" ]] || return 0
     _emit_prompt_context "$harness" "$text" || true
     return 0
@@ -921,7 +921,7 @@ _hook_turn_end() {
     fi
 
     local text
-    text=$(cmd_drain --session "$sid" --via stop-block)
+    text=$(cmd_drain --session "$sid" --via "$harness:turn-end")
     [[ -n "$text" ]] || return 0
     _bump_streak "$sid"
     _emit_continuation "$harness" "$text" || true
@@ -956,7 +956,7 @@ cmd_pi_deliver() {
             # sendUserMessage, so resetting here would clear the budget after
             # each push and it could never fire. Only real typing resets it,
             # via `reset-streak` from pi.on("input").
-            cmd_drain --session "$sid" --via pi-before-start
+            cmd_drain --session "$sid" --via pi:before-start
             ;;
         push)
             # Only the watcher path can wake an idle agent, so only it needs a
@@ -969,7 +969,7 @@ cmd_pi_deliver() {
             pending=$(sql "SELECT COUNT(*) FROM messages WHERE to_session='$(sql_esc "$sid")' AND delivered_at IS NULL;")
             [[ "${pending:-0}" -eq 0 ]] && return 0
             local text
-            text=$(cmd_drain --session "$sid" --via pi-push)
+            text=$(cmd_drain --session "$sid" --via pi:push)
             [[ -n "$text" ]] || return 0
             _bump_streak "$sid"
             printf '%s' "$text"
