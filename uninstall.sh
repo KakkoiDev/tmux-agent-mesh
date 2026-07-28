@@ -4,7 +4,6 @@ set -euo pipefail
 # Reverses install.sh. Leaves the database alone unless --purge is given:
 # undelivered mail is data, not an install artifact.
 
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_LINK="$HOME/.local/bin/tmux-agent-mesh"
 MESH_DIR="${MESH_DIR:-$HOME/.tmux-agent-mesh}"
 PI_EXT_DIR="$HOME/.pi/agent/extensions/tmux-agent-mesh"

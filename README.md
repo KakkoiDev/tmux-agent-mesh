@@ -299,8 +299,8 @@ tmux-agent-mesh roster
 ```
 NAME           HARNESS  PROJECT            STATE    PUSH  PENDING  PANE
 human          human    -                  -        no    1        -
-reviewer       claude   meetsone           working  no    0        work:2.1
-builder        pi       izumo-io           idle     yes   1        work:2.2
+reviewer       claude   web-app            working  no    0        work:2.1
+builder        pi       api-service        idle     yes   1        work:2.2
 ```
 
 ```bash

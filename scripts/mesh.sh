@@ -504,7 +504,8 @@ cmd_send() {
     esac
 
     if [[ -n "$remote" ]]; then
-        local rargs="send --to $(printf '%q' "$to") --message $(printf '%q' "$body")"
+        local rargs
+        rargs="send --to $(printf '%q' "$to") --message $(printf '%q' "$body")"
         [[ "$expect" -eq 1 ]] && rargs="$rargs --expect-reply"
         [[ -n "$thread" ]] && rargs="$rargs --thread $(printf '%q' "$thread")"
         exec ssh "$remote" "tmux-agent-mesh $rargs"
@@ -543,7 +544,8 @@ cmd_broadcast() {
     local sender
     sender=$(_self_session "$from")
 
-    local where="harness<>'human' AND session_id<>'$(sql_esc "$sender")'"
+    local where
+    where="harness<>'human' AND session_id<>'$(sql_esc "$sender")'"
     [[ -n "$project" ]] && where="$where AND project_name='$(sql_esc "$project")'"
     [[ -n "$harness" ]] && where="$where AND harness='$(sql_esc "$harness")'"
 
@@ -1176,7 +1178,8 @@ cmd_recv() {
     [[ -n "$thread" ]] || _die "recv: --thread is required"
     [[ -n "$sid" ]] || sid=$(_self_session "")
 
-    local q="SELECT m.id, COALESCE(a.alias, m.from_session), m.body
+    local q
+    q="SELECT m.id, COALESCE(a.alias, m.from_session), m.body
              FROM messages m LEFT JOIN agents a ON a.session_id=m.from_session
              WHERE m.thread_id='$(sql_esc "$thread")' AND m.to_session='$(sql_esc "$sid")'
              ORDER BY m.id"

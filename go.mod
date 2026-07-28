@@ -1,4 +1,4 @@
-module github.com/cyril/tmux-agent-mesh
+module github.com/KakkoiDev/tmux-agent-mesh
 
 go 1.25.0
 

@@ -6,6 +6,8 @@
 if [[ -z "${AGENT_MESH_PLUGIN_DIR:-}" ]]; then
     AGENT_MESH_PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 fi
+# Read by mesh.sh and agent-mesh.tmux, which source this file.
+# shellcheck disable=SC2034
 SCRIPTS_DIR="$AGENT_MESH_PLUGIN_DIR/scripts"
 
 # ── platform helpers ──────────────────────────────────────────────────

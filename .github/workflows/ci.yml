@@ -1,0 +1,45 @@
+name: CI
+on:
+  push:
+  pull_request:
+
+jobs:
+  bats:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install bats, shellcheck, sqlite3, tmux
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bats shellcheck sqlite3 tmux jq
+      - name: shellcheck
+        run: |
+          shellcheck -S warning scripts/mesh.sh scripts/helpers.sh \
+            install.sh uninstall.sh agent-mesh.tmux bin/tmux-agent-mesh
+      - name: bats
+        run: bats tests/
+
+  # The suite runs under bash 3.2 on macOS, which is the oldest supported shell
+  # and the one where a bare [[ ]] assertion silently passes. Both platforms run,
+  # because a green Linux run says nothing about the shell most contributors have.
+  bats-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install bats
+        run: brew install bats-core
+      - name: bash version under test
+        run: /bin/bash --version | head -1
+      - name: bats
+        run: bats tests/
+
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+      - run: go vet ./...
+      - run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - run: go test ./...
