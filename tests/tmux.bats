@@ -80,3 +80,57 @@ hooks_for() { tmux show-hooks -g "$1" 2>/dev/null || true; }
     run bash -c "tmux show-options -gqv @agent-mesh-status"
     assert_ok
 }
+
+# ── doctor ───────────────────────────────────────────────────────────
+#
+# doctor is what a user runs to decide whether to believe mesh works, so its
+# coverage matters more than average. It used to check dependencies and hook
+# wiring and nothing else: not the PATH the hooks depend on, not the tmux state
+# that proves the plugin loaded, not the config cache whose corruption kills
+# every hook at once.
+
+doctor_in_fake_home() { HOME="$FAKE_HOME" "$MESH_BIN" doctor; }
+
+@test "doctor fails when the database is missing" {
+    rm -f "$DB"
+    run doctor_in_fake_home
+    assert_fail
+    assert_contains "$output" "FAIL  database exists"
+}
+
+# Wiring is opt-in, so "not wired" is a choice. A missing codex hooks.json used
+# to be a hard failure while a missing claude settings.json was a skip.
+@test "doctor treats an unwired harness as a choice, not a failure" {
+    printf '#!/bin/sh\nexit 0\n' > "$TEST_TMPDIR/bin/codex"
+    chmod +x "$TEST_TMPDIR/bin/codex"
+    run doctor_in_fake_home
+    assert_contains "$output" "info  codex not wired"
+    refute_contains "$output" "FAIL  codex"
+}
+
+# Half-wired is the only genuinely broken harness state, and the only one
+# nobody notices.
+@test "doctor fails a half-wired harness" {
+    printf '#!/bin/sh\nexit 0\n' > "$TEST_TMPDIR/bin/codex"
+    chmod +x "$TEST_TMPDIR/bin/codex"
+    mkdir -p "$FAKE_HOME/.codex"
+    jq -n '{hooks:{Stop:[{matcher:"",hooks:[{type:"command",command:"tmux-agent-mesh hook Stop --harness codex"}]}]}}' \
+        > "$FAKE_HOME/.codex/hooks.json"
+    run doctor_in_fake_home
+    assert_fail
+    assert_contains "$output" "codex half-wired: 1 of 4"
+}
+
+@test "doctor sees the tmux state the plugin creates" {
+    run_plugin
+    run doctor_in_fake_home
+    assert_contains "$output" "ok    cleanup registered on pane-died"
+    assert_contains "$output" "ok    menu key bound"
+    assert_contains "$output" "ok    symlink points at this checkout"
+}
+
+@test "doctor reports the tmux state as missing before the plugin loads" {
+    run doctor_in_fake_home
+    assert_contains "$output" "FAIL  cleanup registered on pane-died"
+    assert_contains "$output" "FAIL  menu key bound"
+}

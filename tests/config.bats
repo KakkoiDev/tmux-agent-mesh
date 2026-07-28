@@ -130,6 +130,26 @@ EOF
     assert_contains "$output" "survives the cache"
 }
 
+# A cache that will not parse must not be able to take the whole tool down,
+# including the command you would run to find out what is wrong.
+@test "an unparseable cache is rebuilt rather than sourced" {
+    printf "ICON_MAIL='unterminated\n" > "$MESH_DIR/config_cache"
+    fake_tmux
+    PATH="$TEST_TMPDIR/bin:$PATH" run "$MESH_BIN" send --from A --to human --message x
+    assert_ok
+    assert_eq "$(count_messages)" "1"
+    run bash -n "$MESH_DIR/config_cache"
+    assert_ok
+}
+
+@test "an unparseable cache does not take doctor down with it" {
+    printf "ICON_MAIL='unterminated\n" > "$MESH_DIR/config_cache"
+    fake_tmux
+    PATH="$TEST_TMPDIR/bin:$PATH" run "$MESH_BIN" doctor
+    assert_contains "$output" "dependencies"
+    assert_contains "$output" "harnesses"
+}
+
 @test "refresh rebuilds a stale cache instead of reusing it" {
     plant_config "ENABLED='off'"
     fake_tmux

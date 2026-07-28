@@ -212,7 +212,9 @@ fi
 
 if [[ "$DO_STATUS" -eq 1 ]]; then
     say ""
-    if command -v tmux >/dev/null 2>&1 && tmux info >/dev/null 2>&1; then
+    # list-sessions, not `tmux info`: info exits non-zero with "no current
+    # client" when a server is running but nothing is attached.
+    if command -v tmux >/dev/null 2>&1 && tmux list-sessions >/dev/null 2>&1; then
         cur=$(tmux show-option -gqv status-right 2>/dev/null || true)
         case "$cur" in
             *"@agent-mesh-status"*) say "status-bar: already present" ;;

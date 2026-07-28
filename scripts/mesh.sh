@@ -1364,84 +1364,152 @@ _probe() {
     fi
 }
 
+# Same, but shows why. A report that says only FAIL is not a diagnostic.
+_probe_why() {
+    local label="$1"; shift
+    local err
+    if err=$("$@" 2>&1 >/dev/null); then
+        printf 'ok    %s\n' "$label"
+    else
+        printf 'FAIL  %s\n' "$label"
+        [[ -n "$err" ]] && printf '      %s\n' "$(printf '%s' "$err" | head -1)"
+        _DOCTOR_FAIL=1
+    fi
+}
+
 _human_seeded() {
     local n
     n=$(sql "SELECT COUNT(*) FROM agents WHERE session_id='$HUMAN_ID';" 2>/dev/null) || return 1
     [[ "${n:-0}" -eq 1 ]]
 }
 
-_claude_hook_wired() {
-    jq -e --arg e "$1" \
-        '(.hooks[$e] // []) | map(.hooks[]? | select(.command | test("tmux-agent-mesh"))) | length > 0' \
-        "$HOME/.claude/settings.json"
+_schema_complete() {
+    local n
+    n=$(sql "SELECT COUNT(*) FROM sqlite_master WHERE type='table'
+             AND name IN ('agents','messages','threads','dispatches');" 2>/dev/null) || return 1
+    [[ "${n:-0}" -eq 4 ]]
 }
 
-_gemini_hook_wired() {
-    jq -e --arg e "$1" \
-        '(.hooks[$e] // []) | map(.hooks[]? | select(.command | test("tmux-agent-mesh"))) | length > 0' \
-        "$HOME/.gemini/settings.json"
+_db_wal()       { [[ "$(sql 'PRAGMA journal_mode;' 2>/dev/null)" == "wal" ]]; }
+_db_intact()    { [[ "$(sql 'PRAGMA integrity_check;' 2>/dev/null)" == "ok" ]]; }
+
+# Hook commands are wired as the bare string `tmux-agent-mesh hook ...`, and a
+# harness hook runs under a non-interactive shell. A pass under one shell and a
+# fail under the other is exactly the shape of "wired, and nothing happens".
+_on_path_sh()   { sh -c 'command -v tmux-agent-mesh' >/dev/null 2>&1; }
+_on_path_login(){ bash -lc 'command -v tmux-agent-mesh' >/dev/null 2>&1; }
+
+# Two clones of this repo can each own the symlink, and the loser then runs the
+# other one's code with no sign that anything is wrong.
+_cli_points_here() {
+    local link="$HOME/.local/bin/tmux-agent-mesh"
+    [[ -L "$link" ]] || return 1
+    [[ "$(readlink "$link")" == "$AGENT_MESH_PLUGIN_DIR/bin/tmux-agent-mesh" ]]
 }
 
-_codex_hook_wired() {
-    jq -e --arg e "$1" \
-        '(.hooks[$e] // []) | map(.hooks[]? | select(.command | test("tmux-agent-mesh"))) | length > 0' \
-        "$HOME/.codex/hooks.json"
-}
+# list-sessions, not `tmux info`: info exits non-zero with "no current client"
+# when a server is running but nothing is attached to it.
+_tmux_running()   { tmux list-sessions >/dev/null 2>&1; }
+_tmux_conf_line() { grep -qF "agent-mesh.tmux" "$HOME/.tmux.conf" 2>/dev/null; }
+_pane_died_hook() { tmux show-hooks -g pane-died 2>/dev/null | grep -qF "mesh.sh cleanup"; }
+_menu_bound()     { tmux list-keys -T prefix 2>/dev/null | grep -qF "mesh.sh menu"; }
 
-# The Pi extension is the only path that can wake an idle agent, and it is
-# also the only integration that is a symlink rather than a config edit.
+# The Pi extension is the only path that can wake an idle agent, and the only
+# integration that is a symlink rather than a config edit.
 _pi_extension_linked() {
-    local d="$HOME/.pi/agent/extensions/tmux-agent-mesh"
-    [[ -e "$d/index.ts" ]]
+    [[ -e "$HOME/.pi/agent/extensions/tmux-agent-mesh/index.ts" ]]
+}
+
+_wired_events() {
+    local file="$1"; shift
+    local ev n=0
+    for ev in "$@"; do
+        if jq -e --arg e "$ev" \
+            '(.hooks[$e] // []) | map(.hooks[]? | select(.command | test("tmux-agent-mesh"))) | length > 0' \
+            "$file" >/dev/null 2>&1; then
+            n=$((n + 1))
+        fi
+    done
+    printf '%s' "$n"
+}
+
+# Wiring is opt-in, so "not wired" is a choice and not a fault. Half-wired is
+# the only genuinely broken state, and the only one nobody notices.
+_report_harness() {
+    local name="$1" bin="$2" flag="$3" file="$4"; shift 4
+    if ! command -v "$bin" >/dev/null 2>&1; then
+        printf 'skip  %s hooks (%s not on PATH)\n' "$name" "$bin"
+        return 0
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+        printf 'skip  %s hooks (no jq)\n' "$name"
+        return 0
+    fi
+    local n total="$#"
+    if [[ -f "$file" ]]; then
+        n=$(_wired_events "$file" "$@")
+    else
+        n=0
+    fi
+    if [[ "$n" -eq 0 ]]; then
+        printf 'info  %s not wired (opt in with ./install.sh %s)\n' "$name" "$flag"
+    elif [[ "$n" -eq "$total" ]]; then
+        printf 'ok    %s hooks wired (%s events)\n' "$name" "$n"
+    else
+        printf 'FAIL  %s half-wired: %s of %s events in %s\n' "$name" "$n" "$total" "$file"
+        _DOCTOR_FAIL=1
+    fi
 }
 
 cmd_doctor() {
     _DOCTOR_FAIL=0
-    _probe "sqlite3 present"        command -v sqlite3
-    _probe "tmux present"           command -v tmux
-    _probe "jq present"             command -v jq
-    _probe "tmux >= 3.0"            check_tmux_version 3.0
-    _probe "database exists"        test -f "$DB"
-    _probe "notify dir exists"      test -d "$NOTIFY_DIR"
 
+    printf 'dependencies\n'
+    _probe "sqlite3 present"          command -v sqlite3
+    _probe "tmux present"             command -v tmux
+    _probe "jq present"               command -v jq
+    _probe "tmux >= 3.0"              check_tmux_version 3.0
+
+    printf 'data\n'
+    _probe "database exists"          test -f "$DB"
+    _probe "data dir writable"        test -w "$MESH_DIR"
+    _probe "notify dir writable"      test -w "$NOTIFY_DIR"
     if [[ -f "$DB" ]]; then
-        _probe "human participant seeded" _human_seeded
+        _probe "schema has all four tables" _schema_complete
+        _probe "journal mode is wal"        _db_wal
+        _probe "database passes integrity check" _db_intact
+        _probe "human participant seeded"  _human_seeded
     fi
 
-    local ev
-    if [[ -f "$HOME/.claude/settings.json" ]] && command -v jq >/dev/null 2>&1; then
-        for ev in SessionStart SessionEnd UserPromptSubmit Stop; do
-            _probe "claude hook $ev wired" _claude_hook_wired "$ev"
-        done
+    printf 'cli\n'
+    _probe "on PATH for a non-login shell" _on_path_sh
+    _probe "on PATH for a login shell"     _on_path_login
+    _probe "symlink points at this checkout" _cli_points_here
+
+    printf 'tmux\n'
+    if _tmux_running; then
+        _probe "plugin line in ~/.tmux.conf" _tmux_conf_line
+        _probe "cleanup registered on pane-died" _pane_died_hook
+        _probe "menu key bound"                  _menu_bound
     else
-        printf 'skip  claude hook wiring (no settings.json or no jq)\n'
+        printf 'skip  tmux state (no running server)\n'
     fi
 
-    if command -v codex >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
-        if [[ -f "$HOME/.codex/hooks.json" ]]; then
-            for ev in SessionStart SessionEnd UserPromptSubmit Stop; do
-                _probe "codex hook $ev wired" _codex_hook_wired "$ev"
-            done
+    printf 'harnesses\n'
+    _report_harness claude claude --claude "$HOME/.claude/settings.json" \
+        SessionStart SessionEnd UserPromptSubmit Stop
+    _report_harness codex codex --codex "$HOME/.codex/hooks.json" \
+        SessionStart SessionEnd UserPromptSubmit Stop
+    _report_harness gemini gemini --gemini "$HOME/.gemini/settings.json" \
+        SessionStart SessionEnd BeforeAgent AfterAgent
+    if command -v pi >/dev/null 2>&1; then
+        if _pi_extension_linked; then
+            printf 'ok    pi extension linked\n'
         else
-            printf 'FAIL  codex hooks.json missing (%s)\n' "$HOME/.codex/hooks.json"
-            _DOCTOR_FAIL=1
+            printf 'info  pi not wired (opt in with ./install.sh --pi)\n'
         fi
     else
-        printf 'skip  codex hook wiring (codex not installed)\n'
-    fi
-
-    if command -v gemini >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
-        for ev in SessionStart SessionEnd BeforeAgent AfterAgent; do
-            _probe "gemini hook $ev wired" _gemini_hook_wired "$ev"
-        done
-    else
-        printf 'skip  gemini hook wiring (gemini not installed)\n'
-    fi
-
-    if command -v pi >/dev/null 2>&1; then
-        _probe "pi extension linked" _pi_extension_linked
-    else
-        printf 'skip  pi extension (pi not installed)\n'
+        printf 'skip  pi extension (pi not on PATH)\n'
     fi
 
     return "$_DOCTOR_FAIL"

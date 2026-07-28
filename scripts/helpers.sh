@@ -73,9 +73,16 @@ load_config() {
         now=$(date +%s)
         age=$(( now - $(_file_mtime "$cache" 2>/dev/null || echo 0) ))
         if [[ "$age" -lt 60 ]]; then
-            # shellcheck disable=SC1090
-            source "$cache"
-            return
+            # A cache that will not parse is worse than no cache: `source` under
+            # `set -euo pipefail` aborts the caller, which would take down every
+            # hook and every command including the one meant to diagnose it. So
+            # check first and rebuild rather than report.
+            if bash -n "$cache" 2>/dev/null; then
+                # shellcheck disable=SC1090
+                source "$cache"
+                return
+            fi
+            rm -f "$cache" 2>/dev/null || true
         fi
     fi
 
