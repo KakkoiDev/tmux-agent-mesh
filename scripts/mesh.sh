@@ -855,6 +855,14 @@ _claim_dispatch() {
     printf '%s' "$task"
 }
 
+# Who asked for this agent's work. Read after the claim, since the row is then
+# stamped with claimed_by. Naming the sender is as far as this goes: actually
+# routing the result would need a completion signal no harness provides.
+_dispatch_reply_to() {
+    sql "SELECT COALESCE(reply_to_session,'') FROM dispatches
+         WHERE claimed_by='$(sql_esc "$1")' ORDER BY id DESC LIMIT 1;"
+}
+
 cmd_claim_dispatch() {
     local sid="" pane="${TMUX_PANE:-}"
     while [[ $# -gt 0 ]]; do
@@ -887,9 +895,21 @@ _hook_session_start() {
 
     command -v jq >/dev/null 2>&1 || return 0
 
-    local context="" initial=""
+    local context="" initial="" reply_to="" line
     context=$(_peer_context "$sid" || true)
     initial=$(_claim_dispatch "$sid" "${TMUX_PANE:-}" || true)
+    if [[ -n "$initial" ]]; then
+        reply_to=$(_dispatch_reply_to "$sid")
+        if [[ -n "$reply_to" && "$reply_to" != "$sid" ]]; then
+            line=$(printf 'Report your result with: tmux-agent-mesh send --to %s --message "..."' \
+                "$(_display_name "$reply_to")")
+            if [[ -n "$context" ]]; then
+                context=$(printf '%s\n%s' "$context" "$line")
+            else
+                context="$line"
+            fi
+        fi
+    fi
     [[ -z "$context" && -z "$initial" ]] && return 0
     _emit_session_start "$harness" "$context" "$initial" || true
     return 0

@@ -665,6 +665,30 @@ teardown() {
     assert_eq "$(get_alias D)" "scout"
 }
 
+# dispatches.reply_to_session was written and never read, so a dispatched agent
+# had no idea who wanted the answer. Routing the result needs a completion signal
+# no harness provides; naming the sender in the context does not.
+@test "session start tells a dispatched agent who to report back to" {
+    msql "INSERT INTO dispatches (tmux_pane, harness, task, reply_to_session)
+          VALUES ('%55','claude','do it','A');"
+    TMUX_PANE=%55
+    run _hook_session_start claude D /tmp/d
+    echo "$output" | jq -e '.hookSpecificOutput.additionalContext | contains("send --to alpha")'
+}
+
+@test "session start says nothing about reporting back when nothing was dispatched" {
+    run _hook_session_start claude D /tmp/d
+    refute_contains "$output" "Report your result"
+}
+
+@test "codex session start folds the reporting instruction into context" {
+    msql "INSERT INTO dispatches (tmux_pane, harness, task, reply_to_session)
+          VALUES ('%55','codex','build it','A');"
+    TMUX_PANE=%55
+    run _hook_session_start codex D /tmp/d
+    echo "$output" | jq -e '.hookSpecificOutput.additionalContext | contains("send --to alpha")'
+}
+
 # _set_alias exits on a taken or malformed name. _claim_dispatch runs inside
 # $(...), so that exit killed the subshell after the row had been marked
 # claimed and before the task was printed: dispatch consumed, task destroyed.
