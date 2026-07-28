@@ -121,6 +121,14 @@ Established by running a real agent, not from documentation:
   from that directory. Type-only imports are fine, since they are erased before
   jiti runs. Discovery therefore works as for the other harnesses, through
   injected context naming the CLI.
+- The `input` event fires for the extension's own `sendUserMessage` as well as for
+  typing, carrying `source: "extension"`. Resetting the continuation budget on
+  every input event therefore cleared it immediately after each push, and
+  `@agent-mesh-max-blocks` never stopped anything on Pi. Observed with
+  max-blocks 1: two consecutive pushes both delivered and `block_streak` stayed
+  at 0. Only `source == "interactive"` is a person typing.
+- `ctx.ui` has `notify()` and no `info()`. Reaching for the wrong name through an
+  optional-call chain made every `/mesh` subcommand run and print nothing.
 
 ## Loop safety
 
