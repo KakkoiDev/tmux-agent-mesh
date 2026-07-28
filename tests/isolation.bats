@@ -54,6 +54,34 @@ teardown() {
     assert_fail
 }
 
+# ── portability ──────────────────────────────────────────────────────
+#
+# helpers.sh is not part of source_mesh_functions (the awk filter strips its
+# `source` line), so these load it directly. The uname stub is what makes them
+# mean anything: without it both branches would be checked on macOS only.
+
+@test "watch formats a timestamp with BSD date flags on macos" {
+    source "$SCRIPTS_DIR/helpers.sh"
+    uname() { echo Darwin; }
+    date() { printf '%s' "$*"; }
+    run _fmt_time 0
+    assert_contains "$output" "-r 0"
+}
+
+@test "watch formats a timestamp with GNU date flags elsewhere" {
+    source "$SCRIPTS_DIR/helpers.sh"
+    uname() { echo Linux; }
+    date() { printf '%s' "$*"; }
+    run _fmt_time 0
+    assert_contains "$output" "-d @0"
+}
+
+@test "watch prints a real clock time on this platform" {
+    source "$SCRIPTS_DIR/helpers.sh"
+    run _fmt_time 0
+    assert_match "$output" '[0-9][0-9]:[0-9][0-9]:[0-9][0-9]'
+}
+
 # ── stderr hygiene ───────────────────────────────────────────────────
 #
 # Harnesses surface hook stderr to the user, and Claude Code treats a

@@ -1138,7 +1138,7 @@ cmd_watch() {
         while IFS='|' read -r id created fname tname body; do
             [[ -z "$id" ]] && continue
             printf '%s  %-12s -> %-12s  %s\n' \
-                "$(date -r "$created" '+%H:%M:%S' 2>/dev/null || printf '%8s' '')" \
+                "$(_fmt_time "$created" 2>/dev/null || printf '%8s' '')" \
                 "$fname" "$tname" "$body"
             seen="$id"
         done <<EOF

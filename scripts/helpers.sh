@@ -17,6 +17,14 @@ _file_mtime() {
     esac
 }
 
+# `date -r <epoch>` is BSD-only, so watch printed blank timestamps on Linux.
+_fmt_time() {
+    case "$(uname)" in
+        Darwin) date -r "$1" '+%H:%M:%S' ;;
+        *)      date -d "@$1" '+%H:%M:%S' ;;
+    esac
+}
+
 # ── tmux option helpers ──────────────────────────────────────────────
 
 get_tmux_option() {
