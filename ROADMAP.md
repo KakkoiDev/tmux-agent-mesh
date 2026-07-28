@@ -1,0 +1,135 @@
+# Roadmap
+
+Sequenced, with the reason each step blocks the next. The order is forced by
+dependencies, not preference.
+
+## Where it stands
+
+Running: peer messaging, delivery into a working agent's turn for Claude, Codex
+and Gemini, idle wake for Pi, `dispatch`, the five brakes, the untrusted-peer
+envelope, the tmux menu and status bar. 318 bash tests.
+
+Built and not wired: the Go store. Channels, membership, private channels, access
+rules, per-recipient delivery, append-only read receipts. 36 Go tests.
+
+## 1. Server and the two transports
+
+Everything else waits on this, for a hard reason rather than a scheduling one: a
+remote mailbox cannot be a network share, because SQLite in WAL mode needs shared
+memory and locking over NFS or SSHFS corrupts the file. A process has to own it.
+
+One binary, three modes. The client **never** opens the database, in either
+deployment, which is what makes an access rule worth more than a comment.
+
+```
+mesh serve            unix socket, local
+mesh serve-stdio      over ssh, forced command in authorized_keys
+mesh <command>        the client the hooks and the TUI both call
+```
+
+ssh with `ControlMaster` for the remote transport: no port, no tokens, credentials
+already exist, and a hook costs roughly 20ms rather than a full handshake.
+
+Fix before writing the server, since the schema is what the server is written
+against: `max-thread-msgs` is the wrong brake (see ARCHITECTURE.md). A topic that
+accumulates decisions is the most valuable thing in the mailbox and this cap
+destroys it at 12 messages.
+
+## 2. Client, hook rewiring, budget ledger
+
+The hooks currently open the database directly. They become clients.
+
+Add the spend ceiling at the same time, because it is cheapest while the request
+path is being written and because a mailbox meant to run continuously without one
+is a bill, not a system. `max-blocks` bounds one agent's streak; nothing bounds
+the fleet. Reuse `tmux-agent-resumer`'s quota reader rather than inventing a
+second accounting.
+
+Also: queue the intent before advancing delivery state, so a client that dies
+mid-claim can be recovered by draining rather than losing the message. Taken from
+firstmate's `state/.wake-queue` ordering.
+
+## 3. The wake path
+
+Three gates, all of which must agree, or the mail waits. See the README section
+for the diagram and the reasoning. Gate 2 is not optional: without it, mesh types
+a peer agent's message into a pane that has dropped to a shell, and that is
+command execution by mail.
+
+Land the composer classifier in `tmux-agent-resumer` first (see that repo's
+`TASK-composer-content-guard.md`). Its payload is an operator-configured string,
+so a mistake there is input corruption; here the payload is another agent's text
+and the same mistake is remote code execution. Prove it where it is cheap.
+
+## 4. Channels, recipients, files
+
+The store is built. This is wiring plus the file store.
+
+File bodies live outside the database under a directory only the server can read.
+The row is the handle, the bytes are unreachable except through the service, and
+that is where membership is checked. This is the one feature that is *only* honest
+once step 1 exists, because on a shared uid an agent can read the store directly.
+
+## 5. Enforcement
+
+`dispatch` sandboxes by default, `--no-sandbox` opts out, `doctor` reports which
+agents are fenced. Enforce what mesh launched, report what it did not.
+
+Verified working on macOS: a seatbelt profile denying the data directory blocks
+`cat`, `sqlite3` and the `/tmp` symlink route. Seatbelt matches **resolved** paths,
+so a profile written against `/tmp/...` does nothing. `sandbox-exec` is formally
+deprecated while remaining functional; Claude Code's own sandbox settings may be
+the better hook. Linux equivalent is bubblewrap, or simply not mounting the
+directory into a container.
+
+Until this lands, local channel privacy is advisory and the README says so.
+
+## 6. The TUI
+
+Go, in its own tmux window rather than a popup, because a popup is modal and dies
+on focus change. `prefix + g` opens it or jumps to it.
+
+Read any channel you have access to, post, open a thread, DM one agent, upload a
+file, and see who read what and when. Editing your own message keeps the original
+in history rather than overwriting: an agent may already have acted on what it
+read.
+
+## Open design decisions
+
+### A resident helper is a new participant type
+
+A long-lived agent whose job is knowing where things are and who is doing what.
+Not a per-errand invocation: accumulated context is the product, and auto-compact
+is built for exactly that session shape.
+
+Two constraints that are not negotiable if it exists, because it inverts the
+threat model. Every other participant is untrusted peer input by default, but a
+designated helper is one that other agents will trust *by construction* - mislead
+it once and it misdirects everyone who consults it.
+
+- **Read-only tools only.**
+- **Answers are pointers with provenance** (`file:line` plus the command to
+  verify), never prose conclusions. This is also what makes a cheap model
+  acceptable for the role: a wrong pointer is checkable, a wrong assertion is not.
+
+### Threads as durable context
+
+A thread retains who said what, when, and what was decided. That is strictly more
+than a vector store of chunks, which keeps similarity and throws provenance away.
+Worth designing deliberately: thread summaries, search, and "what did we decide
+about X". Blocked on removing the message cap first.
+
+### Worktrees stay visible
+
+Not a managed pool. A predictable path, an addressable pane, a queryable row.
+Tools that hide worktrees read as simpler until you need to know what is running
+where. Teardown must refuse rather than discard: dirty worktrees, and committed
+work that has not landed, block removal.
+
+### Coexisting with a second blocking hook
+
+Mesh returns `{decision:"block"}` on `Stop`. firstmate exits 2 with a banner on
+stderr for the same purpose. Two hooks cannot both own a turn boundary. The exit-2
+form composes where a blocking decision does not, so if mesh ever has to share
+`Stop`, that is the mechanism to switch to. Today the answer is
+`@agent-mesh-delivery next-prompt`.

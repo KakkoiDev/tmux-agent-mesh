@@ -611,30 +611,85 @@ not.
 
 ### Waking an idle agent (designed)
 
-For Claude, Codex and Gemini the only mechanism is typing into the pane. That is
-what every other tmux agent orchestrator does, and it races your keyboard and the
-composer with no acknowledgement.
+For Claude, Codex and Gemini the only mechanism is typing into the pane.
 
-What mesh adds is a gate nothing else has: it installs the turn hooks, so it knows
-the agent is between turns instead of scraping the pane for the word "tokens".
-Two independent gates, or the mail waits.
+An earlier version of this section claimed the pane's composer state is not
+observable, and that a keystroke path can never be acknowledged. **Both were
+wrong**, corrected here after reading `kunchenguid/firstmate` (MIT):
+
+- Composer state **is** observable. `tmux capture-pane -e` keeps the ANSI styling,
+  and de-emphasised placeholder text is then removed by style rather than by
+  pattern: dim runs (SGR 2) for Claude and Codex suggestion text, dark truecolor
+  foregrounds for Grok placeholders. What survives is real typed content.
+- A keystroke path **can** be acknowledged, not by the harness but by re-reading
+  the screen after `Enter`. Still-pending on a busy pane means the harness queued
+  it; still-pending on an idle pane is a genuine swallow.
+
+Mesh gates on three independent signals, and holds the mail unless all three
+agree. Two come from `tmux-agent-resumer`, one from firstmate.
 
 ```mermaid
 flowchart TB
     M["mail arrives for a non-Pi agent"] --> G1{"turn_state<br/>== idle?"}
-    G1 -->|no| H["hold: the turn-end hook will deliver it"]
-    G1 -->|yes| G2{"composer<br/>line empty?"}
-    G2 -->|no| H2["hold: do not destroy what you were typing"]
-    G2 -->|yes| W["Escape, A if vim mode, send-keys -l, Enter"]
+    G1 -->|no| H1["hold: the turn-end hook will deliver it"]
+    G1 -->|yes| G2{"live agent process<br/>under the pane?"}
+    G2 -->|no| H2["hold: the pane is a shell, never type into it"]
+    G2 -->|yes| G3{"are you watching<br/>this pane right now?"}
+    G3 -->|yes| H3["hold: do not type under your hands"]
+    G3 -->|no| G4{"composer classifies<br/>as empty?"}
+    G4 -->|"pending / unknown"| H4["hold: do not destroy what you typed"]
+    G4 -->|empty| W["Escape, A if vim mode, send-keys -l, Enter"]
+    W --> V{"re-read: still pending?"}
+    V -->|"yes, pane idle"| S["swallowed: report it, keep the mail"]
+    V -->|"yes, pane busy"| Q["queued by the harness: done"]
+    V -->|no| D["delivered"]
 ```
 
-The typing routine comes from `tmux-agent-resumer`, which solved the traps the
-hard way: vim-mode detection via the `-- INSERT --` marker, `Escape` then `A` to
-reach insert, and spaced Escapes because a rapid double-Escape opens Claude's
-rewind menu.
+Gate 2 is why this is safe at all. A pane whose agent has exited shows a plain
+shell prompt, and a naive emptiness check reads that as a ready composer. Mesh
+would then type a **peer agent's message text** and press Enter, which is one
+agent getting arbitrary commands run in your shell by mailing them to a dead
+pane. Two independent answers to that: a process-table check for a live agent
+under the pane, and firstmate's rule that a bare `>`/`$`/`%`/`#` glyph counts as
+an empty composer only inside a bordered composer box, while `❯` and `›` are
+genuine agent prompts either way.
+
+The typing routine itself comes from `tmux-agent-resumer`: vim-mode detection via
+the `-- INSERT --` marker, `Escape` then `A` to reach insert, and spaced Escapes
+because a rapid double-Escape opens Claude's rewind menu.
 
 Until this exists, mail for an idle Claude, Codex or Gemini agent waits for your
 next prompt, and `dispatch` is the way to get guaranteed pickup.
+
+### Running alongside firstmate
+
+[`firstmate`](https://github.com/kunchenguid/firstmate) ships a tracked `Stop`
+hook for its own watcher re-arm, using an exit-2 rewake. Mesh's `Stop` hook
+returns `{decision:"block"}`. Both then try to own the same turn boundary, and
+the interaction is untested.
+
+Before launching an agent inside a firstmate clone, hand `Stop` to firstmate:
+
+```bash
+tmux set -g @agent-mesh-delivery next-prompt && tmux-agent-mesh refresh
+```
+
+Mail still arrives, on the next prompt instead of by forcing a turn. The two
+projects are complementary and do not overlap: firstmate delegates vertically
+inside one project, mesh carries messages horizontally between agents, projects
+and machines.
+
+### Worktrees stay visible
+
+`dispatch --worktree` creates a worktree at a path you can predict
+(`~/.tmux-worktree/<project>/<branch>`), in a pane you can address, recorded in a
+row you can query. It is deliberately **not** a managed pool.
+
+Tools that manage worktrees for you and hide them read as simpler until you need
+to know what is running where, and then the abstraction is the problem. Mesh's
+`roster` and `dispatches` exist so that question always has an answer. Any future
+teardown must refuse rather than discard: a dirty worktree, or committed work that
+has not landed, blocks removal.
 
 ---
 
