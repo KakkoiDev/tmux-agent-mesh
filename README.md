@@ -165,7 +165,7 @@ prompt.
 | `@agent-mesh-pi-delivery` | `push` | `push`, `before-start`, `off` |
 | `@agent-mesh-wake` | `off` | opt-in `send-keys` wake for idle non-Pi panes |
 | `@agent-mesh-on-mail` | `""` | shell hook on new mail for `human` |
-| `@agent-mesh-keybinding` | `m` | menu key after the prefix |
+| `@agent-mesh-keybinding` | `g` | menu key after the prefix (`m` is tmux's own `select-pane -m`) |
 | `@agent-mesh-icon-mail` | `@` | status bar indicator |
 | `@agent-mesh-debug-log` | `0` | `1` writes `~/.tmux-agent-mesh/debug.log` |
 

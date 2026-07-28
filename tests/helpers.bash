@@ -146,6 +146,34 @@ source_mesh_functions() {
     SCRIPTS_DIR="$PROJECT_ROOT/scripts"
 }
 
+# A tmux server on a private socket, with a `tmux` wrapper first on PATH so
+# every call from mesh reaches it and never the developer's own session.
+# HOME is redirected too, because agent-mesh.tmux symlinks into it.
+start_test_tmux() {
+    REAL_TMUX=$(command -v tmux) || return 1
+    TMUX_SOCKET="mesh-test-$$-${BATS_TEST_NUMBER:-0}"
+    FAKE_HOME="$TEST_TMPDIR/home"
+    mkdir -p "$TEST_TMPDIR/bin" "$FAKE_HOME"
+    printf '#!/usr/bin/env bash\nexec %s -L %s "$@"\n' "$REAL_TMUX" "$TMUX_SOCKET" \
+        > "$TEST_TMPDIR/bin/tmux"
+    chmod +x "$TEST_TMPDIR/bin/tmux"
+    export PATH="$TEST_TMPDIR/bin:$PATH"
+    # -f /dev/null: starting a server sources ~/.tmux.conf, which would load the
+    # developer's other plugins and let their hooks run against real state.
+    tmux -f /dev/null new-session -d -s mesh
+}
+
+stop_test_tmux() {
+    [[ -n "${TMUX_SOCKET:-}" ]] || return 0
+    "${REAL_TMUX:-tmux}" -L "$TMUX_SOCKET" kill-server 2>/dev/null || true
+    return 0
+}
+
+# Load the plugin against the private server and the fake home.
+run_plugin() {
+    HOME="$FAKE_HOME" bash "$PROJECT_ROOT/agent-mesh.tmux"
+}
+
 # Path to the installed pi extension type definitions, for checking the
 # extension's calls against the real API instead of against memory. Fails when
 # pi is not installed, so the caller can skip.

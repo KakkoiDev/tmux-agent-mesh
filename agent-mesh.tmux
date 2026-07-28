@@ -58,4 +58,11 @@ tmux bind-key "${KEYBINDING:-m}" run-shell "$SCRIPTS_DIR/mesh.sh menu"
 
 # Reap agents whose pane died. session_shutdown does not fire when a pane is
 # killed, so for every harness this is the only cleanup path.
-tmux set-hook -g pane-died "run-shell -b '$SCRIPTS_DIR/mesh.sh cleanup'"
+#
+# -ga, not -g: a plain set replaces whatever else is on pane-died, and this
+# plugin has three siblings plus whatever the user wrote. The existence check is
+# what keeps -ga idempotent, since tmux reloads this file on every source-file
+# and an unconditional append accumulates one duplicate per reload.
+if ! tmux show-hooks -g pane-died 2>/dev/null | grep -qF "$SCRIPTS_DIR/mesh.sh cleanup"; then
+    tmux set-hook -ga pane-died "run-shell -b '$SCRIPTS_DIR/mesh.sh cleanup'"
+fi

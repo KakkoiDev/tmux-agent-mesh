@@ -71,7 +71,9 @@ load_config() {
         fi
     fi
 
-    KEYBINDING=$(get_tmux_option "@agent-mesh-keybinding" "m")
+    # Not `m`: that is tmux's own select-pane -m, so the old default silently
+    # took a built-in away from everyone who installed this.
+    KEYBINDING=$(get_tmux_option "@agent-mesh-keybinding" "g")
     ITEMS_PER_PAGE=$(get_tmux_option "@agent-mesh-items-per-page" "10")
     KEY_NEXT=$(get_tmux_option "@agent-mesh-key-next" "i")
     KEY_PREV=$(get_tmux_option "@agent-mesh-key-prev" "o")
