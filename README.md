@@ -105,9 +105,22 @@ tmux-agent-mesh dispatch --task "audit the migration for missing indexes" \
 tmux-agent-mesh dispatch --task "port the tests" --harness pi --worktree feat/x
 ```
 
-tmux runs the agent as the pane's own process and the task is handed over as its
-first message. No keystrokes are sent. `--worktree` creates a git worktree under
+tmux runs the agent as the pane's own process, with the task as its initial
+prompt. Nothing is typed into the pane. `--worktree` creates a git worktree under
 `~/.tmux-worktree/<project>/<branch>`.
+
+The task goes on the harness's own command line, not through a hook: no hook can
+start a turn in a session that has never had one. Pi is the exception, because
+its extension can call `sendUserMessage`.
+
+A dispatched pane inherits the **tmux server's** environment, not your shell's,
+and tmux runs the launch line through `default-shell`, which reads its own
+startup files. Use `--env` when the harness needs something your profile
+normally sets or clears:
+
+```bash
+tmux-agent-mesh dispatch --task "..." --harness claude --env NODE_EXTRA_CA_CERTS=
+```
 
 ### You are a participant
 
@@ -200,7 +213,7 @@ tmux-agent-tracker, and setting it would point tracker at the wrong database.
 bats tests/
 ```
 
-302 tests across seven suites. `tests/config.bats` runs mesh as a real
+306 tests across seven suites. `tests/config.bats` runs mesh as a real
 subprocess against a planted option cache, and `tests/tmux.bats` runs a tmux
 server on a private socket with `-f /dev/null`, so neither reads the machine's
 live tmux state.

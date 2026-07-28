@@ -93,7 +93,7 @@ redelivery loop is worse than an audit log.
 | Turn-end event | `Stop` | `Stop` | `AfterAgent` | none usable |
 | Continuation payload | `{decision:"block", hookSpecificOutput:{hookEventName:"Stop", additionalContext:T}}` | `{decision:"block", reason:T}` | `{decision:"deny", reason:T}` | n/a |
 | Prompt event | `UserPromptSubmit` | `UserPromptSubmit` | `BeforeAgent` | `before_agent_start` |
-| Seed a spawned session | `initialUserMessage` | folded into context | folded into context | `sendUserMessage` |
+| Seed a spawned session | initial prompt on argv | initial prompt on argv | initial prompt on argv | `sendUserMessage` |
 | Wake an idle agent | no | no | no | **yes** |
 | `stop_hook_active` supplied | no | yes | yes | n/a |
 
@@ -237,7 +237,7 @@ state, mesh rows are messages, so dropping them needs the explicit `--reset`.
 bats tests/
 ```
 
-302 tests. Every assertion goes through a helper function, never a bare `[[ ]]`
+306 tests. Every assertion goes through a helper function, never a bare `[[ ]]`
 or `! cmd`: bash 3.2 is the system bash on macOS and the one this suite runs
 under, and it trips neither `set -e` nor the `ERR` trap for either of those when
 they are not the last statement of a function. About a third of the assertions

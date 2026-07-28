@@ -178,6 +178,23 @@ mesh_in_fake_home() { HOME="$FAKE_HOME" "$MESH_BIN" "$@"; }
     assert_eq "$(msql 'SELECT COUNT(*) FROM dispatches;')" "0"
 }
 
+# A dispatched pane inherits the tmux server's environment, not your shell's, so
+# anything your profile sets or clears is missing. Observed live: a corporate
+# NODE_EXTRA_CA_CERTS in the server environment broke every dispatched agent,
+# while the same agent started by hand worked, because the user's shell unsets it.
+@test "dispatch passes an env override through to the pane" {
+    printf '#!/bin/sh\nprintf %%s "$MESH_PROBE" > %s/probe\nexec sleep 30\n' "$TEST_TMPDIR" \
+        > "$TEST_TMPDIR/bin/claude"
+    chmod +x "$TEST_TMPDIR/bin/claude"
+    mesh_in_fake_home dispatch --task x --harness claude --env MESH_PROBE=cleared >/dev/null
+    local waited=0
+    while [[ ! -f "$TEST_TMPDIR/probe" && "$waited" -lt 30 ]]; do
+        sleep 0.1
+        waited=$((waited + 1))
+    done
+    assert_eq "$(cat "$TEST_TMPDIR/probe")" "cleared"
+}
+
 @test "dispatch refuses a harness it does not know" {
     run mesh_in_fake_home dispatch --task x --harness emacs
     assert_fail

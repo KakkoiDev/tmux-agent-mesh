@@ -636,13 +636,6 @@ teardown() {
     assert_eq "$(_block_streak B)" "0"
 }
 
-@test "session start delivers a claimed dispatch as the first message" {
-    msql "INSERT INTO dispatches (tmux_pane, harness, task) VALUES ('%55','claude','list the files');"
-    TMUX_PANE=%55
-    run _hook_session_start claude D /tmp/d
-    echo "$output" | jq -e '.hookSpecificOutput.initialUserMessage == "list the files"'
-}
-
 @test "session start marks a dispatch claimed" {
     msql "INSERT INTO dispatches (tmux_pane, harness, task) VALUES ('%55','claude','do it');"
     TMUX_PANE=%55
@@ -654,8 +647,19 @@ teardown() {
     msql "INSERT INTO dispatches (tmux_pane, harness, task) VALUES ('%55','claude','do it');"
     TMUX_PANE=%55
     _hook_session_start claude D /tmp/d >/dev/null
-    run _hook_session_start claude E /tmp/e
-    echo "$output" | jq -e '.hookSpecificOutput | has("initialUserMessage") == false'
+    _hook_session_start claude E /tmp/e >/dev/null
+    assert_eq "$(msql "SELECT claimed_by FROM dispatches WHERE id=1;")" "D"
+}
+
+# No harness hook can start a turn in a session that has not had one. Claude
+# Code's SessionStart output has no field that seeds a prompt: emitting
+# initialUserMessage left the dispatched agent at an empty prompt with its task
+# already claimed and gone. Observed against v2.1.220.
+@test "session start does not pretend it can seed a prompt" {
+    msql "INSERT INTO dispatches (tmux_pane, harness, task) VALUES ('%55','claude','list the files');"
+    TMUX_PANE=%55
+    run _hook_session_start claude D /tmp/d
+    refute_contains "$output" "initialUserMessage"
 }
 
 @test "session start applies the dispatch alias" {
@@ -700,35 +704,55 @@ teardown() {
     assert_eq "$output" "do it"
 }
 
-@test "session start still delivers the task when the dispatch alias is taken" {
-    _set_alias A scout
-    msql "INSERT INTO dispatches (tmux_pane, harness, task, alias) VALUES ('%55','claude','do it','scout');"
-    TMUX_PANE=%55
-    run _hook_session_start claude D /tmp/d
-    echo "$output" | jq -e '.hookSpecificOutput.initialUserMessage == "do it"'
-}
-
-@test "session start still delivers the task when the dispatch alias is malformed" {
+@test "a dispatch whose alias is malformed still hands over the task" {
     msql "INSERT INTO dispatches (tmux_pane, harness, task, alias) VALUES ('%55','claude','do it','bad name!');"
-    TMUX_PANE=%55
-    run _hook_session_start claude D /tmp/d
-    echo "$output" | jq -e '.hookSpecificOutput.initialUserMessage == "do it"'
+    run _claim_dispatch D %55
+    assert_ok
+    assert_eq "$output" "do it"
 }
 
-# Codex and Gemini have no initialUserMessage, so the task must fold into
-# the context string or a dispatched agent starts with no instructions.
-@test "codex session start folds the dispatch task into context" {
-    msql "INSERT INTO dispatches (tmux_pane, harness, task) VALUES ('%55','codex','build it');"
-    TMUX_PANE=%55
-    run _hook_session_start codex D /tmp/d
-    echo "$output" | jq -e '.hookSpecificOutput.additionalContext | contains("build it")'
+# ── the task reaches the agent on its own command line ───────────────
+
+@test "the launch command carries the task for claude" {
+    run _harness_launch claude "audit the migration"
+    assert_ok
+    assert_contains "$output" "claude "
+    _launch_carries_task claude "audit the migration"
 }
 
-@test "gemini session start folds the dispatch task into context" {
-    msql "INSERT INTO dispatches (tmux_pane, harness, task) VALUES ('%55','gemini','build it');"
-    TMUX_PANE=%55
-    run _hook_session_start gemini D /tmp/d
-    echo "$output" | jq -e '.hookSpecificOutput.additionalContext | contains("build it")'
+# The pane's shell reads its own startup files. On macOS /etc/zshenv rebuilds
+# PATH through path_helper, so a bare harness name that resolved for dispatch can
+# fail to resolve in the pane, and the pane dies with nothing said.
+@test "the launch command names the harness by absolute path" {
+    mkdir -p "$TEST_TMPDIR/bin"
+    printf '#!/bin/sh\nexit 0\n' > "$TEST_TMPDIR/bin/claude"
+    chmod +x "$TEST_TMPDIR/bin/claude"
+    PATH="$TEST_TMPDIR/bin:$PATH" run _harness_launch claude "x"
+    assert_contains "$output" "$TEST_TMPDIR/bin/claude"
+}
+
+@test "the launch command carries the task for codex and gemini" {
+    _launch_carries_task codex "audit the migration"
+    _launch_carries_task gemini "audit the migration"
+}
+
+# tmux hands the launch line to a shell, so an unquoted task would be executed.
+@test "the launch command quotes a task containing shell metacharacters" {
+    _launch_carries_task claude 'rm -rf /; echo $HOME `id`'
+}
+
+# Pi is the one harness that does not need it: its extension claims the dispatch
+# at session_start and calls sendUserMessage, which does start a turn.
+@test "the launch command for pi carries no task" {
+    run _harness_launch pi "audit the migration"
+    assert_ok
+    assert_match "$output" '*pi'
+    refute_contains "$output" "audit"
+}
+
+@test "the launch command rejects an unknown harness" {
+    run _harness_launch emacs "x"
+    assert_fail
 }
 
 # ── hook routing per harness ─────────────────────────────────────────

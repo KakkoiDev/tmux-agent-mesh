@@ -801,26 +801,19 @@ _emit_prompt_context() {
     esac
 }
 
+# Context only. No harness hook can start a turn in a session that has not had
+# one, so a dispatched agent gets its task on the harness's own command line
+# instead (see _harness_launch). This used to emit initialUserMessage for
+# Claude Code, which is not a field it honours: the agent sat at an empty prompt
+# with its task already claimed and gone.
 _emit_session_start() {
-    local harness="$1" context="$2" initial="$3"
+    local harness="$1" context="$2"
     case "$harness" in
-        claude)
-            if [[ -n "$initial" ]]; then
-                jq -n --arg c "$context" --arg i "$initial" \
-                    '{hookSpecificOutput:({hookEventName:"SessionStart"}
-                      + (if $c != "" then {additionalContext:$c} else {} end)
-                      + {initialUserMessage:$i})}'
-            else
-                jq -n --arg c "$context" \
-                    '{hookSpecificOutput:{hookEventName:"SessionStart", additionalContext:$c}}'
-            fi ;;
-        codex)
-            jq -n --arg c "$context" --arg i "$initial" \
-                '{hookSpecificOutput:{hookEventName:"SessionStart",
-                  additionalContext:(if $i != "" then $c + "\n\nYour assigned task:\n" + $i else $c end)}}' ;;
+        claude|codex)
+            jq -n --arg c "$context" \
+                '{hookSpecificOutput:{hookEventName:"SessionStart", additionalContext:$c}}' ;;
         gemini)
-            jq -n --arg c "$context" --arg i "$initial" \
-                '{hookSpecificOutput:{additionalContext:(if $i != "" then $c + "\n\nYour assigned task:\n" + $i else $c end)}}' ;;
+            jq -n --arg c "$context" '{hookSpecificOutput:{additionalContext:$c}}' ;;
         *) return 1 ;;
     esac
 }
@@ -909,10 +902,12 @@ _hook_session_start() {
 
     command -v jq >/dev/null 2>&1 || return 0
 
-    local context="" initial="" reply_to="" line
+    # The claim is what applies the dispatch alias and identifies the requester.
+    # The task itself arrived on the command line, so it is not needed here.
+    local context="" task="" reply_to="" line
     context=$(_peer_context "$sid" || true)
-    initial=$(_claim_dispatch "$sid" "${TMUX_PANE:-}" || true)
-    if [[ -n "$initial" ]]; then
+    task=$(_claim_dispatch "$sid" "${TMUX_PANE:-}" || true)
+    if [[ -n "$task" ]]; then
         reply_to=$(_dispatch_reply_to "$sid")
         if [[ -n "$reply_to" && "$reply_to" != "$sid" ]]; then
             line=$(printf 'Report your result with: tmux-agent-mesh send --to %s --message "..."' \
@@ -924,8 +919,8 @@ _hook_session_start() {
             fi
         fi
     fi
-    [[ -z "$context" && -z "$initial" ]] && return 0
-    _emit_session_start "$harness" "$context" "$initial" || true
+    [[ -z "$context" ]] && return 0
+    _emit_session_start "$harness" "$context" || true
     return 0
 }
 
@@ -1166,8 +1161,40 @@ _harness_command() {
     esac
 }
 
+# The task goes on the harness's own command line, because no hook can start a
+# turn in a session that has not had one. Claude Code's SessionStart output has
+# no field that seeds a prompt: a dispatched agent used to sit at an empty
+# prompt with its task already claimed and gone. Verified against v2.1.220.
+#
+# Pi is the exception and needs no argument: its extension claims the dispatch
+# at session_start and calls sendUserMessage, which does start a turn.
+_harness_launch() {
+    local harness="$1" task="$2" cmd bin
+    cmd=$(_harness_command "$harness") || return 1
+    # An absolute path, not the bare name. tmux runs the launch line through
+    # default-shell, which reads its own startup files: on macOS /etc/zshenv
+    # rebuilds PATH through path_helper, so the name that resolved for dispatch
+    # can fail to resolve in the pane, and the pane just dies with nothing said.
+    bin=$(command -v "$cmd" 2>/dev/null) || bin="$cmd"
+    case "$harness" in
+        claude|codex) printf '%s %s' "$bin" "$(printf '%q' "$task")" ;;
+        gemini)       printf '%s -i %s' "$bin" "$(printf '%q' "$task")" ;;
+        pi)           printf '%s' "$bin" ;;
+    esac
+}
+
+# tmux hands the launch line to a shell, so the check that matters is not
+# whether the task appears in the string but whether it survives word splitting
+# as one argument.
+_launch_carries_task() {
+    local harness="$1" task="$2" line argv
+    line=$(_harness_launch "$harness" "$task") || return 1
+    eval "argv=($line)"
+    [[ "${argv[$(( ${#argv[@]} - 1 ))]}" == "$task" ]]
+}
+
 cmd_dispatch() {
-    local task="" harness="claude" alias="" worktree="" as_window=0 dir="$PWD" from=""
+    local task="" harness="claude" alias="" worktree="" as_window=0 dir="$PWD" from="" envs=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --task|-t)  task="${2:-}"; shift ;;
@@ -1176,6 +1203,7 @@ cmd_dispatch() {
             --worktree) worktree="${2:-}"; shift ;;
             --cwd)      dir="${2:-}"; shift ;;
             --from)     from="${2:-}"; shift ;;
+            --env)      envs="$envs $(printf '%q' "${2:-}")"; shift ;;
             --window)   as_window=1 ;;
             *) _die "dispatch: unknown flag '$1'" ;;
         esac
@@ -1205,11 +1233,16 @@ cmd_dispatch() {
     sender=$(_self_session "$from")
 
     # tmux runs the command as the pane's own process, so nothing is typed in.
-    local pane
+    # A dispatched pane inherits the tmux *server's* environment, not your
+    # shell's, so anything your profile sets or clears is absent here. --env is
+    # the way to put it back: the launch line is run by a shell, so a plain
+    # assignment prefix is enough and needs no tmux version above the 3.0 floor.
+    local launch pane
+    launch="${envs:+${envs# } }$(_harness_launch "$harness" "$task")"
     if [[ "$as_window" -eq 1 ]]; then
-        pane=$(tmux new-window -d -P -F '#{pane_id}' -c "$dir" "$cmd")
+        pane=$(tmux new-window -d -P -F '#{pane_id}' -c "$dir" "$launch")
     else
-        pane=$(tmux split-window -d -P -F '#{pane_id}' -c "$dir" "$cmd")
+        pane=$(tmux split-window -d -P -F '#{pane_id}' -c "$dir" "$launch")
     fi
     [[ -n "$pane" ]] || _die "dispatch: tmux did not return a pane id"
 
@@ -1635,11 +1668,18 @@ cmd_selftest() {
         _st_json "$h prompt payload"        '.hookSpecificOutput.additionalContext' \
             "$(_emit_prompt_context "$h" x)"
         _st_json "$h session-start payload" '.hookSpecificOutput.additionalContext' \
-            "$(_emit_session_start "$h" x "")"
+            "$(_emit_session_start "$h" x)"
+        if _launch_carries_task "$h" "audit it now"; then
+            _st_ok "$h dispatch passes the task as one argument"
+        else
+            _st_fail "$h dispatch does not pass the task to the agent"
+        fi
     done
-    _st_json "claude seeds a dispatched session" \
-        '.hookSpecificOutput.initialUserMessage == "do it"' \
-        "$(_emit_session_start claude ctx "do it")"
+    if _launch_carries_task pi "audit it now"; then
+        _st_fail "pi dispatch should leave the task to its extension"
+    else
+        _st_ok "pi dispatch needs no task argument, its extension delivers"
+    fi
 
     # ── the hook, as a real subprocess with real stdin ─────────────────
     #
@@ -1779,7 +1819,8 @@ Messaging
   drain --session <id> --via <mode> [--json]
 
 Spawning
-  dispatch --task <t> [--harness <h>] [--alias <a>] [--worktree <branch>] [--window]
+  dispatch --task <t> [--harness <h>] [--alias <a>] [--worktree <branch>]
+                      [--env KEY=VALUE] [--window]
   claim-dispatch [--session <id>] [--pane <%N>]
 
 tmux
