@@ -283,3 +283,18 @@ teardown() {
     # No cap or mode arithmetic in TypeScript
     refute grep -qE 'MAX_BLOCKS|max_hops|block_streak' "$f"
 }
+
+# The extension read NOTIFY_DIR while mesh.sh reads MESH_NOTIFY_DIR, so setting
+# the documented override moved mesh's flags and left the watcher looking at the
+# old directory: push delivery silently dead. The test suite exported both names,
+# which is exactly why nothing noticed.
+@test "extension reads the same environment names as mesh.sh" {
+    local f="$PROJECT_ROOT/pi-extension/index.ts" v
+    for v in $(grep -oE 'process\.env\.[A-Za-z_][A-Za-z0-9_]*' "$f" \
+               | /usr/bin/sed 's/process\.env\.//' | sort -u); do
+        case "$v" in
+            MESH_DIR|MESH_NOTIFY_DIR|MESH_BIN|TMUX_PANE) ;;
+            *) printf 'extension reads %s, which mesh.sh does not set\n' "$v"; return 1 ;;
+        esac
+    done
+}

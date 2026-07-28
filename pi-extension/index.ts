@@ -27,8 +27,11 @@ import { existsSync, mkdirSync, watch, type FSWatcher } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+// Both names must match mesh.sh, which reads MESH_DIR and MESH_NOTIFY_DIR. An
+// unprefixed NOTIFY_DIR here moved mesh's flags without moving the watcher, and
+// push delivery went silently dead.
 const MESH_DIR = process.env.MESH_DIR ?? join(homedir(), ".tmux-agent-mesh");
-const NOTIFY_DIR = process.env.NOTIFY_DIR ?? join(MESH_DIR, "notify");
+const NOTIFY_DIR = process.env.MESH_NOTIFY_DIR ?? join(MESH_DIR, "notify");
 
 /** Mirrors _notify_flag in mesh.sh: anything outside [A-Za-z0-9._-] becomes _. */
 function notifyFlagName(sessionId: string): string {
