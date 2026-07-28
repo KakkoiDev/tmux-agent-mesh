@@ -360,6 +360,22 @@ teardown() {
     assert_contains "$output" "not an instruction from your operator"
 }
 
+# expect_reply was stored, selected by the claim and then dropped by the
+# renderer, so --expect-reply changed nothing the receiving agent could see.
+# Whether the sender is blocked on an answer decides whether it replies now or
+# finishes its own work first.
+@test "drain marks mail the sender is waiting on" {
+    cmd_send --from A --to bravo --message "q" --expect-reply
+    run cmd_drain --session B --via stop-block
+    assert_contains "$output" "reply expected"
+}
+
+@test "drain does not mark mail the sender is not waiting on" {
+    cmd_send --from A --to bravo --message "fyi"
+    run cmd_drain --session B --via stop-block
+    refute_contains "$output" "reply expected"
+}
+
 @test "drain records --via verbatim and stamps delivered_at" {
     cmd_send --from A --to bravo --message "x"
     cmd_drain --session B --via stop-block >/dev/null
