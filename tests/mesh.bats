@@ -512,6 +512,36 @@ _mock_tmux_pane() {
     assert_eq "$(msql "SELECT to_session FROM messages;")" "s2"
 }
 
+# ── selftest ─────────────────────────────────────────────────────────
+#
+# selftest is what a user runs to be shown that mesh works, so it has to be
+# worth believing. It used to check five things and register two agents on the
+# same pane, where the second evicted the first and nothing noticed.
+
+@test "selftest passes against a fresh database" {
+    run "$MESH_BIN" selftest
+    assert_ok
+    refute_contains "$output" "FAIL"
+}
+
+@test "selftest leaves the database as it found it" {
+    insert_agent bystander claude watcher %1
+    insert_message human bystander "pre-existing"
+    run "$MESH_BIN" selftest
+    assert_ok
+    assert_eq "$(count_agents)" "2"
+    assert_eq "$(count_messages)" "1"
+}
+
+# broadcast excludes only the human and the sender, so an unscoped fan-out in
+# selftest would message every real agent registered on the machine.
+@test "selftest does not reach agents outside its own run" {
+    insert_agent bystander claude watcher %1
+    run "$MESH_BIN" selftest
+    assert_ok
+    assert_eq "$(pending_for bystander)" "0"
+}
+
 # ── hook dispatch ────────────────────────────────────────────────────
 
 @test "hook SessionStart registers the session" {

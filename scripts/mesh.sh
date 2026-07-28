@@ -1517,51 +1517,178 @@ cmd_doctor() {
 
 # ── selftest ─────────────────────────────────────────────────────────
 
-# End-to-end round trip against the real database, no harness needed.
+_ST_RC=0
+
+_st_ok()   { printf 'ok    %s\n' "$1"; }
+_st_fail() { printf 'FAIL  %s\n' "$1"; _ST_RC=1; }
+
+_st_eq() {
+    if [[ "$3" == "$2" ]]; then _st_ok "$1"; else _st_fail "$1 (expected '$2', got '$3')"; fi
+}
+
+_st_has() {
+    case "$3" in
+        *"$2"*) _st_ok "$1" ;;
+        *)      _st_fail "$1 (no '$2' in the output)" ;;
+    esac
+}
+
+_st_json() {
+    if printf '%s' "$3" | jq -e "$2" >/dev/null 2>&1; then _st_ok "$1"; else _st_fail "$1"; fi
+}
+
+# A cap has to refuse, and a refusal is a non-zero exit. The subshell contains
+# both the option override and the _die.
+_st_cap() {
+    local label="$1" var="$2" val="$3"; shift 3
+    if ( export "$var=$val"; "$@" ) >/dev/null 2>&1; then
+        _st_fail "$label was allowed"
+    else
+        _st_ok "$label"
+    fi
+}
+
+# End-to-end round trip against the real database, no harness needed. Every row
+# is scoped to this pid and the run ends by asserting the tables are back where
+# they started, because this writes to the mailbox that is actually in use.
 cmd_selftest() {
     _need_jq
-    local a="selftest-a-$$" b="selftest-b-$$" rc=0
+    _ST_RC=0
+    local tag="selftest-$$"
+    local a="$tag-a" b="$tag-b" p="$tag-p" dir="/tmp/$tag"
+    local h out text mid
 
-    cmd_register --session "$a" --harness claude --cwd /tmp >/dev/null
-    cmd_register --session "$b" --harness claude --cwd /tmp >/dev/null
+    local n0_agents n0_msgs n0_threads n0_disp
+    n0_agents=$(sql "SELECT COUNT(*) FROM agents;")
+    n0_msgs=$(sql "SELECT COUNT(*) FROM messages;")
+    n0_threads=$(sql "SELECT COUNT(*) FROM threads;")
+    n0_disp=$(sql "SELECT COUNT(*) FROM dispatches;")
 
-    local out
-    out=$(cmd_send --from "$a" --to "$b" --message "selftest ping" 2>&1) || rc=1
-    printf '%s\n' "$out"
-
-    local text
-    text=$(cmd_drain --session "$b" --via stop-block)
-    if printf '%s' "$text" | grep -q "selftest ping"; then
-        printf 'ok    message delivered and rendered\n'
+    # ── configuration reached this process ─────────────────────────────
+    if [[ -n "${ENABLED:-}" && -n "${MAX_HOPS:-}" && -n "${DELIVERY:-}" ]]; then
+        _st_ok "config loaded (enabled=$ENABLED delivery=$DELIVERY max-hops=$MAX_HOPS)"
     else
-        printf 'FAIL  message did not render\n'; rc=1
-    fi
-    if printf '%s' "$text" | grep -q "untrusted input"; then
-        printf 'ok    untrusted-peer envelope present\n'
-    else
-        printf 'FAIL  envelope missing\n'; rc=1
+        _st_fail "config did not load on this path"
     fi
 
-    local again
-    again=$(cmd_drain --session "$b" --via stop-block)
-    if [[ -z "$again" ]]; then
-        printf 'ok    delivery is at-most-once\n'
+    # --pane "": a pane hosts at most one agent, so registering three against
+    # the caller's own TMUX_PANE would evict each other and leave one row.
+    cmd_register --session "$a" --harness claude --cwd "$dir" --pane "" >/dev/null
+    cmd_register --session "$b" --harness claude --cwd "$dir" --pane "" >/dev/null
+    cmd_register --session "$p" --harness pi     --cwd "$dir" --pane "" >/dev/null
+
+    # ── send, render, claim once ───────────────────────────────────────
+    if out=$(cmd_send --from "$a" --to "$b" --message "selftest ping" --expect-reply 2>&1); then
+        _st_ok "send queued a message"
     else
-        printf 'FAIL  message redelivered\n'; rc=1
+        _st_fail "send failed: $out"
+    fi
+    if [[ -f "$(_notify_flag "$b")" ]]; then
+        _st_ok "notify flag written for the pi watcher"
+    else
+        _st_fail "notify flag missing"
     fi
 
-    local h
+    text=$(cmd_drain --session "$b" --via "$tag:turn-end")
+    _st_has "mail rendered"                   "selftest ping"   "$text"
+    _st_has "untrusted-peer envelope present" "untrusted input" "$text"
+    _st_has "expect-reply surfaced"           "reply expected"  "$text"
+    _st_eq "delivery recorded the mechanism" "$tag:turn-end" \
+        "$(sql "SELECT delivered_via FROM messages WHERE to_session='$b' LIMIT 1;")"
+    _st_eq "audit line written" "1" \
+        "$(grep -c "\"to\":\"$b\"" "$DELIVERY_LOG" 2>/dev/null || printf 0)"
+    _st_eq "delivery is at-most-once" "" "$(cmd_drain --session "$b" --via "$tag:turn-end")"
+
+    # ── reply accounting ───────────────────────────────────────────────
+    mid=$(sql "SELECT id FROM messages WHERE to_session='$b' LIMIT 1;")
+    cmd_reply --from "$b" --to-message "$mid" --message "selftest pong" >/dev/null
+    _st_eq "reply increments the hop count" "1" \
+        "$(sql "SELECT hops FROM messages WHERE to_session='$a' LIMIT 1;")"
+    _st_eq "reply records the parent message" "$mid" \
+        "$(sql "SELECT reply_to_id FROM messages WHERE to_session='$a' LIMIT 1;")"
+    _st_eq "reply stays on one thread" "1" \
+        "$(sql "SELECT COUNT(DISTINCT thread_id) FROM messages WHERE from_session LIKE '$tag%';")"
+    cmd_drain --session "$a" --via "$tag:turn-end" >/dev/null
+
+    # ── the five brakes ────────────────────────────────────────────────
+    _st_cap "kill switch stops a send" ENABLED off \
+        cmd_send --from "$a" --to "$b" --message x
+    _st_cap "hop cap stops a send" MAX_HOPS 1 \
+        cmd_send --from "$a" --to "$b" --message x --hops 2
+    _st_cap "thread cap stops a send" MAX_THREAD_MSGS 0 \
+        cmd_send --from "$a" --to "$b" --message x --thread "$tag-cap"
+    # --project scopes it to this run. broadcast otherwise reaches every real
+    # agent registered on this machine.
+    _st_cap "broadcast cap stops a fan-out" MAX_BROADCAST 1 \
+        cmd_broadcast --from "$a" --project "$tag" --message x
+
+    cmd_send --from "$a" --to "$b" --message "held at the cap" >/dev/null
+    sql "UPDATE agents SET block_streak=99 WHERE session_id='$b';"
+    _st_eq "continuation budget stops forcing turns" "" "$(_hook_turn_end claude "$b" '{}')"
+    _st_eq "held mail is kept, not dropped" "1" \
+        "$(sql "SELECT COUNT(*) FROM messages WHERE to_session='$b' AND delivered_at IS NULL;")"
+    sql "UPDATE agents SET block_streak=0 WHERE session_id='$b';"
+
+    # ── harness payloads ───────────────────────────────────────────────
     for h in claude codex gemini; do
-        if _emit_continuation "$h" "x" | jq -e '.decision' >/dev/null 2>&1; then
-            printf 'ok    %s continuation payload valid\n' "$h"
-        else
-            printf 'FAIL  %s continuation payload invalid\n' "$h"; rc=1
-        fi
+        _st_json "$h continuation payload"  '.decision' "$(_emit_continuation "$h" x)"
+        _st_json "$h prompt payload"        '.hookSpecificOutput.additionalContext' \
+            "$(_emit_prompt_context "$h" x)"
+        _st_json "$h session-start payload" '.hookSpecificOutput.additionalContext' \
+            "$(_emit_session_start "$h" x "")"
     done
+    _st_json "claude seeds a dispatched session" \
+        '.hookSpecificOutput.initialUserMessage == "do it"' \
+        "$(_emit_session_start claude ctx "do it")"
 
-    sql "DELETE FROM messages WHERE from_session='$a' OR to_session='$b';"
-    cmd_deregister --session "$a"; cmd_deregister --session "$b"
-    return "$rc"
+    # ── the hook, as a real subprocess with real stdin ─────────────────
+    out=$(printf '{"session_id":"%s"}' "$b" \
+          | "$SCRIPTS_DIR/mesh.sh" hook Stop --harness claude 2>/dev/null)
+    _st_json "hook continues a turn on compact stdin" '.decision == "block"' "$out"
+    cmd_send --from "$a" --to "$b" --message "pretty stdin" >/dev/null
+    out=$(printf '{\n  "session_id": "%s"\n}\n' "$b" \
+          | "$SCRIPTS_DIR/mesh.sh" hook Stop --harness claude 2>/dev/null)
+    _st_json "hook continues a turn on pretty-printed stdin" '.decision == "block"' "$out"
+
+    # ── pi delivery ────────────────────────────────────────────────────
+    cmd_send --from "$a" --to "$p" --message "wake up" >/dev/null
+    text=$(cmd_pi_deliver --session "$p" --mode push)
+    _st_has "pi push delivers"      "wake up" "$text"
+    _st_eq  "pi push spends budget" "1"       "$(_block_streak "$p")"
+
+    sql "UPDATE agents SET block_streak=99 WHERE session_id='$p';"
+    cmd_send --from "$a" --to "$p" --message "over budget" >/dev/null
+    _st_eq "pi push is silent at the budget" "" "$(cmd_pi_deliver --session "$p" --mode push)"
+    text=$(cmd_pi_deliver --session "$p" --mode before-start)
+    _st_has "pi before-start ignores the budget" "over budget" "$text"
+
+    # ── dispatch handover ──────────────────────────────────────────────
+    sql "INSERT INTO dispatches (tmux_pane, harness, task, alias, reply_to_session)
+         VALUES ('$tag-pane', 'claude', 'audit the thing', '$tag-alias', '$a');"
+    _st_eq "dispatch hands over its task" "audit the thing" \
+        "$(_claim_dispatch "$b" "$tag-pane" || true)"
+    _st_eq "dispatch is claimed only once" "" "$(_claim_dispatch "$b" "$tag-pane" || true)"
+    _st_eq "dispatch records who to report back to" "$a" "$(_dispatch_reply_to "$b")"
+    sql "INSERT INTO dispatches (tmux_pane, harness, task, alias)
+         VALUES ('$tag-pane2', 'claude', 'second task', '$tag-alias');"
+    _st_eq "a taken alias costs the alias, not the task" "second task" \
+        "$(_claim_dispatch "$a" "$tag-pane2" || true)"
+
+    # ── clean up and prove it ──────────────────────────────────────────
+    sql "DELETE FROM messages WHERE from_session LIKE '$tag%' OR to_session LIKE '$tag%';
+         DELETE FROM dispatches WHERE tmux_pane LIKE '$tag%';"
+    cmd_deregister --session "$a" >/dev/null
+    cmd_deregister --session "$b" >/dev/null
+    cmd_deregister --session "$p" >/dev/null
+    sql "DELETE FROM threads WHERE thread_id NOT IN (SELECT DISTINCT thread_id FROM messages);"
+    _update_status
+
+    _st_eq "agents table restored"     "$n0_agents"  "$(sql "SELECT COUNT(*) FROM agents;")"
+    _st_eq "messages table restored"   "$n0_msgs"    "$(sql "SELECT COUNT(*) FROM messages;")"
+    _st_eq "threads table restored"    "$n0_threads" "$(sql "SELECT COUNT(*) FROM threads;")"
+    _st_eq "dispatches table restored" "$n0_disp"    "$(sql "SELECT COUNT(*) FROM dispatches;")"
+
+    return "$_ST_RC"
 }
 
 # ── main ─────────────────────────────────────────────────────────────
