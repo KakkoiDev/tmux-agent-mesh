@@ -451,6 +451,67 @@ _mock_tmux_pane() {
     assert_eq "$(count_messages)" "1"
 }
 
+# _update_status counts every undelivered row, so mail for an agent that will
+# never come back kept a mail badge on the status bar forever. cleanup only
+# purged *delivered* mail, so nothing ever removed it.
+@test "cleanup drops pending mail addressed to an agent that is gone" {
+    insert_message human ghost "nobody will ever read this"
+    tmux() { case "$1" in list-panes) printf '' ;; *) return 1 ;; esac; }
+    cmd_cleanup
+    assert_eq "$(count_messages)" "0"
+}
+
+@test "cleanup keeps pending mail addressed to a registered agent" {
+    insert_agent s1 claude reviewer %1
+    insert_message human s1 "still wanted"
+    tmux() { case "$1" in list-panes) printf '%%1\n' ;; *) return 1 ;; esac; }
+    cmd_cleanup
+    assert_eq "$(count_messages)" "1"
+}
+
+# An unclaimed dispatch was never reaped. Pane ids restart at %0 after a tmux
+# server restart, so a stale row could be claimed by an unrelated fresh agent.
+@test "cleanup reaps an unclaimed dispatch whose pane is gone" {
+    msql "INSERT INTO dispatches (tmux_pane, harness, task) VALUES ('%99','claude','stale');"
+    tmux() { case "$1" in list-panes) printf '%%1\n' ;; *) return 1 ;; esac; }
+    cmd_cleanup
+    assert_eq "$(msql 'SELECT COUNT(*) FROM dispatches;')" "0"
+}
+
+@test "cleanup keeps an unclaimed dispatch whose pane is still live" {
+    msql "INSERT INTO dispatches (tmux_pane, harness, task) VALUES ('%1','claude','waiting');"
+    tmux() { case "$1" in list-panes) printf '%%1\n' ;; *) return 1 ;; esac; }
+    cmd_cleanup
+    assert_eq "$(msql 'SELECT COUNT(*) FROM dispatches;')" "1"
+}
+
+# ── deregister leaves nothing behind ─────────────────────────────────
+
+@test "deregister drops the agent's undelivered mail" {
+    insert_agent s1 claude reviewer %1
+    insert_message human s1 "never read"
+    cmd_deregister --session s1
+    assert_eq "$(count_messages)" "0"
+}
+
+@test "deregister logs the mail it could not deliver" {
+    insert_agent s1 claude reviewer %1
+    insert_message human s1 "never read"
+    cmd_deregister --session s1
+    assert_file "$DELIVERY_LOG"
+    jq -e 'select(.via == "undeliverable") | .to == "s1"' < "$DELIVERY_LOG"
+}
+
+@test "deregister leaves other agents' mail alone" {
+    insert_agent s1 claude reviewer %1
+    insert_agent s2 claude builder %2
+    insert_message human s1 "for s1"
+    insert_message human s2 "for s2"
+    cmd_deregister --session s1
+    assert_eq "$(count_messages)" "1"
+    assert_eq "$(msql "SELECT to_session FROM messages;")" "s2"
+}
+
 # ── hook dispatch ────────────────────────────────────────────────────
 
 @test "hook SessionStart registers the session" {

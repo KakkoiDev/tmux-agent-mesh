@@ -318,8 +318,22 @@ cmd_deregister() {
     esid=$(sql_esc "$sid")
     sql "UPDATE threads SET closed_at=unixepoch()
          WHERE closed_at IS NULL AND opener_session='$esid';"
+
+    # This agent's mail can never be delivered now, and _update_status counts
+    # every undelivered row, so leaving it behind keeps a mail badge on the
+    # status bar forever. Log it before dropping it: the audit log is this
+    # project's answer to mail that did not arrive.
+    local orphans
+    orphans=$(sql_json "SELECT id, thread_id, from_session, hops FROM messages
+                        WHERE to_session='$esid' AND delivered_at IS NULL;")
+    if [[ "$orphans" != "[]" ]]; then
+        _log_delivery "$sid" "undeliverable" "$orphans"
+        sql "DELETE FROM messages WHERE to_session='$esid' AND delivered_at IS NULL;"
+    fi
+
     sql "DELETE FROM agents WHERE session_id='$esid';"
     rm -f "$(_notify_flag "$sid")" 2>/dev/null || true
+    _update_status
     _debug_log "deregister sid=$sid"
     return 0
 }
@@ -1311,8 +1325,25 @@ cmd_cleanup() {
 $(sql_sep '|' "SELECT session_id, COALESCE(tmux_pane,'') FROM agents;")
 EOF
 
+    # A dispatch nobody claimed is not harmless: tmux restarts pane ids at %0,
+    # so a stale row can be claimed by an unrelated agent that happens to land
+    # on the same pane id.
+    local did dpane
+    while IFS='|' read -r did dpane; do
+        [[ -z "$did" ]] && continue
+        [[ -z "$dpane" ]] && continue
+        if printf '%s\n' "$live" | grep -qxF "$dpane"; then continue; fi
+        _debug_log "cleanup reaping dispatch=$did pane=$dpane (dead pane)"
+        sql "DELETE FROM dispatches WHERE id=$did;"
+    done <<EOF
+$(sql_sep '|' "SELECT id, COALESCE(tmux_pane,'') FROM dispatches WHERE claimed_at IS NULL;")
+EOF
+
     sql "DELETE FROM messages WHERE delivered_at IS NOT NULL AND delivered_at < unixepoch()-86400;"
     sql "DELETE FROM dispatches WHERE claimed_at IS NOT NULL AND claimed_at < unixepoch()-86400;"
+    # Nothing else ever removes mail for a session that is no longer registered.
+    sql "DELETE FROM messages
+          WHERE delivered_at IS NULL AND to_session NOT IN (SELECT session_id FROM agents);"
     sql "DELETE FROM threads WHERE thread_id NOT IN (SELECT DISTINCT thread_id FROM messages);"
     _update_status
     return 0
