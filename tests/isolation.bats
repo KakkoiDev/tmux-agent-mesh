@@ -26,7 +26,7 @@ teardown() {
 @test "mesh reads no unprefixed environment overrides" {
     run grep -nE '^[A-Z_]+="\$\{(DB|NOTIFY_DIR|DELIVERY_LOG|CACHE|TRACKER_DIR)' \
         "$PROJECT_ROOT/scripts/mesh.sh"
-    [[ "$status" -ne 0 ]]
+    assert_fail
 }
 
 @test "every environment override is MESH_ prefixed" {
@@ -45,13 +45,13 @@ teardown() {
     local other="$TEST_TMPDIR/other.db"
     DB="$other" MESH_DIR="$MESH_DIR" MESH_DB="$MESH_DB" \
         "$MESH_BIN" register --session envtest --harness claude --cwd /tmp
-    [[ ! -f "$other" ]]
-    [[ "$(msql "SELECT COUNT(*) FROM agents WHERE session_id='envtest';")" == "1" ]]
+    refute_file "$other"
+    assert_eq "$(msql "SELECT COUNT(*) FROM agents WHERE session_id='envtest';")" "1"
 }
 
 @test "tracker env vars are never consumed" {
     run grep -nE 'TRACKER_DIR|tracker\.db' "$PROJECT_ROOT/scripts/mesh.sh"
-    [[ "$status" -ne 0 ]]
+    assert_fail
 }
 
 # ── stderr hygiene ───────────────────────────────────────────────────
@@ -66,14 +66,14 @@ teardown() {
     chmod 500 "$ro"
     MESH_DIR="$ro" run _update_status
     chmod 700 "$ro"
-    [[ "$status" -eq 0 ]]
-    [[ -z "$output" ]]
+    assert_ok
+    assert_empty "$output"
 }
 
 @test "turn-end hook writes nothing to stderr on a clean mailbox" {
     cmd_register --session S1 --harness claude --cwd /tmp >/dev/null
     run --separate-stderr _hook_turn_end claude S1 '{}'
-    [[ -z "$stderr" ]]
+    assert_empty "$stderr"
 }
 
 @test "turn-end hook writes nothing to stderr when delivering" {
@@ -81,41 +81,41 @@ teardown() {
     cmd_register --session S2 --harness claude --cwd /tmp >/dev/null
     cmd_send --from S1 --to S2 --message "x" >/dev/null
     run --separate-stderr _hook_turn_end claude S2 '{}'
-    [[ -z "$stderr" ]]
+    assert_empty "$stderr"
 }
 
 @test "prompt hook writes nothing to stderr" {
     cmd_register --session S1 --harness claude --cwd /tmp >/dev/null
     run --separate-stderr _hook_prompt claude S1
-    [[ -z "$stderr" ]]
+    assert_empty "$stderr"
 }
 
 @test "session start writes nothing to stderr with no peers" {
     msql "DELETE FROM agents;"
     run --separate-stderr _hook_session_start claude solo /tmp
-    [[ -z "$stderr" ]]
+    assert_empty "$stderr"
 }
 
 # ── hook robustness ──────────────────────────────────────────────────
 
 @test "hook exits zero on malformed stdin" {
     run bash -c "printf 'not json at all' | MESH_DIR='$MESH_DIR' MESH_DB='$MESH_DB' MESH_NOTIFY_DIR='$NOTIFY_DIR' '$MESH_BIN' hook Stop"
-    [[ "$status" -eq 0 ]]
+    assert_ok
 }
 
 @test "hook exits zero on empty stdin" {
     run bash -c "printf '' | MESH_DIR='$MESH_DIR' MESH_DB='$MESH_DB' MESH_NOTIFY_DIR='$NOTIFY_DIR' '$MESH_BIN' hook Stop"
-    [[ "$status" -eq 0 ]]
+    assert_ok
 }
 
 @test "hook exits zero for an unknown harness name" {
     run bash -c "echo '{\"session_id\":\"x\"}' | MESH_DIR='$MESH_DIR' MESH_DB='$MESH_DB' MESH_NOTIFY_DIR='$NOTIFY_DIR' '$MESH_BIN' hook Stop --harness nonesuch"
-    [[ "$status" -eq 0 ]]
+    assert_ok
 }
 
 @test "hook exits zero when the database is unreadable" {
     chmod 000 "$DB"
     run bash -c "echo '{\"session_id\":\"x\"}' | MESH_DIR='$MESH_DIR' MESH_DB='$MESH_DB' MESH_NOTIFY_DIR='$NOTIFY_DIR' '$MESH_BIN' hook Stop"
     chmod 600 "$DB"
-    [[ "$status" -eq 0 ]]
+    assert_ok
 }

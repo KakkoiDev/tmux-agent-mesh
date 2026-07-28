@@ -40,8 +40,8 @@ hook_cmds() {
 
     install_into_fake_home --claude >/dev/null
 
-    [[ -L "$FAKE_HOME/.claude/settings.json" ]]
-    [[ "$(readlink "$FAKE_HOME/.claude/settings.json")" == "$REAL_DOTFILES/settings.json" ]]
+    assert_symlink "$FAKE_HOME/.claude/settings.json"
+    assert_eq "$(readlink "$FAKE_HOME/.claude/settings.json")" "$REAL_DOTFILES/settings.json"
 }
 
 @test "wiring claude writes through to the symlink target" {
@@ -51,7 +51,7 @@ hook_cmds() {
     install_into_fake_home --claude >/dev/null
 
     run hook_cmds "$REAL_DOTFILES/settings.json" Stop
-    [[ "$output" == *"tmux-agent-mesh hook Stop --harness claude"* ]]
+    assert_contains "$output" "tmux-agent-mesh hook Stop --harness claude"
 }
 
 @test "uninstall keeps a symlinked settings.json a symlink" {
@@ -61,9 +61,9 @@ hook_cmds() {
 
     HOME="$FAKE_HOME" MESH_DIR="$MESH_DIR" bash "$PROJECT_ROOT/uninstall.sh" >/dev/null
 
-    [[ -L "$FAKE_HOME/.claude/settings.json" ]]
+    assert_symlink "$FAKE_HOME/.claude/settings.json"
     run hook_cmds "$REAL_DOTFILES/settings.json" Stop
-    [[ "$output" != *"tmux-agent-mesh"* ]]
+    refute_contains "$output" "tmux-agent-mesh"
 }
 
 # ── coexistence with the sibling plugins ─────────────────────────────
@@ -75,8 +75,8 @@ hook_cmds() {
     install_into_fake_home --claude >/dev/null
 
     run hook_cmds "$FAKE_HOME/.claude/settings.json" Stop
-    [[ "$output" == *"tmux-agent-tracker hook Stop"* ]]
-    [[ "$output" == *"tmux-agent-mesh hook Stop --harness claude"* ]]
+    assert_contains "$output" "tmux-agent-tracker hook Stop"
+    assert_contains "$output" "tmux-agent-mesh hook Stop --harness claude"
 }
 
 @test "uninstall removes only the mesh hook" {
@@ -87,8 +87,8 @@ hook_cmds() {
     HOME="$FAKE_HOME" MESH_DIR="$MESH_DIR" bash "$PROJECT_ROOT/uninstall.sh" >/dev/null
 
     run hook_cmds "$FAKE_HOME/.claude/settings.json" Stop
-    [[ "$output" == *"tmux-agent-tracker hook Stop"* ]]
-    [[ "$output" != *"tmux-agent-mesh"* ]]
+    assert_contains "$output" "tmux-agent-tracker hook Stop"
+    refute_contains "$output" "tmux-agent-mesh"
 }
 
 @test "uninstall preserves unrelated settings keys" {
@@ -98,7 +98,7 @@ hook_cmds() {
     HOME="$FAKE_HOME" MESH_DIR="$MESH_DIR" bash "$PROJECT_ROOT/uninstall.sh" >/dev/null
 
     run jq -r '.model' "$FAKE_HOME/.claude/settings.json"
-    [[ "$output" == "opus" ]]
+    assert_eq "$output" "opus"
 }
 
 # ── idempotency ──────────────────────────────────────────────────────
@@ -110,13 +110,13 @@ hook_cmds() {
     local n
     n=$(jq '[.hooks.Stop[]?.hooks[]? | select(.command | test("tmux-agent-mesh"))] | length' \
         "$FAKE_HOME/.claude/settings.json")
-    [[ "$n" -eq 1 ]]
+    assert_num_eq "$n" 1
 }
 
 @test "the second run reports the hooks as already wired" {
     install_into_fake_home --claude >/dev/null
     run install_into_fake_home --claude
-    [[ "$output" == *"already wired"* ]]
+    assert_contains "$output" "already wired"
 }
 
 @test "installer creates a backup once, not on every run" {
@@ -125,7 +125,7 @@ hook_cmds() {
     printf '{"changed":true}\n' > "$FAKE_HOME/.claude/settings.json.mesh-backup"
     install_into_fake_home --claude >/dev/null
     run jq -r '.changed' "$FAKE_HOME/.claude/settings.json.mesh-backup"
-    [[ "$output" == "true" ]]
+    assert_eq "$output" "true"
 }
 
 # ── per-harness wiring ───────────────────────────────────────────────
@@ -133,52 +133,52 @@ hook_cmds() {
 @test "codex wiring lands in hooks.json with the codex harness flag" {
     install_into_fake_home --codex >/dev/null
     run hook_cmds "$FAKE_HOME/.codex/hooks.json" Stop
-    [[ "$output" == *"--harness codex"* ]]
+    assert_contains "$output" "--harness codex"
 }
 
 @test "codex wiring does not touch config.toml" {
     printf 'notify = ["tmux-agent-tracker", "codex-notify"]\n' > "$FAKE_HOME/.codex/config.toml"
     install_into_fake_home --codex >/dev/null
     run cat "$FAKE_HOME/.codex/config.toml"
-    [[ "$output" == 'notify = ["tmux-agent-tracker", "codex-notify"]' ]]
+    assert_eq "$output" 'notify = ["tmux-agent-tracker", "codex-notify"]'
 }
 
 # Gemini names the turn boundaries differently; wiring Stop there would be inert.
 @test "gemini wiring uses BeforeAgent and AfterAgent" {
     install_into_fake_home --gemini >/dev/null
     run hook_cmds "$FAKE_HOME/.gemini/settings.json" AfterAgent
-    [[ "$output" == *"--harness gemini"* ]]
+    assert_contains "$output" "--harness gemini"
     run hook_cmds "$FAKE_HOME/.gemini/settings.json" BeforeAgent
-    [[ "$output" == *"--harness gemini"* ]]
+    assert_contains "$output" "--harness gemini"
     run hook_cmds "$FAKE_HOME/.gemini/settings.json" Stop
-    [[ -z "$output" ]]
+    assert_empty "$output"
 }
 
 @test "claude wiring uses Stop and UserPromptSubmit" {
     install_into_fake_home --claude >/dev/null
     run hook_cmds "$FAKE_HOME/.claude/settings.json" UserPromptSubmit
-    [[ "$output" == *"--harness claude"* ]]
+    assert_contains "$output" "--harness claude"
     run hook_cmds "$FAKE_HOME/.claude/settings.json" AfterAgent
-    [[ -z "$output" ]]
+    assert_empty "$output"
 }
 
 # ── base install ─────────────────────────────────────────────────────
 
 @test "base install wires no harness" {
     run install_into_fake_home
-    [[ "$output" == *"No harness wired"* ]]
-    [[ ! -f "$FAKE_HOME/.codex/hooks.json" ]]
+    assert_contains "$output" "No harness wired"
+    refute_file "$FAKE_HOME/.codex/hooks.json"
 }
 
 @test "base install links the cli and syncs the skill" {
     install_into_fake_home >/dev/null
-    [[ -L "$FAKE_HOME/.local/bin/tmux-agent-mesh" ]]
-    [[ -f "$FAKE_HOME/.claude/skills/tmux-agent-mesh/SKILL.md" ]]
+    assert_symlink "$FAKE_HOME/.local/bin/tmux-agent-mesh"
+    assert_file "$FAKE_HOME/.claude/skills/tmux-agent-mesh/SKILL.md"
 }
 
 @test "installer rejects unknown flags" {
     run install_into_fake_home --wat
-    [[ "$status" -ne 0 ]]
+    assert_fail
 }
 
 # ── data safety ──────────────────────────────────────────────────────
@@ -187,11 +187,11 @@ hook_cmds() {
 @test "uninstall keeps the database by default" {
     install_into_fake_home --claude >/dev/null
     HOME="$FAKE_HOME" MESH_DIR="$MESH_DIR" bash "$PROJECT_ROOT/uninstall.sh" >/dev/null
-    [[ -f "$MESH_DB" ]]
+    assert_file "$MESH_DB"
 }
 
 @test "uninstall --purge removes the data directory" {
     install_into_fake_home --claude >/dev/null
     HOME="$FAKE_HOME" MESH_DIR="$MESH_DIR" bash "$PROJECT_ROOT/uninstall.sh" --purge >/dev/null
-    [[ ! -d "$MESH_DIR" ]]
+    refute_dir "$MESH_DIR"
 }

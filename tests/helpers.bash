@@ -5,6 +5,46 @@ PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPTS_DIR="$PROJECT_ROOT/scripts"
 MESH_BIN="$SCRIPTS_DIR/mesh.sh"
 
+# ── assertions ───────────────────────────────────────────────────────
+#
+# Every assertion goes through a function, and never through a bare
+# [[ ]] or ! cmd. bash 3.2 (the system bash on macOS, and the one this
+# suite runs under) does not trip `set -e` or the ERR trap for either of
+# those when they are not the last statement of the test body:
+#
+#   bash-3.2 -c 'set -e; f(){ [[ 1 == 2 ]]; echo REACHED; }; f'   -> REACHED
+#   bash-3.2 -c 'set -e; f(){ ! true; echo REACHED; }; f'         -> REACHED
+#
+# A failing *function* call does propagate, on 3.2 as on 5.x, so wrapping
+# is what makes an assertion load-bearing. This is not cosmetic: the suite
+# was green for 227 tests while one of them asserted a value the code has
+# never written.
+
+_afail() { printf 'assertion failed: %s\n' "$*" >&2; return 1; }
+
+assert_ok()   { [[ "$status" -eq 0 ]] || _afail "expected success, got status $status: $output"; }
+assert_fail() { [[ "$status" -ne 0 ]] || _afail "expected failure, got status 0: $output"; }
+assert_status() { [[ "$status" -eq "$1" ]] || _afail "expected status $1, got $status: $output"; }
+
+assert_eq() { [[ "$1" == "$2" ]] || _afail "expected '$2', got '$1'"; }
+assert_ne() { [[ "$1" != "$2" ]] || _afail "expected anything but '$2'"; }
+assert_num_eq() { [[ "$1" -eq "$2" ]] || _afail "expected $2, got '$1'"; }
+
+assert_contains() { [[ "$1" == *"$2"* ]] || _afail "'$1' does not contain '$2'"; }
+refute_contains() { [[ "$1" != *"$2"* ]] || _afail "'$1' unexpectedly contains '$2'"; }
+assert_match()    { [[ "$1" == $2 ]] || _afail "'$1' does not match '$2'"; }
+assert_empty()    { [[ -z "$1" ]] || _afail "expected empty, got '$1'"; }
+assert_not_empty() { [[ -n "$1" ]] || _afail "expected a value, got empty"; }
+
+assert_file()    { [[ -f "$1" ]] || _afail "no such file: $1"; }
+refute_file()    { [[ ! -f "$1" ]] || _afail "file should not exist: $1"; }
+assert_dir()     { [[ -d "$1" ]] || _afail "no such directory: $1"; }
+refute_dir()     { [[ ! -d "$1" ]] || _afail "directory should not exist: $1"; }
+assert_symlink() { [[ -L "$1" ]] || _afail "not a symlink: $1"; }
+
+# `! cmd` has the same bash 3.2 problem as a bare [[ ]].
+refute() { if "$@"; then _afail "expected '$*' to fail"; fi; }
+
 setup_test_env() {
     TEST_TMPDIR=$(mktemp -d)
     # MESH_-prefixed on purpose: a bare DB would also be read by
