@@ -1642,13 +1642,34 @@ cmd_selftest() {
         "$(_emit_session_start claude ctx "do it")"
 
     # ── the hook, as a real subprocess with real stdin ─────────────────
-    out=$(printf '{"session_id":"%s"}' "$b" \
-          | "$SCRIPTS_DIR/mesh.sh" hook Stop --harness claude 2>/dev/null)
-    _st_json "hook continues a turn on compact stdin" '.decision == "block"' "$out"
-    cmd_send --from "$a" --to "$b" --message "pretty stdin" >/dev/null
-    out=$(printf '{\n  "session_id": "%s"\n}\n' "$b" \
-          | "$SCRIPTS_DIR/mesh.sh" hook Stop --harness claude 2>/dev/null)
-    _st_json "hook continues a turn on pretty-printed stdin" '.decision == "block"' "$out"
+    #
+    # The prompt path delivers under every mode except off, so it probes stdin
+    # parsing without depending on the configured delivery policy. Forcing a
+    # turn is a separate claim and only true under stop-block.
+    if [[ "${DELIVERY:-stop-block}" == "off" ]]; then
+        printf 'skip  hook delivery (@agent-mesh-delivery is off)\n'
+    else
+        cmd_send --from "$a" --to "$b" --message "compact stdin" >/dev/null
+        out=$(printf '{"session_id":"%s"}' "$b" \
+              | "$SCRIPTS_DIR/mesh.sh" hook UserPromptSubmit --harness claude 2>/dev/null)
+        _st_json "hook reads compact stdin" \
+            '.hookSpecificOutput.additionalContext | contains("compact stdin")' "$out"
+
+        cmd_send --from "$a" --to "$b" --message "pretty stdin" >/dev/null
+        out=$(printf '{\n  "session_id": "%s"\n}\n' "$b" \
+              | "$SCRIPTS_DIR/mesh.sh" hook UserPromptSubmit --harness claude 2>/dev/null)
+        _st_json "hook reads pretty-printed stdin" \
+            '.hookSpecificOutput.additionalContext | contains("pretty stdin")' "$out"
+
+        if [[ "${DELIVERY:-stop-block}" == "stop-block" ]]; then
+            cmd_send --from "$a" --to "$b" --message "turn end" >/dev/null
+            out=$(printf '{"session_id":"%s"}' "$b" \
+                  | "$SCRIPTS_DIR/mesh.sh" hook Stop --harness claude 2>/dev/null)
+            _st_json "turn-end hook forces a continuation" '.decision == "block"' "$out"
+        else
+            printf 'skip  turn-end continuation (@agent-mesh-delivery is %s)\n' "$DELIVERY"
+        fi
+    fi
 
     # ── pi delivery ────────────────────────────────────────────────────
     cmd_send --from "$a" --to "$p" --message "wake up" >/dev/null

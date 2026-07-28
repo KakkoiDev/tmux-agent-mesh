@@ -160,6 +160,26 @@ EOF
     assert_eq "$(count_messages)" "1"
 }
 
+# ── selftest reports on the configured behaviour, not the default ─────
+
+# Observed on a real install: selftest reported two failures purely because
+# @agent-mesh-delivery was next-prompt, which is a documented setting.
+@test "selftest passes under next-prompt delivery" {
+    plant_config "DELIVERY='next-prompt'"
+    run "$MESH_BIN" selftest
+    assert_ok
+    assert_contains "$output" "skip  turn-end continuation"
+    refute_contains "$output" "FAIL"
+}
+
+@test "selftest passes with delivery off" {
+    plant_config "DELIVERY='off'"
+    run "$MESH_BIN" selftest
+    assert_ok
+    assert_contains "$output" "skip  hook delivery"
+    refute_contains "$output" "FAIL"
+}
+
 # ── not installed means inert ─────────────────────────────────────────
 
 @test "loading config does not create the data dir on an uninstalled machine" {
