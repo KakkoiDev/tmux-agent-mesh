@@ -181,27 +181,31 @@ export default function (pi: ExtensionAPI) {
     if (sessionId) mesh("deregister", "--session", sessionId);
   });
 
+  // ctx.ui is ExtensionUIContext, whose print method is notify(). Calling a
+  // method it does not have through an optional-call chain made every
+  // subcommand here run and print nothing, with no error to say why.
   pi.registerCommand("mesh", {
     description: "tmux-agent-mesh: roster, inbox, or send to another agent",
     handler: async (args: string, ctx) => {
       const argv = args.trim();
       if (!argv || argv === "roster") {
-        ctx.ui?.info?.(mesh("roster") || "mesh: no roster available");
+        ctx.ui.notify(mesh("roster") || "mesh: no roster available");
         return;
       }
       if (argv === "inbox") {
-        ctx.ui?.info?.(mesh("inbox") || "mesh: inbox empty");
+        ctx.ui.notify(mesh("inbox") || "mesh: inbox empty");
         return;
       }
       // /mesh <name> <message...>
       const sp = argv.indexOf(" ");
       if (sp < 0) {
-        ctx.ui?.info?.("usage: /mesh [roster|inbox] or /mesh <name> <message>");
+        ctx.ui.notify("usage: /mesh [roster|inbox] or /mesh <name> <message>");
         return;
       }
       const to = argv.slice(0, sp);
       const body = argv.slice(sp + 1);
-      ctx.ui?.info?.(mesh("send", "--to", to, "--message", body) || "mesh: send failed");
+      const out = mesh("send", "--to", to, "--message", body);
+      ctx.ui.notify(out || "mesh: send failed", out ? "info" : "error");
     },
   });
 }

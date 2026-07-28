@@ -284,6 +284,25 @@ teardown() {
     refute grep -qE 'MAX_BLOCKS|max_hops|block_streak' "$f"
 }
 
+# ctx.ui has no `info` method; it has `notify`. The optional-call chain
+# `ctx.ui?.info?.()` meant every /mesh subcommand shelled out and printed
+# nothing at all, with no error to show what was wrong.
+@test "extension does not call a ui method that does not exist" {
+    refute grep -qE 'ui\??\.info' "$PROJECT_ROOT/pi-extension/index.ts"
+}
+
+# The test that would have caught it: check the calls against the installed
+# package's own type definitions rather than against memory.
+@test "every ui method the extension calls exists in the installed pi types" {
+    local types m
+    types=$(pi_types_file) || skip "pi package types not found"
+    for m in $(grep -oE 'ui\??\.[a-zA-Z]+' "$PROJECT_ROOT/pi-extension/index.ts" \
+               | /usr/bin/sed -E 's/^ui\??\.//' | sort -u); do
+        grep -qE "^[[:space:]]+$m\(" "$types" \
+            || _afail "ui.$m() is not in ExtensionUIContext ($types)"
+    done
+}
+
 # The extension read NOTIFY_DIR while mesh.sh reads MESH_NOTIFY_DIR, so setting
 # the documented override moved mesh's flags and left the watcher looking at the
 # old directory: push delivery silently dead. The test suite exported both names,

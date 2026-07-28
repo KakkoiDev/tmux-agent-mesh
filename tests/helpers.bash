@@ -146,6 +146,17 @@ source_mesh_functions() {
     SCRIPTS_DIR="$PROJECT_ROOT/scripts"
 }
 
+# Path to the installed pi extension type definitions, for checking the
+# extension's calls against the real API instead of against memory. Fails when
+# pi is not installed, so the caller can skip.
+pi_types_file() {
+    local bin f
+    bin=$(command -v pi 2>/dev/null) || return 1
+    f="$(dirname "$bin")/../lib/node_modules/@earendil-works/pi-coding-agent/dist/core/extensions/types.d.ts"
+    [[ -f "$f" ]] || return 1
+    printf '%s' "$f"
+}
+
 # ── fixtures ─────────────────────────────────────────────────────────
 
 insert_agent() {
