@@ -555,6 +555,25 @@ EOF
 
 # ── inbox / drain ────────────────────────────────────────────────────
 
+_inbox_query() {
+    printf 'SELECT m.id, m.thread_id, COALESCE(a.alias, m.from_session) AS from_name,
+                   m.hops, m.created_at, m.body
+            FROM messages m LEFT JOIN agents a ON a.session_id=m.from_session
+            WHERE m.to_session=%s AND m.delivered_at IS NULL AND m.id > %s
+            ORDER BY m.id' "'$(sql_esc "$1")'" "${2:-0}"
+}
+
+_print_inbox() {
+    local id thread fname hops created body
+    while IFS='|' read -r id thread fname hops created body; do
+        [[ -z "$id" ]] && continue
+        printf '#%-5s from %-12s thread %-18s hop %s\n' "$id" "$fname" "$thread" "$hops"
+        printf '      %s\n' "$body"
+    done <<EOF
+$(sql_sep '|' "$(_inbox_query "$1" "${2:-0}");")
+EOF
+}
+
 cmd_inbox() {
     local as="" as_json=0 follow=0 rc sid
     while [[ $# -gt 0 ]]; do
@@ -575,34 +594,17 @@ cmd_inbox() {
         sid=$(_self_session "")
     fi
 
-    local q="SELECT m.id, m.thread_id, COALESCE(a.alias, m.from_session) AS from_name,
-                    m.hops, m.created_at, m.body
-             FROM messages m LEFT JOIN agents a ON a.session_id=m.from_session
-             WHERE m.to_session='$(sql_esc "$sid")' AND m.delivered_at IS NULL
-             ORDER BY m.id"
-
     if [[ "$as_json" -eq 1 ]]; then
-        sql_json "$q;"
+        sql_json "$(_inbox_query "$sid");"
         printf '\n'
         return 0
     fi
-
-    _print_inbox() {
-        local id thread fname hops created body
-        while IFS='|' read -r id thread fname hops created body; do
-            [[ -z "$id" ]] && continue
-            printf '#%-5s from %-12s thread %-18s hop %s\n' "$id" "$fname" "$thread" "$hops"
-            printf '      %s\n' "$body"
-        done <<EOF
-$(sql_sep '|' "$q;")
-EOF
-    }
 
     if [[ "$follow" -eq 0 ]]; then
         local n
         n=$(sql "SELECT COUNT(*) FROM messages WHERE to_session='$(sql_esc "$sid")' AND delivered_at IS NULL;")
         printf 'inbox for %s: %s pending\n' "$(_display_name "$sid")" "$n"
-        _print_inbox
+        _print_inbox "$sid"
         return 0
     fi
 
@@ -611,11 +613,7 @@ EOF
     while true; do
         maxid=$(sql "SELECT COALESCE(MAX(id),0) FROM messages WHERE to_session='$(sql_esc "$sid")';")
         if [[ "${maxid:-0}" -gt "$seen" ]]; then
-            sql_sep '|' "$q AND m.id > $seen;" | while IFS='|' read -r id thread fname hops created body; do
-                [[ -z "$id" ]] && continue
-                printf '#%-5s from %-12s thread %-18s hop %s\n      %s\n' \
-                    "$id" "$fname" "$thread" "$hops" "$body"
-            done
+            _print_inbox "$sid" "$seen"
             seen="$maxid"
         fi
         sleep 1

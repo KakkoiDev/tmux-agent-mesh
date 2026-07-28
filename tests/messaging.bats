@@ -321,6 +321,28 @@ teardown() {
     assert_contains "$output" "0 pending"
 }
 
+# --follow appended `AND m.id > $seen` to a query that already ended in
+# ORDER BY m.id, producing `ORDER BY m.id AND m.id > N`. That is valid SQL
+# which orders by a boolean and filters nothing, so every new message
+# reprinted the whole pending list.
+@test "the followed inbox prints only messages newer than the last seen id" {
+    cmd_send --from A --to bravo --message "first"
+    cmd_send --from A --to bravo --message "second"
+    cmd_send --from A --to bravo --message "third"
+    run _print_inbox B 2
+    assert_contains "$output" "third"
+    refute_contains "$output" "first"
+    refute_contains "$output" "second"
+}
+
+@test "the followed inbox starts by printing everything pending" {
+    cmd_send --from A --to bravo --message "first"
+    cmd_send --from A --to bravo --message "second"
+    run _print_inbox B 0
+    assert_contains "$output" "first"
+    assert_contains "$output" "second"
+}
+
 # ── drain ────────────────────────────────────────────────────────────
 
 @test "drain renders pending mail" {
