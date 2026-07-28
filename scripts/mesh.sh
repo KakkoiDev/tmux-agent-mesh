@@ -435,6 +435,16 @@ cmd_send() {
     done
     [[ -n "$to" ]]   || _die "send: --to is required"
     [[ -n "$body" ]] || _die "send: --message is required"
+    # Both go straight into the INSERT. A non-numeric --hops also makes the cap
+    # check's arithmetic throw, and the enclosing `if` reads that as "under the
+    # cap", so an unvalidated value bypasses the caps as well.
+    case "$hops" in
+        ""|*[!0-9]*) _die "send: --hops must be a number" ;;
+    esac
+    case "$reply_to" in
+        "") ;;
+        *[!0-9]*) _die "send: --reply-to must be a message id" ;;
+    esac
 
     if [[ -n "$remote" ]]; then
         local rargs="send --to $(printf '%q' "$to") --message $(printf '%q' "$body")"

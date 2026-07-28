@@ -139,6 +139,30 @@ teardown() {
     assert_eq "$(count_messages)" "2"
 }
 
+# --hops and --reply-to are interpolated straight into the INSERT. A payload
+# that is not a number makes the cap check's [[ -gt ]] throw an arithmetic
+# syntax error, which the enclosing `if` reads as "under the cap", so the
+# unescaped value reached sqlite3 with the caps bypassed.
+@test "send refuses a non-numeric hop count" {
+    run cmd_send --from A --to bravo --message "x" --hops '0); DROP TABLE messages;--'
+    assert_fail
+    assert_eq "$(count_messages)" "0"
+    assert_contains "$(msql '.tables')" "messages"
+}
+
+@test "send refuses a non-numeric reply-to" {
+    run cmd_send --from A --to bravo --message "x" --reply-to '1); DROP TABLE messages;--'
+    assert_fail
+    assert_eq "$(count_messages)" "0"
+    assert_contains "$(msql '.tables')" "messages"
+}
+
+@test "send accepts a numeric reply-to" {
+    cmd_send --from A --to bravo --message "q"
+    cmd_send --from B --to alpha --message "a" --reply-to 1
+    assert_eq "$(msql "SELECT reply_to_id FROM messages WHERE id=2;")" "1"
+}
+
 @test "send requires both --to and --message" {
     run cmd_send --to bravo
     assert_fail
