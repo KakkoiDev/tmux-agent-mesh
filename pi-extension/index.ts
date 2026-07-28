@@ -164,11 +164,19 @@ export default function (pi: ExtensionAPI) {
    * The continuation budget only means anything if it is reset by *human*
    * input. before_agent_start also fires for the turns mesh itself triggers via
    * sendUserMessage, so resetting there would clear the budget after every push
-   * and it could never stop a runaway. `input` is raw typing, which is exactly
-   * the signal needed.
+   * and it could never stop a runaway.
+   *
+   * `input` is not that signal on its own: it fires for our own
+   * sendUserMessage too, with source "extension". Resetting on every input
+   * event meant the budget went back to zero immediately after each push, so
+   * @agent-mesh-max-blocks never stopped anything on Pi. Observed live: with
+   * max-blocks 1, two consecutive pushes both delivered and the streak stayed
+   * at 0. Only "interactive" is a person typing.
    */
-  pi.on("input", async () => {
-    if (sessionId) mesh("reset-streak", "--session", sessionId);
+  pi.on("input", async (event) => {
+    if (sessionId && event.source === "interactive") {
+      mesh("reset-streak", "--session", sessionId);
+    }
     return { action: "continue" as const };
   });
 

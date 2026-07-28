@@ -200,7 +200,7 @@ tmux-agent-tracker, and setting it would point tracker at the wrong database.
 bats tests/
 ```
 
-301 tests across seven suites. `tests/config.bats` runs mesh as a real
+302 tests across seven suites. `tests/config.bats` runs mesh as a real
 subprocess against a planted option cache, and `tests/tmux.bats` runs a tmux
 server on a private socket with `-f /dev/null`, so neither reads the machine's
 live tmux state.

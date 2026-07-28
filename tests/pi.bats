@@ -303,6 +303,20 @@ teardown() {
     done
 }
 
+# The input event fires for the extension's own sendUserMessage as well as for
+# typing, so resetting the continuation budget on every input event cleared it
+# immediately after each push and @agent-mesh-max-blocks never stopped anything
+# on Pi. Observed live: with max-blocks 1, two consecutive pushes both delivered
+# and the streak stayed at 0.
+@test "extension resets the budget only for interactive input" {
+    local f="$PROJECT_ROOT/pi-extension/index.ts"
+    grep -q 'source === "interactive"' "$f"
+    # The guard is only meaningful if pi really reports a non-interactive source.
+    local types
+    types=$(pi_types_file) || skip "pi package types not found"
+    grep -q 'InputSource = .*"extension"' "$types"
+}
+
 # The extension read NOTIFY_DIR while mesh.sh reads MESH_NOTIFY_DIR, so setting
 # the documented override moved mesh's flags and left the watcher looking at the
 # old directory: push delivery silently dead. The test suite exported both names,
