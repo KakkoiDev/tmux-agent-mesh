@@ -848,7 +848,12 @@ _claim_dispatch() {
     sql "UPDATE dispatches SET claimed_by='$(sql_esc "$sid")', claimed_at=unixepoch() WHERE id=$did;"
     local al
     al=$(sql "SELECT COALESCE(alias,'') FROM dispatches WHERE id=$did;")
-    [[ -n "$al" ]] && _set_alias "$sid" "$al" 2>/dev/null || true
+    # _set_alias exits on a taken or malformed name, and `|| true` cannot catch
+    # an exit. This function runs inside $(...), so without the subshell that
+    # exit killed the caller after the row was claimed and before the task was
+    # printed: the dispatch was consumed and the task destroyed. A name clash
+    # costs the alias, not the work.
+    [[ -n "$al" ]] && ( _set_alias "$sid" "$al" ) 2>/dev/null || true
     printf '%s' "$task"
 }
 

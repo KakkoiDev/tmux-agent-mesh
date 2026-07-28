@@ -627,6 +627,32 @@ teardown() {
     assert_eq "$(get_alias D)" "scout"
 }
 
+# _set_alias exits on a taken or malformed name. _claim_dispatch runs inside
+# $(...), so that exit killed the subshell after the row had been marked
+# claimed and before the task was printed: dispatch consumed, task destroyed.
+@test "a dispatch whose alias is taken still hands over the task" {
+    _set_alias A scout
+    msql "INSERT INTO dispatches (tmux_pane, harness, task, alias) VALUES ('%55','claude','do it','scout');"
+    run _claim_dispatch D %55
+    assert_ok
+    assert_eq "$output" "do it"
+}
+
+@test "session start still delivers the task when the dispatch alias is taken" {
+    _set_alias A scout
+    msql "INSERT INTO dispatches (tmux_pane, harness, task, alias) VALUES ('%55','claude','do it','scout');"
+    TMUX_PANE=%55
+    run _hook_session_start claude D /tmp/d
+    echo "$output" | jq -e '.hookSpecificOutput.initialUserMessage == "do it"'
+}
+
+@test "session start still delivers the task when the dispatch alias is malformed" {
+    msql "INSERT INTO dispatches (tmux_pane, harness, task, alias) VALUES ('%55','claude','do it','bad name!');"
+    TMUX_PANE=%55
+    run _hook_session_start claude D /tmp/d
+    echo "$output" | jq -e '.hookSpecificOutput.initialUserMessage == "do it"'
+}
+
 # Codex and Gemini have no initialUserMessage, so the task must fold into
 # the context string or a dispatched agent starts with no instructions.
 @test "codex session start folds the dispatch task into context" {
