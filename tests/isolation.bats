@@ -54,6 +54,36 @@ teardown() {
     assert_fail
 }
 
+# ── documented surface ───────────────────────────────────────────────
+
+# pi-deliver and reset-streak were dispatched and covered by 33 tests while
+# appearing in neither --help nor the README.
+@test "every command the dispatcher accepts is in --help" {
+    local usage verb
+    usage=$(run_mesh_help)
+    for verb in $(/usr/bin/sed -n '/^case "\${1:-}" in$/,/^esac$/p' "$SCRIPTS_DIR/mesh.sh" \
+                  | grep -oE '^ +[a-z-]+\)' | tr -d ' )'); do
+        assert_contains "$usage" "$verb"
+    done
+}
+
+# The project's whole claim is that it needs no keystroke injection. An
+# @agent-mesh-wake option promised an opt-in send-keys path and never
+# implemented it; this is the guarantee that replaced it.
+@test "no code path sends keystrokes to a pane" {
+    refute grep -rn "send-keys" "$SCRIPTS_DIR" "$PROJECT_ROOT/agent-mesh.tmux" \
+        "$PROJECT_ROOT/pi-extension"
+}
+
+@test "no configuration option is loaded and then never read" {
+    local v
+    for v in $(grep -oE '^[A-Z_]+=\$\(get_tmux_option' "$SCRIPTS_DIR/helpers.sh" \
+               | /usr/bin/sed 's/=.*//'); do
+        grep -q "\${$v" "$SCRIPTS_DIR/mesh.sh" \
+            || _afail "$v is loaded from a tmux option and never read"
+    done
+}
+
 # ── portability ──────────────────────────────────────────────────────
 #
 # helpers.sh is not part of source_mesh_functions (the awk filter strips its

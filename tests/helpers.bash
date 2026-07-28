@@ -169,6 +169,8 @@ stop_test_tmux() {
     return 0
 }
 
+run_mesh_help() { "$MESH_BIN" --help; }
+
 # Load the plugin against the private server and the fake home.
 run_plugin() {
     HOME="$FAKE_HOME" bash "$PROJECT_ROOT/agent-mesh.tmux"

@@ -1204,7 +1204,7 @@ cmd_dispatch() {
     local sender
     sender=$(_self_session "$from")
 
-    # tmux runs the command as the pane's own process. No send-keys anywhere.
+    # tmux runs the command as the pane's own process, so nothing is typed in.
     local pane
     if [[ "$as_window" -eq 1 ]]; then
         pane=$(tmux new-window -d -P -F '#{pane_id}' -c "$dir" "$cmd")
@@ -1766,6 +1766,8 @@ tmux
 
 Harness / diagnostics
   hook <event> [--harness <h>]     harness hook entry point (JSON on stdin)
+  pi-deliver --session <id> --mode push|before-start
+  reset-streak [--session <id>]    clear the continuation budget
   doctor                           check dependencies and wiring
   selftest                         end-to-end round trip, no harness needed
 USAGE

@@ -48,7 +48,6 @@ MAX_HOPS=""
 MAX_THREAD_MSGS=""
 MAX_BLOCKS=""
 MAX_BROADCAST=""
-WAKE=""
 ICON_MAIL=""
 DEBUG_LOG=""
 HOOK_ON_MAIL=""
@@ -100,7 +99,6 @@ load_config() {
     MAX_THREAD_MSGS=$(get_tmux_option "@agent-mesh-max-thread-msgs" "12")
     MAX_BLOCKS=$(get_tmux_option "@agent-mesh-max-blocks" "3")
     MAX_BROADCAST=$(get_tmux_option "@agent-mesh-max-broadcast" "8")
-    WAKE=$(get_tmux_option "@agent-mesh-wake" "off")
     ICON_MAIL=$(get_tmux_option "@agent-mesh-icon-mail" "@")
     DEBUG_LOG=$(get_tmux_option "@agent-mesh-debug-log" "0")
     HOOK_ON_MAIL=$(get_tmux_option "@agent-mesh-on-mail" "")
@@ -125,7 +123,6 @@ load_config() {
             printf 'MAX_THREAD_MSGS=%s\n' "$(_cq "$MAX_THREAD_MSGS")"
             printf 'MAX_BLOCKS=%s\n'      "$(_cq "$MAX_BLOCKS")"
             printf 'MAX_BROADCAST=%s\n'   "$(_cq "$MAX_BROADCAST")"
-            printf 'WAKE=%s\n'            "$(_cq "$WAKE")"
             printf 'ICON_MAIL=%s\n'       "$(_cq "$ICON_MAIL")"
             printf 'DEBUG_LOG=%s\n'       "$(_cq "$DEBUG_LOG")"
             printf 'HOOK_ON_MAIL=%s\n'    "$(_cq "$HOOK_ON_MAIL")"

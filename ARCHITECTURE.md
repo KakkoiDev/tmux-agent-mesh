@@ -226,8 +226,10 @@ state, mesh rows are messages, so dropping them needs the explicit `--reset`.
 | `tests/mesh.bats` | registry, addressing, cleanup |
 | `tests/messaging.bats` | mailbox, delivery, adapters, loop caps |
 | `tests/pi.bats` | push and before-start paths, budget, flag-name contract |
-| `tests/isolation.bats` | env namespace, stderr hygiene, hook robustness |
+| `tests/isolation.bats` | env namespace, stderr hygiene, hook robustness, portability |
 | `tests/install.bats` | symlink preservation, coexistence, idempotency |
+| `tests/config.bats` | option loading and the caps, as real subprocesses |
+| `tests/tmux.bats` | hooks, keys, menu, dispatch, watch, doctor, on a private socket |
 
 ## Testing
 
@@ -235,6 +237,14 @@ state, mesh rows are messages, so dropping them needs the explicit `--reset`.
 bats tests/
 ```
 
-227 tests. Bats cannot watch a harness parse hook output, so each delivery path
-also has a real two-pane manual test recorded in the README. Three of the bugs
-found so far were invisible to bats and only appeared when a real agent ran.
+299 tests. Every assertion goes through a helper function, never a bare `[[ ]]`
+or `! cmd`: bash 3.2 is the system bash on macOS and the one this suite runs
+under, and it trips neither `set -e` nor the `ERR` trap for either of those when
+they are not the last statement of a function. About a third of the assertions
+here asserted nothing until that was fixed, and the suite was green while one of
+them expected a value the code has never written. A suite that cannot fail is
+worse than no suite, because it is quoted as evidence.
+
+Bats still cannot watch a harness parse hook output, so each delivery path also
+has a real two-pane manual test recorded in the README. Three of the bugs found
+so far were invisible to bats and only appeared when a real agent ran.

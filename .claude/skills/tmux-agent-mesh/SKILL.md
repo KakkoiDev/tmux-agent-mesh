@@ -98,8 +98,14 @@ tmux options, all `set -g`:
 | `@agent-mesh-max-blocks` | `3` | Consecutive auto-continuations |
 | `@agent-mesh-max-broadcast` | `8` | Fan-out cap |
 | `@agent-mesh-on-mail` | `""` | Shell hook on new mail for the human |
-| `@agent-mesh-wake` | `off` | Opt-in send-keys wake for idle non-Pi panes |
+| `@agent-mesh-keybinding` | `g` | Menu key after the prefix |
+
+A change to any of these takes effect within 60s, or immediately after
+`tmux-agent-mesh refresh`.
+
+There is no keystroke wake. Mail for an idle Claude/Codex/Gemini agent waits for
+the next human prompt; `dispatch` a fresh agent when you need guaranteed pickup.
 
 Data lives in `~/.tmux-agent-mesh/`. Every environment override is `MESH_`
 prefixed (`MESH_DIR`, `MESH_DB`, `MESH_NOTIFY_DIR`) because a bare `DB` is also
-read by tmux-agent-tracker.
+read by tmux-agent-tracker. The Pi extension reads the same names.

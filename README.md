@@ -81,11 +81,17 @@ auditor        codex    git-dispatch  no    0        work:2.3
 
 ```bash
 tmux-agent-mesh send --to reviewer --message "what file are you in?"
+tmux-agent-mesh send --to reviewer --message "which branch?" --expect-reply
 tmux-agent-mesh broadcast --message "status?" --harness pi
 tmux-agent-mesh reply --to-message 42 --message "done"
 tmux-agent-mesh inbox --as human --follow
 tmux-agent-mesh watch                     # live view of all traffic
 ```
+
+`--expect-reply` marks the message so the receiving agent can tell you are
+blocked on an answer rather than passing on information. `tmux-agent-mesh --help`
+lists the rest, including the two commands the harness adapters call for
+themselves, `pi-deliver` and `reset-streak`.
 
 `--to` accepts an alias, `%pane`, `session:window.pane`, or an unambiguous
 session-id prefix. Ambiguity is an error, never a guess. Prefix matching uses
@@ -163,7 +169,6 @@ prompt.
 |---|---|---|
 | `@agent-mesh-delivery` | `stop-block` | `stop-block`, `next-prompt`, `off` (Claude/Codex/Gemini) |
 | `@agent-mesh-pi-delivery` | `push` | `push`, `before-start`, `off` |
-| `@agent-mesh-wake` | `off` | opt-in `send-keys` wake for idle non-Pi panes |
 | `@agent-mesh-on-mail` | `""` | shell hook on new mail for `human` |
 | `@agent-mesh-keybinding` | `g` | menu key after the prefix (`m` is tmux's own `select-pane -m`) |
 | `@agent-mesh-icon-mail` | `@` | status bar indicator |
@@ -171,6 +176,9 @@ prompt.
 
 Set `@agent-mesh-delivery next-prompt` if you do not want a queued message to
 override your expectation that an agent had finished.
+
+Options are cached for 60s. `tmux-agent-mesh refresh` drops the cache, so a
+change you just made takes effect now rather than within the minute.
 
 ## Data
 
@@ -192,8 +200,26 @@ tmux-agent-tracker, and setting it would point tracker at the wrong database.
 bats tests/
 ```
 
-227 tests across five suites. Bats cannot watch a harness parse hook output, so
-each delivery path also has a real two-pane manual test.
+299 tests across seven suites. `tests/config.bats` runs mesh as a real
+subprocess against a planted option cache, and `tests/tmux.bats` runs a tmux
+server on a private socket with `-f /dev/null`, so neither reads the machine's
+live tmux state.
+
+Every assertion goes through a helper function rather than a bare `[[ ]]`. On
+bash 3.2, which is the system bash on macOS and the one this suite runs under, a
+failing `[[ ]]` that is not the last statement of a function trips neither
+`set -e` nor the `ERR` trap:
+
+```
+bash-3.2 -c 'set -e; f(){ [[ 1 == 2 ]]; echo REACHED; }; f'   # prints REACHED
+```
+
+Roughly a third of the assertions here were decoration until that was fixed, and
+the suite was green while one of them expected a value the code has never
+written.
+
+Bats still cannot watch a harness parse hook output, so each delivery path also
+has a real two-pane manual test.
 
 ### Two-pane manual test
 
@@ -215,7 +241,7 @@ sqlite3 ~/.tmux-agent-mesh/mesh.db \
 ```
 
 For Pi, run `pi` in a pane, let it go fully idle, then send to it. It must start
-a turn on its own with `delivered_via = 'pi-push'`. This is the case the other
+a turn on its own with `delivered_via = 'pi:push'`. This is the case the other
 three harnesses cannot do.
 
 ## Verification status
@@ -254,6 +280,13 @@ treat it as untested until someone confirms it against a trusted repo.
 - **No first-class tool for Pi.** `registerTool` needs a TypeBox schema and
   neither `typebox` nor the pi package resolves from `~/.pi/agent/extensions`, so
   Pi discovers the mailbox the same way the others do, through injected context.
+- **There is no keystroke wake, and there will not be one.** An earlier
+  `@agent-mesh-wake` option promised an opt-in `send-keys` wake for idle
+  Claude/Codex/Gemini panes and was never implemented. It cannot be made correct:
+  tmux cannot tell you whether a TUI composer is empty and focused, so the write
+  races your keyboard exactly as it does in every other tmux agent orchestrator.
+  `dispatch` is the answer when you need guaranteed pickup. A test asserts
+  `send-keys` appears nowhere in `scripts/`.
 
 ## License
 
