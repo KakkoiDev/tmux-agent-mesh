@@ -98,6 +98,35 @@ teardown() {
 
 # ── hook robustness ──────────────────────────────────────────────────
 
+# The hook payload arrives on stdin from the harness, so only a subprocess run
+# exercises how it is read and parsed. Both of these delivered nothing at all:
+# `read -r json` took one line, and the string-match parser needed
+# "session_id":"x" with no space after the colon.
+@test "hook reads a pretty-printed JSON payload" {
+    cmd_register --session A --harness claude --cwd /tmp >/dev/null
+    cmd_register --session B --harness claude --cwd /tmp >/dev/null
+    cmd_send --from A --to B --message "multiline payload" >/dev/null
+    run bash -c "printf '{\n  \"session_id\": \"B\",\n  \"cwd\": \"/tmp\"\n}\n' | '$MESH_BIN' hook Stop --harness claude"
+    assert_ok
+    assert_eq "$(printf '%s' "$output" | jq -r '.decision')" "block"
+    assert_contains "$output" "multiline payload"
+}
+
+@test "hook tolerates whitespace after a JSON key" {
+    cmd_register --session A --harness claude --cwd /tmp >/dev/null
+    cmd_register --session B --harness claude --cwd /tmp >/dev/null
+    cmd_send --from A --to B --message "spaced payload" >/dev/null
+    run bash -c "printf '{\"session_id\": \"B\"}' | '$MESH_BIN' hook Stop --harness claude"
+    assert_ok
+    assert_eq "$(printf '%s' "$output" | jq -r '.decision')" "block"
+}
+
+@test "hook registers from a pretty-printed session start" {
+    run bash -c "printf '{\n  \"session_id\": \"PRETTY\",\n  \"cwd\": \"/tmp/proj\"\n}\n' | '$MESH_BIN' hook SessionStart --harness claude"
+    assert_ok
+    assert_eq "$(msql "SELECT cwd FROM agents WHERE session_id='PRETTY';")" "/tmp/proj"
+}
+
 @test "hook exits zero on malformed stdin" {
     run bash -c "printf 'not json at all' | MESH_DIR='$MESH_DIR' MESH_DB='$MESH_DB' MESH_NOTIFY_DIR='$NOTIFY_DIR' '$MESH_BIN' hook Stop"
     assert_ok

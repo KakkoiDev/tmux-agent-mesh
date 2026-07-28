@@ -33,8 +33,16 @@ sql_json() {
 }
 sql_esc() { local q="'"; printf '%s' "${1//$q/$q$q}"; }
 
-# Fast JSON value extraction, replaces jq for simple string key lookups
+# Top-level JSON value extraction. The string-match fallback only matches
+# "key":"value" with no whitespace and no escapes, which silently returned
+# nothing for a harness that pretty-prints or puts a space after the colon.
+# jq is a hard dependency of every delivery path; the fallback exists so
+# SessionEnd still deregisters without it.
 _json_val() {
+    if command -v jq >/dev/null 2>&1; then
+        printf '%s' "$1" | jq -r --arg k "$2" '.[$k] // empty' 2>/dev/null || true
+        return 0
+    fi
     local _t="${1#*\"$2\":\"}"
     [[ "$_t" == "$1" ]] && return
     printf '%s' "${_t%%\"*}"
@@ -1017,8 +1025,9 @@ cmd_hook() {
     done
     [[ -n "$event" ]] || return 0
 
+    # Whole payload, not one line: a harness is free to pretty-print it.
     local json
-    read -r json || true
+    json=$(cat) || true
     [[ -z "$json" ]] && json='{}'
 
     local sid
