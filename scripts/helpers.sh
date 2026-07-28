@@ -45,8 +45,19 @@ ICON_MAIL=""
 DEBUG_LOG=""
 HOOK_ON_MAIL=""
 
+# Quote a value for the cache file, which is sourced. @agent-mesh-on-mail is a
+# shell snippet, so single quotes are expected there; unescaped they produced a
+# syntax-error cache and the bare `source` under `set -euo pipefail` then killed
+# every hook, menu, watch and refresh at once.
+_cq() {
+    local q="'" esc
+    esc="${1//$q/$q\\$q$q}"
+    printf "'%s'" "$esc"
+}
+
 load_config() {
-    local cache="${MESH_DIR:-$HOME/.tmux-agent-mesh}/config_cache"
+    local dir="${MESH_DIR:-$HOME/.tmux-agent-mesh}"
+    local cache="$dir/config_cache"
 
     # Use cache if fresh (< 60s), shared across all hook invocations
     if [[ -f "$cache" ]]; then
@@ -77,28 +88,33 @@ load_config() {
     DEBUG_LOG=$(get_tmux_option "@agent-mesh-debug-log" "0")
     HOOK_ON_MAIL=$(get_tmux_option "@agent-mesh-on-mail" "")
 
-    mkdir -p "$(dirname "$cache")"
+    # No data dir means mesh is not installed here. Read the options, but do not
+    # create anything: a harness hook on an uninstalled machine must be inert.
+    [[ -d "$dir" ]] || return 0
 
-    # Atomic write, safe for concurrent hook invocations
-    cat > "${cache}.tmp" <<EOF
-KEYBINDING='$KEYBINDING'
-ITEMS_PER_PAGE='$ITEMS_PER_PAGE'
-KEY_NEXT='$KEY_NEXT'
-KEY_PREV='$KEY_PREV'
-KEY_QUIT='$KEY_QUIT'
-ENABLED='$ENABLED'
-DELIVERY='$DELIVERY'
-PI_DELIVERY='$PI_DELIVERY'
-MAX_HOPS='$MAX_HOPS'
-MAX_THREAD_MSGS='$MAX_THREAD_MSGS'
-MAX_BLOCKS='$MAX_BLOCKS'
-MAX_BROADCAST='$MAX_BROADCAST'
-WAKE='$WAKE'
-ICON_MAIL='$ICON_MAIL'
-DEBUG_LOG='$DEBUG_LOG'
-HOOK_ON_MAIL='$HOOK_ON_MAIL'
-EOF
-    mv -f "${cache}.tmp" "$cache"
+    # Atomic write, safe for concurrent hook invocations. Cosmetic, so an
+    # unwritable dir must not fail a hook.
+    {
+        {
+            printf 'KEYBINDING=%s\n'      "$(_cq "$KEYBINDING")"
+            printf 'ITEMS_PER_PAGE=%s\n'  "$(_cq "$ITEMS_PER_PAGE")"
+            printf 'KEY_NEXT=%s\n'        "$(_cq "$KEY_NEXT")"
+            printf 'KEY_PREV=%s\n'        "$(_cq "$KEY_PREV")"
+            printf 'KEY_QUIT=%s\n'        "$(_cq "$KEY_QUIT")"
+            printf 'ENABLED=%s\n'         "$(_cq "$ENABLED")"
+            printf 'DELIVERY=%s\n'        "$(_cq "$DELIVERY")"
+            printf 'PI_DELIVERY=%s\n'     "$(_cq "$PI_DELIVERY")"
+            printf 'MAX_HOPS=%s\n'        "$(_cq "$MAX_HOPS")"
+            printf 'MAX_THREAD_MSGS=%s\n' "$(_cq "$MAX_THREAD_MSGS")"
+            printf 'MAX_BLOCKS=%s\n'      "$(_cq "$MAX_BLOCKS")"
+            printf 'MAX_BROADCAST=%s\n'   "$(_cq "$MAX_BROADCAST")"
+            printf 'WAKE=%s\n'            "$(_cq "$WAKE")"
+            printf 'ICON_MAIL=%s\n'       "$(_cq "$ICON_MAIL")"
+            printf 'DEBUG_LOG=%s\n'       "$(_cq "$DEBUG_LOG")"
+            printf 'HOOK_ON_MAIL=%s\n'    "$(_cq "$HOOK_ON_MAIL")"
+        } > "${cache}.tmp" && mv -f "${cache}.tmp" "$cache"
+    } 2>/dev/null || true
+    return 0
 }
 
 # ── version check ────────────────────────────────────────────────────

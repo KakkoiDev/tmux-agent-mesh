@@ -66,17 +66,6 @@ _debug_log() {
 
 _die() { printf '%s\n' "$*" >&2; exit 1; }
 
-# Load config from cache without a freshness check. Hook hot path.
-_load_config_fast() {
-    local cache="$MESH_DIR/config_cache"
-    if [[ -f "$cache" ]]; then
-        # shellcheck disable=SC1090
-        source "$cache"
-    else
-        load_config
-    fi
-}
-
 _need_jq() {
     command -v jq >/dev/null 2>&1 || _die "jq is required for this command"
 }
@@ -747,8 +736,12 @@ cmd_status_bar() {
     return 0
 }
 
+# Drops the 60s cache so a tmux option change takes effect now. Without the
+# unlink there is no way to force a reload, and "set the option, then test it"
+# silently tests the old value.
 cmd_refresh() {
-    _load_config_fast
+    rm -f "$MESH_DIR/config_cache" 2>/dev/null || true
+    load_config
     _update_status
     return 0
 }
@@ -1012,7 +1005,6 @@ cmd_hook() {
     # No database means mesh is not installed. Never fail a harness hook.
     [[ -f "$DB" ]] || return 0
     _ensure_schema
-    _load_config_fast
 
     local event="${1:-}" harness="${MESH_HARNESS:-claude}"
     shift || true
@@ -1092,7 +1084,6 @@ cmd_recv() {
 # ── watch ────────────────────────────────────────────────────────────
 
 cmd_watch() {
-    _load_config_fast
     printf 'tmux-agent-mesh: watching all traffic (Ctrl-C to stop)\n\n'
     local seen id fname tname body created
     seen=$(sql "SELECT COALESCE(MAX(id),0) FROM messages;")
@@ -1187,7 +1178,6 @@ cmd_dispatch() {
 # ── menu ─────────────────────────────────────────────────────────────
 
 cmd_menu() {
-    _load_config_fast
     local items=() alias sid harness pending target n=0
     while IFS='|' read -r alias sid harness pending target; do
         [[ -z "$sid" ]] && continue
@@ -1398,7 +1388,6 @@ cmd_doctor() {
 # End-to-end round trip against the real database, no harness needed.
 cmd_selftest() {
     _need_jq
-    _load_config_fast
     local a="selftest-a-$$" b="selftest-b-$$" rc=0
 
     cmd_register --session "$a" --harness claude --cwd /tmp >/dev/null
@@ -1444,6 +1433,15 @@ cmd_selftest() {
 }
 
 # ── main ─────────────────────────────────────────────────────────────
+
+# Every command, not a chosen few. Five commands used to load config and seven
+# did not, so `send`, `broadcast`, `reply`, `drain`, `pi-deliver` and `dispatch`
+# ran on the hardcoded fallbacks: @agent-mesh-enabled off did not stop a send,
+# the configured caps were ignored, @agent-mesh-on-mail never fired and
+# @agent-mesh-pi-delivery did nothing. Kept out of a function on purpose - the
+# test harness sources this file by stripping the dispatcher's `case ... esac`
+# range, and an indented `case` would fall outside it and execute.
+load_config
 
 case "${1:-}" in
     init)           shift; cmd_init "$@" ;;

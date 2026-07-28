@@ -75,6 +75,40 @@ setup_test_env() {
     # Build the schema through the real init path so tests never drift
     # from production DDL.
     "$MESH_BIN" init >/dev/null
+
+    # mesh.sh loads config for every command, so a subprocess run would
+    # otherwise read the developer's live tmux options and the suite would pass
+    # or fail depending on what they had set. A planted cache is also the
+    # fixture for testing the config path itself.
+    plant_config
+}
+
+# Write the config cache mesh.sh reads. Each argument is a VAR='value' line;
+# anything not given keeps the default below.
+plant_config() {
+    local cache="$MESH_DIR/config_cache"
+    mkdir -p "$MESH_DIR"
+    cat > "$cache" <<'EOF'
+KEYBINDING='g'
+ITEMS_PER_PAGE='10'
+KEY_NEXT='i'
+KEY_PREV='o'
+KEY_QUIT='q'
+ENABLED='on'
+DELIVERY='stop-block'
+PI_DELIVERY='push'
+MAX_HOPS='4'
+MAX_THREAD_MSGS='12'
+MAX_BLOCKS='3'
+MAX_BROADCAST='8'
+ICON_MAIL='@'
+DEBUG_LOG='0'
+HOOK_ON_MAIL=''
+EOF
+    local line
+    for line in "$@"; do
+        printf '%s\n' "$line" >> "$cache"
+    done
 }
 
 teardown_test_env() {
@@ -88,7 +122,6 @@ msql() { printf '.timeout 100\n%s\n' "$*" | sqlite3 "$DB"; }
 # Source mesh functions without executing the main dispatcher
 source_mesh_functions() {
     load_config() { true; }
-    _load_config_fast() { true; }
     get_tmux_option() { echo "${2:-}"; }
     tmux() { return 1; }
 
@@ -130,6 +163,8 @@ insert_message() {
           VALUES ('$thread', '$from', '$to', '$body', $hops);"
 }
 
+pending_for()    { msql "SELECT COUNT(*) FROM messages WHERE to_session='$1' AND delivered_at IS NULL;"; }
+body_of()        { msql "SELECT body FROM messages WHERE id=$1;"; }
 count_agents()   { msql "SELECT COUNT(*) FROM agents;"; }
 count_messages() { msql "SELECT COUNT(*) FROM messages;"; }
 get_alias()      { msql "SELECT COALESCE(alias,'') FROM agents WHERE session_id='$1';"; }

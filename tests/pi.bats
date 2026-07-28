@@ -17,7 +17,6 @@ teardown() {
     teardown_test_env
 }
 
-pending_for() { msql "SELECT COUNT(*) FROM messages WHERE to_session='$1' AND delivered_at IS NULL;"; }
 
 # ── push mode ────────────────────────────────────────────────────────
 

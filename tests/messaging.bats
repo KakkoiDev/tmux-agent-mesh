@@ -17,8 +17,6 @@ teardown() {
     teardown_test_env
 }
 
-pending_for() { msql "SELECT COUNT(*) FROM messages WHERE to_session='$1' AND delivered_at IS NULL;"; }
-body_of()     { msql "SELECT body FROM messages WHERE id=$1;"; }
 
 # ── send ─────────────────────────────────────────────────────────────
 
