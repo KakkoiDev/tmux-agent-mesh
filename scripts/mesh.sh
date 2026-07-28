@@ -48,6 +48,19 @@ _json_val() {
     printf '%s' "${_t%%\"*}"
 }
 
+# Harnesses disagree on the shape: a bare string in some payloads, an object with
+# an id in others. Nothing is lost by accepting both.
+_json_model() {
+    command -v jq >/dev/null 2>&1 || return 0
+    # .model.id on a string is an error, not null, so the shape has to be tested
+    # before it is indexed.
+    printf '%s' "$1" \
+        | jq -r '.model as $m
+                 | (if ($m | type) == "object" then $m.id else $m end)
+                 | strings' 2>/dev/null || true
+    return 0
+}
+
 # Booleans need their own probe: _json_val only matches quoted values.
 _json_true() {
     printf '%s' "$1" | grep -qE "\"$2\"[[:space:]]*:[[:space:]]*true"
@@ -155,6 +168,14 @@ CREATE TABLE IF NOT EXISTS agents (
     project_name  TEXT,
     push_capable  INTEGER NOT NULL DEFAULT 0,
     block_streak  INTEGER NOT NULL DEFAULT 0,
+    -- Turn state, from the hooks this plugin already installs: a prompt starts
+    -- a turn, a turn-end finishes one. Authoritative, unlike scraping the pane
+    -- for words like "tokens", and it decides whether an idle agent may be woken.
+    -- Nullable and unconstrained on purpose: _SCHEMA_SQL is a single-quoted
+    -- shell string and cannot contain the quotes a DEFAULT or CHECK would need.
+    -- Absent means idle, which is what a row written before this column meant.
+    turn_state    TEXT,
+    model         TEXT,
     registered_at INTEGER NOT NULL DEFAULT (unixepoch()),
     last_seen     INTEGER NOT NULL DEFAULT (unixepoch())
 );
@@ -225,6 +246,7 @@ SQL
 
     printf 'PRAGMA journal_mode=WAL;\nPRAGMA busy_timeout=100;\n%s\n' "$_SCHEMA_SQL" \
         | sqlite3 "$DB" >/dev/null
+    _apply_migrations
 
     # The human is a first-class participant, seeded once.
     sql "INSERT OR IGNORE INTO agents (session_id, harness, alias, push_capable)
@@ -233,11 +255,32 @@ SQL
     echo "Initialized: $DB"
 }
 
+# CREATE TABLE IF NOT EXISTS cannot add a column to a table that already exists,
+# so a new column needs its own ALTER. Both are idempotent: the ALTER fails
+# harmlessly once the column is there, and the marker file skips the whole thing
+# on every later invocation.
+_MIGRATIONS_SQL='
+ALTER TABLE agents ADD COLUMN turn_state TEXT;
+ALTER TABLE agents ADD COLUMN model TEXT;
+'
+
+_apply_migrations() {
+    local stmt
+    while IFS= read -r stmt; do
+        [[ -z "$stmt" ]] && continue
+        printf '%s\n' "$stmt" | sqlite3 "$DB" >/dev/null 2>&1 || true
+    done <<EOF
+$_MIGRATIONS_SQL
+EOF
+    return 0
+}
+
 _ensure_schema() {
     [[ -f "$DB" ]] || return 0
-    [[ -f "$MESH_DIR/.schema_v1" ]] && return 0
+    [[ -f "$MESH_DIR/.schema_v2" ]] && return 0
     printf '%s\n' "$_SCHEMA_SQL" | sqlite3 "$DB" >/dev/null 2>&1 || true
-    touch "$MESH_DIR/.schema_v1" 2>/dev/null || true
+    _apply_migrations
+    touch "$MESH_DIR/.schema_v2" 2>/dev/null || true
 }
 
 # ── register / deregister / alias ────────────────────────────────────
@@ -732,6 +775,29 @@ _block_streak() {
 _bump_streak()  { sql "UPDATE agents SET block_streak=block_streak+1 WHERE session_id='$(sql_esc "$1")';"; }
 _reset_streak() { sql "UPDATE agents SET block_streak=0 WHERE session_id='$(sql_esc "$1")';"; }
 
+# ── turn state ───────────────────────────────────────────────────────
+#
+# Recorded from this plugin's own hooks, which already fire on exactly the two
+# boundaries that matter. This is what makes waking an idle agent safe to
+# attempt: an authoritative answer to "is it between turns", rather than the
+# screen-scrape for words like "tokens" that every other tool has to rely on.
+
+_set_turn_state() {
+    sql "UPDATE agents SET turn_state='$2', last_seen=unixepoch()
+         WHERE session_id='$(sql_esc "$1")';"
+}
+
+_turn_state() {
+    local v
+    v=$(sql "SELECT turn_state FROM agents WHERE session_id='$(sql_esc "$1")';")
+    printf '%s' "${v:-idle}"
+}
+
+_set_model() {
+    [[ -n "$2" ]] || return 0
+    sql "UPDATE agents SET model='$(sql_esc "$2")' WHERE session_id='$(sql_esc "$1")';"
+}
+
 # ── status ───────────────────────────────────────────────────────────
 
 _update_status() {
@@ -892,13 +958,15 @@ cmd_claim_dispatch() {
 # ── hook ─────────────────────────────────────────────────────────────
 
 _hook_session_start() {
-    local harness="$1" sid="$2" cwd="$3"
+    local harness="$1" sid="$2" cwd="$3" model="${4:-}"
     if [[ -n "$cwd" ]]; then
         cmd_register --session "$sid" --harness "$harness" --cwd "$cwd"
     else
         cmd_register --session "$sid" --harness "$harness"
     fi
     _reset_streak "$sid"
+    _set_turn_state "$sid" idle
+    _set_model "$sid" "$model"
 
     command -v jq >/dev/null 2>&1 || return 0
 
@@ -928,6 +996,7 @@ _hook_prompt() {
     local harness="$1" sid="$2"
     # Human input ends any auto-continuation run.
     _reset_streak "$sid"
+    _set_turn_state "$sid" working
     [[ "${DELIVERY:-stop-block}" == "off" ]] && return 0
     command -v jq >/dev/null 2>&1 || return 0
 
@@ -940,6 +1009,9 @@ _hook_prompt() {
 
 _hook_turn_end() {
     local harness="$1" sid="$2" json="$3"
+    # Recorded before any early return: the state has to be right even when
+    # delivery is off, because it is what the wake path reads.
+    _set_turn_state "$sid" idle
     [[ "${DELIVERY:-stop-block}" == "off" ]] && return 0
     command -v jq >/dev/null 2>&1 || return 0
 
@@ -1076,7 +1148,7 @@ cmd_hook() {
     _debug_log "HOOK $event harness=$harness sid=$sid"
 
     case "$event" in
-        SessionStart)                 _hook_session_start "$harness" "$sid" "$cwd" ;;
+        SessionStart)                 _hook_session_start "$harness" "$sid" "$cwd" "$(_json_model "$json")" ;;
         SessionEnd|session_shutdown)  cmd_deregister --session "$sid" ;;
         UserPromptSubmit|BeforeAgent) _hook_prompt "$harness" "$sid" ;;
         Stop|AfterAgent)              _hook_turn_end "$harness" "$sid" "$json" ;;
@@ -1313,7 +1385,7 @@ cmd_roster() {
     local q="SELECT a.alias, a.session_id, a.harness, a.project_name, a.push_capable,
                 (SELECT COUNT(*) FROM messages m
                   WHERE m.to_session=a.session_id AND m.delivered_at IS NULL) AS pending,
-                a.tmux_target
+                a.turn_state, a.model, a.tmux_target
          FROM agents a ORDER BY (a.harness='human') DESC, a.alias IS NULL, a.alias, a.registered_at"
 
     if [[ "$as_json" -eq 1 ]]; then
@@ -1322,14 +1394,16 @@ cmd_roster() {
         return 0
     fi
 
-    printf '%-14s %-8s %-18s %-5s %-8s %s\n' NAME HARNESS PROJECT PUSH PENDING PANE
-    local alias sid harness project push pending target
-    while IFS='|' read -r alias sid harness project push pending target; do
+    printf '%-14s %-8s %-18s %-8s %-5s %-8s %s\n' \
+        NAME HARNESS PROJECT STATE PUSH PENDING PANE
+    local alias sid harness project push pending state model target
+    while IFS='|' read -r alias sid harness project push pending state model target; do
         [[ -z "$sid" ]] && continue
         [[ -n "$alias" ]] || alias="${sid:0:8}"
         [[ "$push" == "1" ]] && push="yes" || push="no"
-        printf '%-14s %-8s %-18s %-5s %-8s %s\n' \
-            "$alias" "$harness" "${project:--}" "$push" "$pending" "${target:--}"
+        [[ "$harness" == "human" ]] && state="-"
+        printf '%-14s %-8s %-18s %-8s %-5s %-8s %s\n' \
+            "$alias" "$harness" "${project:--}" "${state:--}" "$push" "$pending" "${target:--}"
     done <<EOF
 $(sql_sep '|' "$q;")
 EOF

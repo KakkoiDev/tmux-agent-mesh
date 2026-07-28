@@ -512,6 +512,105 @@ _mock_tmux_pane() {
     assert_eq "$(msql "SELECT to_session FROM messages;")" "s2"
 }
 
+# ── turn state ───────────────────────────────────────────────────────
+#
+# Recorded from mesh's own hooks. Everything else has to scrape the pane for
+# words like "tokens" to guess whether an agent is mid-turn; this is the answer,
+# and it is what decides whether waking an idle agent is safe to attempt.
+
+@test "a new session starts idle" {
+    echo '{"session_id":"t1","cwd":"/tmp/p"}' | cmd_hook SessionStart
+    assert_eq "$(_turn_state t1)" "idle"
+}
+
+@test "a prompt marks the agent working" {
+    echo '{"session_id":"t1","cwd":"/tmp/p"}' | cmd_hook SessionStart
+    echo '{"session_id":"t1"}' | cmd_hook UserPromptSubmit
+    assert_eq "$(_turn_state t1)" "working"
+}
+
+@test "a turn end marks the agent idle again" {
+    echo '{"session_id":"t1","cwd":"/tmp/p"}' | cmd_hook SessionStart
+    echo '{"session_id":"t1"}' | cmd_hook UserPromptSubmit
+    echo '{"session_id":"t1"}' | cmd_hook Stop
+    assert_eq "$(_turn_state t1)" "idle"
+}
+
+@test "gemini turn boundaries move the same state" {
+    echo '{"session_id":"t1","cwd":"/tmp/p"}' | cmd_hook SessionStart
+    echo '{"session_id":"t1"}' | cmd_hook BeforeAgent
+    assert_eq "$(_turn_state t1)" "working"
+    echo '{"session_id":"t1"}' | cmd_hook AfterAgent
+    assert_eq "$(_turn_state t1)" "idle"
+}
+
+# The state has to be right even when delivery is off, because the wake path
+# reads it and delivery mode has nothing to do with whether a turn is running.
+@test "turn state is recorded even with delivery off" {
+    DELIVERY=off
+    echo '{"session_id":"t1","cwd":"/tmp/p"}' | cmd_hook SessionStart
+    echo '{"session_id":"t1"}' | cmd_hook UserPromptSubmit
+    assert_eq "$(_turn_state t1)" "working"
+    echo '{"session_id":"t1"}' | cmd_hook Stop
+    assert_eq "$(_turn_state t1)" "idle"
+}
+
+@test "an unknown session has no state to report" {
+    assert_eq "$(_turn_state nosuch)" "idle"
+}
+
+@test "the roster shows turn state" {
+    insert_agent s1 claude reviewer %1
+    msql "UPDATE agents SET turn_state='working' WHERE session_id='s1';"
+    run cmd_roster
+    assert_contains "$output" "STATE"
+    assert_contains "$output" "working"
+}
+
+# ── model ────────────────────────────────────────────────────────────
+
+@test "session start records a model given as a string" {
+    echo '{"session_id":"t1","cwd":"/tmp/p","model":"claude-opus-5"}' | cmd_hook SessionStart
+    assert_eq "$(msql "SELECT model FROM agents WHERE session_id='t1';")" "claude-opus-5"
+}
+
+# Harnesses disagree on the shape, so both are accepted.
+@test "session start records a model given as an object" {
+    echo '{"session_id":"t1","cwd":"/tmp/p","model":{"id":"claude-opus-5","display_name":"Opus"}}' \
+        | cmd_hook SessionStart
+    assert_eq "$(msql "SELECT model FROM agents WHERE session_id='t1';")" "claude-opus-5"
+}
+
+@test "a payload with no model leaves it null" {
+    echo '{"session_id":"t1","cwd":"/tmp/p"}' | cmd_hook SessionStart
+    assert_eq "$(msql "SELECT COALESCE(model,'none') FROM agents WHERE session_id='t1';")" "none"
+}
+
+# ── schema migration ─────────────────────────────────────────────────
+
+# CREATE TABLE IF NOT EXISTS cannot add a column to a table that already exists,
+# so an install that predates these columns needs the ALTERs to run.
+@test "init adds the new columns to a database that predates them" {
+    msql "DROP TABLE agents;"
+    msql "CREATE TABLE agents (session_id TEXT PRIMARY KEY, harness TEXT NOT NULL,
+          alias TEXT UNIQUE, tmux_pane TEXT, tmux_target TEXT, cwd TEXT,
+          project_name TEXT, push_capable INTEGER NOT NULL DEFAULT 0,
+          block_streak INTEGER NOT NULL DEFAULT 0,
+          registered_at INTEGER NOT NULL DEFAULT (unixepoch()),
+          last_seen INTEGER NOT NULL DEFAULT (unixepoch()));"
+    "$MESH_BIN" init >/dev/null
+    assert_contains "$(msql '.schema agents')" "turn_state"
+    assert_contains "$(msql '.schema agents')" "model"
+}
+
+@test "init is safe to run again once the columns exist" {
+    run "$MESH_BIN" init
+    assert_ok
+    run "$MESH_BIN" init
+    assert_ok
+    assert_eq "$(msql "SELECT COUNT(*) FROM agents WHERE session_id='human';")" "1"
+}
+
 # ── selftest ─────────────────────────────────────────────────────────
 #
 # selftest is what a user runs to be shown that mesh works, so it has to be

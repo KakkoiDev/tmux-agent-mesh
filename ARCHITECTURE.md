@@ -237,7 +237,7 @@ state, mesh rows are messages, so dropping them needs the explicit `--reset`.
 bats tests/
 ```
 
-306 tests. Every assertion goes through a helper function, never a bare `[[ ]]`
+318 tests. Every assertion goes through a helper function, never a bare `[[ ]]`
 or `! cmd`: bash 3.2 is the system bash on macOS and the one this suite runs
 under, and it trips neither `set -e` nor the `ERR` trap for either of those when
 they are not the last statement of a function. About a third of the assertions
