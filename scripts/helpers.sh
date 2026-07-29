@@ -51,7 +51,7 @@ get_tmux_option() { tk_opt "$1" "${2:-}"; }
 # (A comment line must not begin with the linter's own name, or it is parsed as
 # a directive and fails with SC1072.)
 # shellcheck disable=SC2034
-declare KEYBINDING="" ITEMS_PER_PAGE="" KEY_NEXT="" KEY_PREV="" KEY_QUIT="" \
+declare KEYBINDING="" KEY_QUIT="" \
         ENABLED="" DELIVERY="" PI_DELIVERY="" MAX_HOPS="" MAX_THREAD_MSGS="" \
         MAX_BLOCKS="" MAX_BROADCAST="" ICON_MAIL="" DEBUG_LOG="" HOOK_ON_MAIL=""
 
@@ -65,9 +65,6 @@ _cq() { tk_cq "$1"; }
 # built-in away from everyone who installed this.
 _MESH_CONFIG_SPECS=(
     'KEYBINDING:@agent-mesh-keybinding:g'
-    'ITEMS_PER_PAGE:@agent-mesh-items-per-page:10'
-    'KEY_NEXT:@agent-mesh-key-next:i'
-    'KEY_PREV:@agent-mesh-key-prev:o'
     'KEY_QUIT:@agent-mesh-key-quit:q'
     'ENABLED:@agent-mesh-enabled:on'
     'DELIVERY:@agent-mesh-delivery:stop-block'

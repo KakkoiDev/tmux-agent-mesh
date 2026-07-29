@@ -59,10 +59,14 @@ teardown() {
 # pi-deliver and reset-streak were dispatched and covered by 33 tests while
 # appearing in neither --help nor the README.
 @test "every command the dispatcher accepts is in --help" {
-    local usage verb
+    local usage verb verbs
     usage=$(run_mesh_help)
-    for verb in $(/usr/bin/sed -n '/^case "\${1:-}" in$/,/^esac$/p' "$SCRIPTS_DIR/mesh.sh" \
-                  | grep -oE '^ +[a-z-]+\)' | tr -d ' )'); do
+    verbs=$(/usr/bin/sed -n '/^case "\${1:-}" in$/,/^esac$/p' "$SCRIPTS_DIR/mesh.sh" \
+            | grep -oE '^ +[a-z-]+\)' | tr -d ' )')
+    # A generated list that comes back empty makes this loop run zero times and
+    # the test pass while checking nothing. See the note on the option test below.
+    assert_not_empty "$verbs"
+    for verb in $verbs; do
         assert_contains "$usage" "$verb"
     done
 }
@@ -75,13 +79,48 @@ teardown() {
         "$PROJECT_ROOT/pi-extension"
 }
 
+# This test was vacuous for its whole life, and that is the interesting part.
+#
+# It used to extract with `grep -oE '^[A-Z_]+=\$\(get_tmux_option'`, but every
+# such assignment in helpers.sh was indented four spaces, so the `^` anchor
+# matched zero lines, the loop body never ran, and the test passed while
+# asserting nothing. Three dead options hid behind it inside a 318-test suite.
+#
+# It would now be doubly dead: helpers.sh delegates to the shared library and no
+# longer calls get_tmux_option at all. The option list lives in
+# _MESH_CONFIG_SPECS as VAR:@option:default entries.
+#
+# Two rules for any test that generates its own assertions:
+#   1. assert the extracted list is non-empty before looping,
+#   2. and scan every file that legitimately reads the thing.
+# KEYBINDING is read by agent-mesh.tmux, not mesh.sh, so scanning only mesh.sh
+# would report a live option as dead.
 @test "no configuration option is loaded and then never read" {
-    local v
-    for v in $(grep -oE '^[A-Z_]+=\$\(get_tmux_option' "$SCRIPTS_DIR/helpers.sh" \
-               | /usr/bin/sed 's/=.*//'); do
-        grep -q "\${$v" "$SCRIPTS_DIR/mesh.sh" \
+    local v names readers
+    names=$(grep -oE "^ +'[A-Z_]+:" "$SCRIPTS_DIR/helpers.sh" | tr -d " '" | /usr/bin/sed 's/:$//')
+    assert_not_empty "$names"
+
+    readers="$(cat "$SCRIPTS_DIR/mesh.sh" "$PROJECT_ROOT/agent-mesh.tmux")"
+    for v in $names; do
+        # `${VAR` or bare `$VAR`, with a word boundary so MAX_BLOCKS does not
+        # satisfy a check for MAX_BLOCK.
+        printf '%s' "$readers" | grep -qE "\\\$\{?$v\b" \
             || _afail "$v is loaded from a tmux option and never read"
     done
+}
+
+# The extraction pattern above is itself tested, so a future edit that breaks it
+# fails loudly instead of silently disabling the check.
+@test "the option-name extraction pattern matches what it claims to" {
+    local fixture found
+    fixture="$BATS_TEST_TMPDIR/specs.sh"
+    printf "%s\n" \
+        "_MESH_CONFIG_SPECS=(" \
+        "    'REAL_ONE:@agent-mesh-real-one:x'" \
+        "NOT_INDENTED:@agent-mesh-nope:y" \
+        ")" > "$fixture"
+    found=$(grep -oE "^ +'[A-Z_]+:" "$fixture" | tr -d " '" | /usr/bin/sed 's/:$//')
+    assert_eq "$found" "REAL_ONE"
 }
 
 # ── portability ──────────────────────────────────────────────────────

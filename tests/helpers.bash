@@ -90,16 +90,13 @@ setup_test_env() {
 # treated as a foreign or older format and rebuilt from the live tmux options,
 # which would silently discard everything planted here. The fixture has to write
 # what production writes; it was already coupled to the format, since it
-# hardcodes all fifteen variable names.
+# hardcodes every variable name.
 plant_config() {
     local cache="$MESH_DIR/config_cache"
     mkdir -p "$MESH_DIR"
     cat > "$cache" <<'EOF'
 # tk-config v1 agent-mesh
 KEYBINDING='g'
-ITEMS_PER_PAGE='10'
-KEY_NEXT='i'
-KEY_PREV='o'
 KEY_QUIT='q'
 ENABLED='on'
 DELIVERY='stop-block'
