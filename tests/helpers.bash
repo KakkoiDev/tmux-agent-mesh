@@ -85,10 +85,17 @@ setup_test_env() {
 
 # Write the config cache mesh.sh reads. Each argument is a VAR='value' line;
 # anything not given keeps the default below.
+#
+# The first line is the format marker the loader checks. A cache without one is
+# treated as a foreign or older format and rebuilt from the live tmux options,
+# which would silently discard everything planted here. The fixture has to write
+# what production writes; it was already coupled to the format, since it
+# hardcodes all fifteen variable names.
 plant_config() {
     local cache="$MESH_DIR/config_cache"
     mkdir -p "$MESH_DIR"
     cat > "$cache" <<'EOF'
+# tk-config v1 agent-mesh
 KEYBINDING='g'
 ITEMS_PER_PAGE='10'
 KEY_NEXT='i'
@@ -154,6 +161,17 @@ start_test_tmux() {
     TMUX_SOCKET="mesh-test-$$-${BATS_TEST_NUMBER:-0}"
     FAKE_HOME="$TEST_TMPDIR/home"
     mkdir -p "$TEST_TMPDIR/bin" "$FAKE_HOME"
+
+    # kill-server ends the server but leaves the socket file behind, so a full
+    # run used to drop 25 files into /tmp/tmux-$UID and never collect them. A
+    # per-run TMUX_TMPDIR under $TMPDIR makes them disappear with the run.
+    #
+    # Short path on purpose: a unix socket caps at ~104 bytes and TEST_TMPDIR
+    # already sits under a deep mktemp path, so putting the socket there fails
+    # with "File name too long" on every call.
+    MESH_SOCKDIR="${TMPDIR:-/tmp}/mesh-sock-$$"
+    mkdir -p "$MESH_SOCKDIR"
+    export TMUX_TMPDIR="$MESH_SOCKDIR"
     printf '#!/usr/bin/env bash\nexec %s -L %s "$@"\n' "$REAL_TMUX" "$TMUX_SOCKET" \
         > "$TEST_TMPDIR/bin/tmux"
     chmod +x "$TEST_TMPDIR/bin/tmux"
@@ -166,6 +184,10 @@ start_test_tmux() {
 stop_test_tmux() {
     [[ -n "${TMUX_SOCKET:-}" ]] || return 0
     "${REAL_TMUX:-tmux}" -L "$TMUX_SOCKET" kill-server 2>/dev/null || true
+    if [[ -n "${MESH_SOCKDIR:-}" && "$MESH_SOCKDIR" == */mesh-sock-* ]]; then
+        rm -rf "$MESH_SOCKDIR"
+        MESH_SOCKDIR=""
+    fi
     return 0
 }
 

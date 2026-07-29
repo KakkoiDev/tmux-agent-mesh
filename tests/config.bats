@@ -22,12 +22,27 @@ teardown() {
 # A fake tmux ahead of the real one on PATH, so `refresh` reads known values
 # without touching the developer's server. With no arguments every option
 # answers empty and mesh falls back to its own defaults.
+#
+# It has to answer BOTH forms. Config loading now reads a whole namespace with a
+# single `show-options -g` instead of one `show-option -gqv` per option (fifteen
+# forks down to one), and a fake that knows only the singular form reports every
+# option unset, so the whole suite silently tests the defaults.
+#
+# The namespace listing always uses the double-quoted rendering, which is what
+# real tmux does for any value containing a space, a quote or a hash. That also
+# exercises the path where the reader declines to unescape and asks tmux for the
+# authoritative value, because `show-options -g` renders `a\tb` and a real tab
+# identically enough that sequential unescaping corrupts one of them.
 fake_tmux() {
     mkdir -p "$TEST_TMPDIR/bin"
     cat > "$TEST_TMPDIR/bin/tmux" <<EOF
 #!/usr/bin/env bash
 if [[ "\$1" == "show-option" && "\$3" == "${1:-}" ]]; then
     printf '%s' "${2:-}"
+elif [[ "\$1" == "show-options" ]]; then
+    if [[ -n "${1:-}" ]]; then
+        printf '%s "%s"\n' "${1:-}" "${2:-}"
+    fi
 fi
 exit 0
 EOF
