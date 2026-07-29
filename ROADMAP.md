@@ -133,3 +133,36 @@ stderr for the same purpose. Two hooks cannot both own a turn boundary. The exit
 form composes where a blocking decision does not, so if mesh ever has to share
 `Stop`, that is the mechanism to switch to. Today the answer is
 `@agent-mesh-delivery next-prompt`.
+
+### The channel model, rescued from the deleted Go package
+
+`internal/store` was removed in the commit that added this section. It was
+unreachable by construction: no `package main` anywhere in the repo, and
+`internal/` cannot be imported from outside the module. 1,830 lines, including
+tests, that nothing ever ran.
+
+Worse than dead. Its `schema.sql` and bash's `_SCHEMA_SQL` both targeted
+`mesh.db` with incompatible definitions, so wiring the Go up would have corrupted
+a live database. Keeping it cost a Go toolchain in CI and left the next reader
+treating it as authoritative.
+
+Two ideas in it are better than what bash does today, and are the reason this
+note exists rather than just a deletion:
+
+**One recipient mechanism instead of four.** A message is posted to a *channel*
+and every member of that channel is a recipient, so a direct message, a named
+group and a broadcast are the same operation with different membership. Today
+bash has `to_session` for point-to-point plus a separate `broadcast` path, and a
+DM is a channel with exactly two members expressed as a special case. Membership
+also gives read receipts and join rules a natural home: `channel_rules` gated
+joining by harness or model, and a rule matching nothing locked the channel
+rather than opening it, which is the right default for a private one.
+
+**An explicit `host` column.** The bash schema has no concept of which machine an
+agent is on, so `send --remote` shells out over ssh and the roster cannot
+represent a peer that is not local. A `host` column, defaulting to empty for
+local, is what makes a genuinely distributed roster possible without reshaping
+every row later. `tk_identity_list` already reserves the field for this reason.
+
+Neither is worth building until the message cap comes off and there is a second
+machine in play.
