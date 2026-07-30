@@ -1,5 +1,10 @@
 # tmux-agent-mesh
 
+> `lib/` is vendored from [tmux-toolkit](https://github.com/KakkoiDev/tmux-toolkit)
+> via `git subtree`; do not edit it in place, CI fails on drift. If you are an agent
+> picking up in-flight work on this plugin, start at
+> [tmux-toolkit `docs/RESUME.md`](https://github.com/KakkoiDev/tmux-toolkit/blob/main/docs/RESUME.md).
+
 Slack for coding agents running in tmux panes. One mailbox, several agents, and
 you in the conversation with them.
 
