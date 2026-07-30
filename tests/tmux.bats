@@ -20,32 +20,194 @@ teardown() {
     teardown_test_env
 }
 
-# pane-died is a pane hook, so a bare `show-hooks -g` does not list it. It has
+# pane-exited is a pane hook, so a bare `show-hooks -g` does not list it. It has
 # to be asked for by name.
 hooks_for() { tmux show-hooks -g "$1" 2>/dev/null || true; }
 
-# ── pane-died ────────────────────────────────────────────────────────
-
-@test "the plugin registers cleanup on pane-died" {
-    run_plugin
-    run hooks_for pane-died
-    assert_contains "$output" "mesh.sh cleanup"
+# Spawn a window whose pane runs `sleep`, and return its pane id. A long-running
+# command is required: a pane whose command exits immediately can be gone before
+# the caller reads the id back.
+victim_pane() {
+    local name="$1"
+    tmux new-window -d -n "$name" 'sleep 100'
+    tmux list-panes -a -F '#{pane_id} #{window_name}' | awk -v n="$name" '$2==n{print $1}'
 }
 
-@test "the plugin keeps a pane-died hook somebody else registered" {
-    tmux set-hook -g pane-died "run-shell -b 'echo other'"
+# Scoped to the sessions a test registered. `count_agents` cannot be used here:
+# loading the plugin registers the human row, so every absolute count is one
+# higher than the test planted and an off-by-one reads as a reap failure.
+count_reap_agents() { msql "SELECT COUNT(*) FROM agents WHERE session_id LIKE 'reap%';"; }
+
+# The reap runs from `run-shell -b`, so it is asynchronous by construction and
+# the debounce adds a scheduled trailing pass. Poll instead of sleeping a fixed
+# amount, and keep the budget above the debounce window.
+wait_for_reap() {
+    local sid="$1" i=0
+    while [[ $i -lt 120 ]]; do
+        agent_exists "$sid" || return 0
+        sleep 0.1
+        i=$((i + 1))
+    done
+    return 1
+}
+
+# ── the teardown hooks ───────────────────────────────────────────────
+#
+# No single hook covers pane teardown on 3.5a with remain-on-exit off, which is
+# the default. Measured: a pane whose process exits fires pane-exited; kill-pane
+# fires only after-kill-pane; kill-window fires only window-unlinked;
+# kill-session fires session-closed. See the matrix in agent-mesh.tmux.
+CLEANUP_HOOKS="pane-exited after-kill-pane window-unlinked session-closed"
+
+@test "the plugin registers cleanup on every teardown hook" {
     run_plugin
-    run hooks_for pane-died
-    assert_contains "$output" "mesh.sh cleanup"
-    assert_contains "$output" "echo other"
+    local h
+    for h in $CLEANUP_HOOKS; do
+        assert_contains "$(hooks_for "$h")" "mesh.sh cleanup"
+    done
+}
+
+@test "the plugin keeps a teardown hook somebody else registered" {
+    local h
+    for h in $CLEANUP_HOOKS; do
+        tmux set-hook -g "$h" "run-shell -b 'echo other'"
+    done
+    run_plugin
+    for h in $CLEANUP_HOOKS; do
+        assert_contains "$(hooks_for "$h")" "mesh.sh cleanup"
+        assert_contains "$(hooks_for "$h")" "echo other"
+    done
 }
 
 # tmux reloads the config on every `source-file`, so an append that does not
 # check first accumulates one duplicate hook per reload.
-@test "loading the plugin twice does not duplicate the hook" {
+@test "loading the plugin twice does not duplicate any hook" {
     run_plugin
     run_plugin
-    assert_eq "$(hooks_for pane-died | grep -c 'mesh.sh cleanup')" "1"
+    local h
+    for h in $CLEANUP_HOOKS; do
+        assert_eq "$(hooks_for "$h" | grep -c 'mesh.sh cleanup')" "1"
+    done
+}
+
+# `pane-died` fires only while `remain-on-exit` is on, and it is off by default,
+# so binding cleanup there left the plugin with no working cleanup path at all.
+# Assert the old hook is gone, or an upgrade keeps reaping twice per pane close.
+@test "the plugin does not leave cleanup on pane-died" {
+    run_plugin
+    run hooks_for pane-died
+    refute_contains "$output" "mesh.sh cleanup"
+}
+
+@test "loading the plugin removes a cleanup hook left on pane-died" {
+    tmux set-hook -ga pane-died "run-shell -b '$SCRIPTS_DIR/mesh.sh cleanup'"
+    run_plugin
+    assert_empty "$(hooks_for pane-died | grep 'mesh.sh cleanup' || true)"
+}
+
+# ── the reap actually happens ────────────────────────────────────────
+#
+# Every hook test above asserts only that a hook *string* is registered. None of
+# them asserted a row was reaped, and that is precisely how V4 survived 319
+# tests: the hook was present, plausible, and dead, because `pane-died` needs
+# `remain-on-exit` on and nothing turns it on.
+
+@test "an agent is reaped when its pane is killed" {
+    run_plugin
+    tmux set-option -g remain-on-exit off
+
+    local pane
+    pane=$(victim_pane victim)
+    assert_not_empty "$pane"
+
+    "$MESH_BIN" register --session reapme --harness claude --pane "$pane" >/dev/null
+    assert_eq "$(count_reap_agents)" "1"
+
+    tmux kill-pane -t "$pane"
+    wait_for_reap reapme || _afail "reapme survived kill-pane"
+    refute agent_exists reapme
+}
+
+# The case pane-exited does cover, and the only one it covers: the agent's own
+# process ending. Distinct from kill-pane, which fires a different hook.
+@test "an agent is reaped when its own process exits" {
+    run_plugin
+    tmux set-option -g remain-on-exit off
+
+    local pane
+    pane=$(victim_pane selfexit)
+    assert_not_empty "$pane"
+
+    "$MESH_BIN" register --session reapself --harness claude --pane "$pane" >/dev/null
+    assert_eq "$(count_reap_agents)" "1"
+
+    # Kill the command, not the pane, so tmux sees the process exit.
+    tmux send-keys -t "$pane" C-c
+    wait_for_reap reapself || _afail "reapself survived its process exiting"
+    refute agent_exists reapself
+}
+
+# kill-window fires neither pane-exited nor after-kill-pane, so an agent in a
+# window the user closes was invisible to every earlier version of this hook set.
+@test "an agent is reaped when its window is killed" {
+    run_plugin
+    tmux set-option -g remain-on-exit off
+
+    local pane
+    pane=$(victim_pane doomedwin)
+    assert_not_empty "$pane"
+
+    "$MESH_BIN" register --session reapwin --harness claude --pane "$pane" >/dev/null
+    assert_eq "$(count_reap_agents)" "1"
+
+    tmux kill-window -t doomedwin
+    wait_for_reap reapwin || _afail "reapwin survived kill-window"
+    refute agent_exists reapwin
+}
+
+# kill-session fires session-closed only. tmux-worktree closes a whole session
+# per branch, so this is the teardown the sibling plugins actually trigger.
+@test "an agent is reaped when its session is killed" {
+    run_plugin
+    tmux set-option -g remain-on-exit off
+
+    tmux new-session -d -s doomedsess 'sleep 100'
+    local pane
+    pane=$(tmux list-panes -t doomedsess -F '#{pane_id}' | head -1)
+    assert_not_empty "$pane"
+
+    "$MESH_BIN" register --session reapsess --harness claude --pane "$pane" >/dev/null
+    assert_eq "$(count_reap_agents)" "1"
+
+    tmux kill-session -t doomedsess
+    wait_for_reap reapsess || _afail "reapsess survived kill-session"
+    refute agent_exists reapsess
+}
+
+# A burst is the case the debounce exists for, and the case it can break: if a
+# debounced call returns without scheduling the trailing pass, the last pane to
+# die is never reaped.
+@test "every agent is reaped when several panes close at once" {
+    run_plugin
+    tmux set-option -g remain-on-exit off
+
+    local i pane panes=()
+    for i in 1 2 3 4; do
+        pane=$(victim_pane "victim$i")
+        assert_not_empty "$pane"
+        "$MESH_BIN" register --session "reap$i" --harness claude --pane "$pane" >/dev/null
+        panes+=("$pane")
+    done
+    assert_eq "$(count_reap_agents)" "4"
+
+    for pane in "${panes[@]}"; do
+        tmux kill-pane -t "$pane" 2>/dev/null || true
+    done
+
+    for i in 1 2 3 4; do
+        wait_for_reap "reap$i" || _afail "reap$i survived its pane closing"
+    done
+    assert_eq "$(count_reap_agents)" "0"
 }
 
 # ── key binding ──────────────────────────────────────────────────────
@@ -124,15 +286,27 @@ doctor_in_fake_home() { HOME="$FAKE_HOME" "$MESH_BIN" doctor; }
 @test "doctor sees the tmux state the plugin creates" {
     run_plugin
     run doctor_in_fake_home
-    assert_contains "$output" "ok    cleanup registered on pane-died"
+    assert_contains "$output" "ok    cleanup registered on every teardown hook"
+    assert_contains "$output" "ok    no stale cleanup on pane-died"
     assert_contains "$output" "ok    menu key bound"
     assert_contains "$output" "ok    symlink points at this checkout"
 }
 
 @test "doctor reports the tmux state as missing before the plugin loads" {
     run doctor_in_fake_home
-    assert_contains "$output" "FAIL  cleanup registered on pane-died"
+    assert_contains "$output" "FAIL  cleanup registered on every teardown hook"
     assert_contains "$output" "FAIL  menu key bound"
+}
+
+# A doctor that only checks the new hook would report a clean bill of health on a
+# server still carrying the dead one, which is the state every existing install
+# is in until the plugin is reloaded.
+@test "doctor fails when cleanup is still on pane-died" {
+    run_plugin
+    tmux set-hook -ga pane-died "run-shell -b '$SCRIPTS_DIR/mesh.sh cleanup'"
+    run doctor_in_fake_home
+    assert_fail
+    assert_contains "$output" "FAIL  no stale cleanup on pane-died"
 }
 
 # ── dispatch ─────────────────────────────────────────────────────────

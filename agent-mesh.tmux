@@ -56,13 +56,53 @@ tmux set -gq @agent-mesh-status ""
 # prefix + m: roster with pending counts, jump to a pane.
 tmux bind-key "${KEYBINDING:-m}" run-shell "$SCRIPTS_DIR/mesh.sh menu"
 
-# Reap agents whose pane died. session_shutdown does not fire when a pane is
+# Reap agents whose pane is gone. session_shutdown does not fire when a pane is
 # killed, so for every harness this is the only cleanup path.
 #
-# -ga, not -g: a plain set replaces whatever else is on pane-died, and this
-# plugin has three siblings plus whatever the user wrote. The existence check is
-# what keeps -ga idempotent, since tmux reloads this file on every source-file
-# and an unconditional append accumulates one duplicate per reload.
-if ! tmux show-hooks -g pane-died 2>/dev/null | grep -qF "$SCRIPTS_DIR/mesh.sh cleanup"; then
-    tmux set-hook -ga pane-died "run-shell -b '$SCRIPTS_DIR/mesh.sh cleanup'"
-fi
+# Four hooks, because no single one covers pane teardown. Measured on 3.5a with
+# remain-on-exit off, which is the default:
+#
+#   the pane's process exits      pane-exited, window-layout-changed
+#   kill-pane, multi-pane window  after-kill-pane, window-layout-changed
+#   kill-pane, last pane          after-kill-pane, window-unlinked
+#   kill-window                   window-unlinked
+#   kill-session                  session-closed, window-unlinked
+#   pane-died                     never fires at all
+#
+# So `pane-exited` alone still misses every kill-*, and `pane-died` (what
+# releases up to 0.1.0 used) fires only while remain-on-exit is on: the plugin
+# shipped with no working cleanup path whatsoever. window-layout-changed is
+# deliberately not in the set - it also fires on every split, resize and layout
+# switch, which is a much hotter path than anything it would add coverage for.
+#
+# All four are debounced into one prune by cmd_cleanup, so overlapping hooks on
+# the same event cost one stat, not one prune.
+MESH_CLEANUP_HOOKS="pane-exited after-kill-pane window-unlinked session-closed"
+
+# Drop the dead pane-died binding. Left behind it becomes a second reap that does
+# fire, for anybody who turns remain-on-exit on.
+#
+# Unset by index, since only one entry in the array is ours. tmux does not
+# renumber the survivors, so the indices read here stay valid across removals.
+tmux show-hooks -g pane-died 2>/dev/null \
+    | grep -F "$SCRIPTS_DIR/mesh.sh cleanup" \
+    | sed -n 's/^pane-died\[\([0-9]*\)\].*/\1/p' \
+    | while read -r _i; do
+        tmux set-hook -gu "pane-died[$_i]" 2>/dev/null || true
+      done
+
+# -ga, not -g: a plain set replaces whatever else is on the hook, and this plugin
+# has three siblings plus whatever the user wrote. The existence check is what
+# keeps -ga idempotent, since tmux reloads this file on every source-file and an
+# unconditional append accumulates one duplicate per reload.
+#
+# Validated per name: the published floor is tmux 3.0 and an unknown hook name
+# makes set-hook fail, which under `set -e` would abort the rest of this file.
+# `show-hooks -g <name>` is the only per-name check that works, since a bare
+# `show-hooks -g` omits names that are unset.
+for _hook in $MESH_CLEANUP_HOOKS; do
+    tmux show-hooks -g "$_hook" >/dev/null 2>&1 || continue
+    if ! tmux show-hooks -g "$_hook" 2>/dev/null | grep -qF "$SCRIPTS_DIR/mesh.sh cleanup"; then
+        tmux set-hook -ga "$_hook" "run-shell -b '$SCRIPTS_DIR/mesh.sh cleanup'"
+    fi
+done

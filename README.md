@@ -166,7 +166,7 @@ flowchart TB
 
     Base --> Conf["./install.sh --tmux-conf"]
     Conf --> C1["run-shell line in ~/.tmux.conf"]
-    C1 --> C2["keybind, pane-died cleanup, CLI + Pi symlinks"]
+    C1 --> C2["keybind, teardown-hook cleanup, CLI + Pi symlinks"]
 
     Base --> Harness["./install.sh --claude --codex --gemini --pi"]
     Harness --> H1["hooks in each harness config"]
@@ -818,7 +818,10 @@ turn on its own with `delivered_via = 'pi:push'`.
 - **`session_start` does not fire under `pi --print`.** One-shot print runs never
   register.
 - **A killed pane fires no shutdown hook** on any harness, so dead agents are
-  reaped by `cleanup`, bound to tmux's `pane-died`.
+  reaped by `cleanup`, bound to four tmux hooks: `pane-exited` for a process that
+  exits, `after-kill-pane`, `window-unlinked` for a closed window, and
+  `session-closed`. Measured on 3.5a, no single one of these covers pane teardown
+  and `pane-died` never fires at all, because it requires `remain-on-exit`.
 - **No first-class tool for Pi.** `registerTool` needs a TypeBox schema and neither
   `typebox` nor the pi package resolves from `~/.pi/agent/extensions`, so Pi
   discovers the mailbox the way the others do, through injected context.

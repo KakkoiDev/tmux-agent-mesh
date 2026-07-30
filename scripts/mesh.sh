@@ -1416,7 +1416,51 @@ EOF
 
 # Remove agents whose tmux pane is gone, delivered mail older than 24h,
 # and threads with no remaining messages.
+#
+# Measured on a 14-pane server with 14 agents: 188ms, of which 55ms is sourcing
+# this file and 122ms is nine forks (seven sqlite3, one list-panes, one set).
+# `pane-exited` fires on every pane close server-wide, and killing a window with
+# four panes fires four times, so unbounded that is four concurrent sqlite
+# writers against the database while the server is mid-teardown.
+#
+# The debounce therefore skips the prune, but a skip that simply returns loses
+# the last death in a burst: nothing else would ever notice that pane is gone.
+# A skipped call schedules one trailing pass instead, and a pending marker keeps
+# a burst of any size to exactly one scheduled run.
+MESH_CLEANUP_DEBOUNCE="${MESH_CLEANUP_DEBOUNCE:-2}"
+
+_cleanup_stamp()   { printf '%s/.cleanup.stamp' "$MESH_DIR"; }
+_cleanup_pending() { printf '%s/.cleanup.pending' "$MESH_DIR"; }
+
+# run-shell -b -d is a libevent timer inside tmux, so no `sleep` child is left
+# holding a process slot. With no server there is nothing to schedule from and
+# nothing to reap for either, so failing to schedule is not an error.
+_schedule_cleanup() {
+    tmux run-shell -b -d "$(( MESH_CLEANUP_DEBOUNCE + 1 ))" \
+        "$SCRIPTS_DIR/mesh.sh cleanup --forced" 2>/dev/null || true
+}
+
 cmd_cleanup() {
+    local forced=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --forced) forced=1 ;;
+            *) _die "cleanup: unknown flag '$1'" ;;
+        esac
+        shift
+    done
+
+    if [[ "$forced" -eq 0 ]] && tk_fresh "$(_cleanup_stamp)" "$MESH_CLEANUP_DEBOUNCE"; then
+        if [[ ! -e "$(_cleanup_pending)" ]]; then
+            : > "$(_cleanup_pending)" 2>/dev/null || true
+            _schedule_cleanup
+        fi
+        _debug_log "cleanup debounced, trailing pass scheduled"
+        return 0
+    fi
+    rm -f "$(_cleanup_pending)" 2>/dev/null || true
+    : > "$(_cleanup_stamp)" 2>/dev/null || true
+
     _ensure_schema
 
     local live=""
@@ -1521,7 +1565,21 @@ _cli_points_here() {
 # when a server is running but nothing is attached to it.
 _tmux_running()   { tmux list-sessions >/dev/null 2>&1; }
 _tmux_conf_line() { grep -qF "agent-mesh.tmux" "$HOME/.tmux.conf" 2>/dev/null; }
-_pane_died_hook() { tmux show-hooks -g pane-died 2>/dev/null | grep -qF "mesh.sh cleanup"; }
+# Every hook in the covering set, not just one: a partial registration reaps on
+# some teardowns and not others, which looks like an intermittent bug rather than
+# a missing hook. The list is the same one agent-mesh.tmux registers.
+_cleanup_hooks_registered() {
+    local h
+    for h in pane-exited after-kill-pane window-unlinked session-closed; do
+        tmux show-hooks -g "$h" >/dev/null 2>&1 || continue
+        tmux show-hooks -g "$h" 2>/dev/null | grep -qF "mesh.sh cleanup" || return 1
+    done
+    return 0
+}
+
+# The old binding is a failure, not just clutter: it fires a second reap for
+# anyone running with remain-on-exit on, so report it rather than ignore it.
+_no_stale_died_hook() { ! tmux show-hooks -g pane-died 2>/dev/null | grep -qF "mesh.sh cleanup"; }
 _menu_bound()     { tmux list-keys -T prefix 2>/dev/null | grep -qF "mesh.sh menu"; }
 
 # The Pi extension is the only path that can wake an idle agent, and the only
@@ -1599,8 +1657,9 @@ cmd_doctor() {
     printf 'tmux\n'
     if _tmux_running; then
         _probe "plugin line in ~/.tmux.conf" _tmux_conf_line
-        _probe "cleanup registered on pane-died" _pane_died_hook
-        _probe "menu key bound"                  _menu_bound
+        _probe "cleanup registered on every teardown hook" _cleanup_hooks_registered
+        _probe "no stale cleanup on pane-died"             _no_stale_died_hook
+        _probe "menu key bound"                            _menu_bound
     else
         printf 'skip  tmux state (no running server)\n'
     fi

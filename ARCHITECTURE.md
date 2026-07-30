@@ -115,7 +115,9 @@ Established by running a real agent, not from documentation:
 - `session_start` fires interactively but **not** under `pi --print`. A one-shot
   print run never registers.
 - `session_shutdown` does **not** fire when a pane is killed, so dead-pane
-  reaping is the only cleanup path there. `pane-died` triggers `cleanup`.
+  reaping is the only cleanup path there. Four tmux hooks trigger `cleanup`:
+  `pane-exited`, `after-kill-pane`, `window-unlinked` and `session-closed`. No
+  single hook covers pane teardown, and `pane-died` covers none of it.
 - `registerTool` is unusable from `~/.pi/agent/extensions`: its `parameters`
   field needs a TypeBox schema and neither `typebox` nor the pi package resolves
   from that directory. Type-only imports are fine, since they are erased before
@@ -257,7 +259,7 @@ state, mesh rows are messages, so dropping them needs the explicit `--reset`.
 
 | File | Purpose |
 |---|---|
-| `agent-mesh.tmux` | TPM entry: DB init, CLI symlink, skill sync, Pi extension link, keybind, `pane-died` cleanup |
+| `agent-mesh.tmux` | TPM entry: DB init, CLI symlink, skill sync, Pi extension link, keybind, teardown-hook cleanup |
 | `scripts/mesh.sh` | every command, single dispatcher |
 | `scripts/helpers.sh` | tmux option access, 60s config cache, version check |
 | `pi-extension/index.ts` | resident watcher and the push channel |
