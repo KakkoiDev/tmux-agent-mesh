@@ -31,14 +31,14 @@ type ChannelView struct {
 
 // SidebarModel is the channel list + agent roster panel.
 type SidebarModel struct {
-	channels      []ChannelView
-	agents        []AgentView
-	cursor        int
-	viewport      viewport.Model
-	width         int
-	height        int
-	focused       bool
-	showAgents    bool
+	channels   []ChannelView
+	agents     []AgentView
+	cursor     int
+	viewport   viewport.Model
+	width      int
+	height     int
+	focused    bool
+	showAgents bool
 }
 
 func NewSidebar() SidebarModel {
@@ -123,9 +123,6 @@ func (m *SidebarModel) View() string {
 	m.viewport.SetContent(content)
 
 	style := SidebarStyle.Width(m.width).Height(m.height)
-	if m.focused {
-		style = style.BorderForeground(highlight)
-	}
 	return style.Render(m.viewport.View())
 }
 
@@ -138,31 +135,35 @@ func (m *SidebarModel) renderChannel(ch ChannelView, selected bool) string {
 	name := ch.Name
 	if ch.Kind == "dm" {
 		name = "@" + name[3:] // strip "dm-" prefix for display
-		if len(name) > 14 {
-			name = name[:14]
-		}
 	} else {
 		name = "#" + name
 	}
 
-	var parts []string
-	parts = append(parts, prefix+name)
-
+	// Build the trailing markers first so the name can be truncated to fit.
+	// (Member counts are dropped: unread + private markers matter more and
+	// the name needs the space.)
+	var suffix []string
 	if ch.Unread > 0 {
-		parts = append(parts, ChannelUnreadStyle.Render(fmt.Sprintf("(%d)", ch.Unread)))
+		suffix = append(suffix, fmt.Sprintf("(%d)", ch.Unread))
 	}
 	if ch.Visibility == "private" {
-		parts = append(parts, ChannelPrivateStyle.Render("[L]"))
+		suffix = append(suffix, "[L]")
+	}
+	suffixStr := ""
+	if len(suffix) > 0 {
+		suffixStr = " " + strings.Join(suffix, " ")
 	}
 
-	line := strings.Join(parts, " ")
-
-	// Add member count
-	if ch.Kind == "channel" && ch.MemberCount > 0 {
-		memberStr := fmt.Sprintf("%d", ch.MemberCount)
-		line += strings.Repeat(" ", max(0, m.width-lipgloss.Width(line)-lipgloss.Width(memberStr)-2))
-		line += ChannelPrivateStyle.Render(memberStr)
+	// Content width: sidebar width minus left/right padding.
+	contentW := 20 - 2
+	avail := contentW - len(prefix) - lipgloss.Width(suffixStr)
+	if avail < 1 {
+		name = ""
+	} else if len([]rune(name)) > avail {
+		name = Truncate(name, avail)
 	}
+
+	line := prefix + name + suffixStr
 
 	if selected && m.focused {
 		return ChannelSelectedStyle.Render(line)

@@ -19,27 +19,32 @@ const (
 
 // PickerItem is one selectable item in the picker.
 type PickerItem struct {
-	ID      int64
-	Name    string
-	Detail  string // extra info like member count or harness
+	ID     int64
+	Name   string
+	Detail string // extra info like member count or harness
 }
 
 // PickerModel is the fuzzy-find picker overlay.
 type PickerModel struct {
-	active  bool
-	mode    PickerMode
-	input   textinput.Model
-	items   []PickerItem
+	active   bool
+	mode     PickerMode
+	input    textinput.Model
+	items    []PickerItem
 	filtered []PickerItem
-	cursor  int
-	width   int
-	height  int
+	cursor   int
+	width    int
+	height   int
 }
 
 func NewPicker() PickerModel {
 	ti := textinput.New()
 	ti.Placeholder = "Filter..."
+	ti.Prompt = ""
 	ti.Width = 30
+	ti.PromptStyle = InputPromptStyle
+	ti.TextStyle = InputTextStyle
+	ti.PlaceholderStyle = InputPlaceholderStyle
+	ti.Cursor.Style = InputCursorStyle
 
 	return PickerModel{
 		input: ti,

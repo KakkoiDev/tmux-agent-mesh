@@ -20,19 +20,24 @@ type SearchResult struct {
 
 // SearchModel is the search bar + results overlay.
 type SearchModel struct {
-	active     bool
-	input      textinput.Model
-	results    []SearchResult
-	cursor     int
-	viewport   viewport.Model
-	width      int
-	height     int
+	active   bool
+	input    textinput.Model
+	results  []SearchResult
+	cursor   int
+	viewport viewport.Model
+	width    int
+	height   int
 }
 
 func NewSearch() SearchModel {
 	ti := textinput.New()
 	ti.Placeholder = "Search messages..."
+	ti.Prompt = ""
 	ti.Width = 40
+	ti.PromptStyle = InputPromptStyle
+	ti.TextStyle = InputTextStyle
+	ti.PlaceholderStyle = InputPlaceholderStyle
+	ti.Cursor.Style = InputCursorStyle
 
 	vp := viewport.New(60, 10)
 

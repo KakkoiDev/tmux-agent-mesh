@@ -33,8 +33,13 @@ type ComposeModel struct {
 func NewCompose() ComposeModel {
 	ti := textinput.New()
 	ti.Placeholder = "Type a message..."
+	ti.Prompt = ""
 	ti.CharLimit = 4000
 	ti.Width = 60
+	ti.PromptStyle = InputPromptStyle
+	ti.TextStyle = InputTextStyle
+	ti.PlaceholderStyle = InputPlaceholderStyle
+	ti.Cursor.Style = InputCursorStyle
 
 	return ComposeModel{
 		input: ti,
@@ -117,13 +122,13 @@ func (m *ComposeModel) View() string {
 
 	style := ComposeStyle.Width(m.width)
 	if m.focused {
-		style = style.BorderForeground(highlight)
+		style = style.BorderForeground(accent)
 	}
 
 	rendered := fmt.Sprintf("%s %s", ComposePromptStyle.Render(prompt), m.input.View())
 	// Status bar hints
-	hints := "enter: send  ctrl+t: thread  ctrl+n: new DM  ctrl+k: channel  ctrl+u: upload  ?: help  ctrl+c: quit"
-	rendered += "\n" + StatusBarStyle.Width(m.width).Render(hints)
+	hints := "enter: send  tab: switch  ctrl+t: thread  ctrl+n: dm  ctrl+k: channel  ?: help  ctrl+c: quit"
+	rendered += "\n" + StatusBarStyle.Width(m.width-3).Render(hints)
 	rendered = style.Render(rendered)
 
 	return rendered
@@ -158,7 +163,7 @@ Actions
   q / Ctrl+C     Quit
 
 Status
-  ● working  ◐ idle+pending  ○ idle  ✕ dead
+  ⬤ working  ◐ idle+pending  ○ idle  ✖ dead
   ✓ sent  ✓✓ read  ⏳ pending
   * unread  [L] private channel`
 

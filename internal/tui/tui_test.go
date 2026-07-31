@@ -831,11 +831,11 @@ func TestAgentDots(t *testing.T) {
 		agent AgentView
 		want  string
 	}{
-		{AgentView{TurnState: "working", Pending: 0}, "●"},
+		{AgentView{TurnState: "working", Pending: 0}, "⬤"},
 		{AgentView{TurnState: "idle", Pending: 0}, "○"},
 		{AgentView{TurnState: "idle", Pending: 3}, "◐"},
 		{AgentView{TurnState: "working", Pending: 1}, "◐"},
-		{AgentView{Dead: true}, "✕"},
+		{AgentView{Dead: true}, "✖"},
 	}
 
 	for _, tt := range tests {

@@ -30,15 +30,15 @@ type MsgView struct {
 
 // FeedModel is the scrollable message area.
 type FeedModel struct {
-	messages   []MsgView
-	viewport   viewport.Model
-	width      int
-	height     int
-	focused    bool
-	cursor     int // index into messages
+	messages    []MsgView
+	viewport    viewport.Model
+	width       int
+	height      int
+	focused     bool
+	cursor      int // index into messages
 	channelName string
-	showThread bool
-	threadMsgs []MsgView
+	showThread  bool
+	threadMsgs  []MsgView
 }
 
 func NewFeed() FeedModel {
@@ -109,7 +109,7 @@ func (m *FeedModel) View() string {
 		header := MessageHeaderStyle.Render(m.channelName)
 		b.WriteString(header)
 		b.WriteString("\n")
-		b.WriteString(strings.Repeat("─", m.width-2))
+		b.WriteString(strings.Repeat("━", m.width-2))
 		b.WriteString("\n")
 	}
 
@@ -129,7 +129,7 @@ func (m *FeedModel) View() string {
 
 	style := FeedStyle.Width(m.width).Height(m.height)
 	if m.focused {
-		style = style.BorderForeground(highlight)
+		style = style.BorderForeground(accent)
 	}
 	return style.Render(m.viewport.View())
 }
@@ -140,7 +140,7 @@ func (m *FeedModel) renderMessage(msg MsgView, selected bool) string {
 	// Selection marker
 	cursor := " "
 	if selected {
-		cursor = ">"
+		cursor = MessageCursorStyle.Render(">")
 	}
 
 	// Timestamp
@@ -204,7 +204,7 @@ func (m *FeedModel) ThreadView(root MsgView, replies []MsgView) string {
 	// Root message
 	b.WriteString(MessageHeaderStyle.Render("Thread"))
 	b.WriteString("\n")
-	b.WriteString(strings.Repeat("─", m.width-2))
+	b.WriteString(strings.Repeat("━", m.width-2))
 	b.WriteString("\n\n")
 
 	b.WriteString(m.renderMessage(root, false))

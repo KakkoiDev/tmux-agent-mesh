@@ -10,13 +10,13 @@ import (
 
 // ThreadModel is the thread overlay.
 type ThreadModel struct {
-	active    bool
-	root      *MsgView
-	replies   []MsgView
-	viewport  viewport.Model
-	cursor    int
-	width     int
-	height    int
+	active   bool
+	root     *MsgView
+	replies  []MsgView
+	viewport viewport.Model
+	cursor   int
+	width    int
+	height   int
 }
 
 func NewThread() ThreadModel {

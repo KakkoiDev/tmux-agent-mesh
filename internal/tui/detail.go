@@ -10,11 +10,11 @@ import (
 
 // DetailModel shows message metadata and read receipts.
 type DetailModel struct {
-	visible   bool
-	width     int
-	height    int
-	message   *MsgView
-	receipts  []store.Receipt
+	visible  bool
+	width    int
+	height   int
+	message  *MsgView
+	receipts []store.Receipt
 }
 
 func NewDetail() DetailModel {
@@ -57,7 +57,7 @@ func (m *DetailModel) View() string {
 
 	b.WriteString(MessageHeaderStyle.Render("Details"))
 	b.WriteString("\n")
-	b.WriteString(strings.Repeat("─", m.width-2))
+	b.WriteString(strings.Repeat("━", m.width-2))
 	b.WriteString("\n\n")
 
 	// Message info
