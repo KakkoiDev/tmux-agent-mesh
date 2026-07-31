@@ -47,18 +47,28 @@ var SidebarTitleStyle = lipgloss.NewStyle().
 	Bold(true).
 	Foreground(accent)
 
+// SidebarSeparatorStyle — muted separator line under headers.
+var SidebarSeparatorStyle = lipgloss.NewStyle().
+	Foreground(border)
+
 // ChannelItemStyle — bright white channel rows.
 var ChannelItemStyle = lipgloss.NewStyle().
 	Foreground(white).
 	Padding(0, 0)
 
 // ChannelSelectedStyle — full-width yellow pill for the selected channel.
-// No side padding: the pill must fit the 18-column content area exactly
+// No side padding: the pill must fit the content area exactly
 // (SidebarStyle chrome: 2 borders + 2 padding).
 var ChannelSelectedStyle = lipgloss.NewStyle().
 	Bold(true).
 	Background(yellow).
 	Foreground(onYellow)
+
+// ChannelActiveStyle — muted highlight for the active channel when sidebar
+// is not focused (so the user can still see which channel is open).
+var ChannelActiveStyle = lipgloss.NewStyle().
+	Bold(true).
+	Foreground(yellow)
 
 // ChannelUnreadStyle — bold yellow unread counts.
 var ChannelUnreadStyle = lipgloss.NewStyle().

@@ -307,8 +307,8 @@ func TestSidebarRendersAgents(t *testing.T) {
 	})
 
 	view := sm.View()
-	if !strings.Contains(view, "AGENTS") {
-		t.Error("sidebar should have AGENTS header")
+	if !strings.Contains(view, "MEMBERS") {
+		t.Error("sidebar should have MEMBERS header")
 	}
 	if !strings.Contains(view, "builder") {
 		t.Error("sidebar should contain builder")

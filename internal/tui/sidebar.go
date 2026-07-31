@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -31,14 +30,13 @@ type ChannelView struct {
 
 // SidebarModel is the channel list + agent roster panel.
 // sidebarChrome is the column budget consumed by SidebarStyle borders (2)
-// plus horizontal padding (2); the viewport and row renderers subtract it.
+// plus horizontal padding (2); row renderers subtract it.
 const sidebarChrome = 4
 
 type SidebarModel struct {
 	channels   []ChannelView
 	agents     []AgentView
 	cursor     int
-	viewport   viewport.Model
 	width      int
 	height     int
 	focused    bool
@@ -46,9 +44,7 @@ type SidebarModel struct {
 }
 
 func NewSidebar() SidebarModel {
-	vp := viewport.New(18, 40)
 	return SidebarModel{
-		viewport:   vp,
 		showAgents: true,
 	}
 }
@@ -56,8 +52,6 @@ func NewSidebar() SidebarModel {
 func (m *SidebarModel) SetSize(width, height int) {
 	m.width = width
 	m.height = height
-	m.viewport.Width = max(0, width-sidebarChrome)
-	m.viewport.Height = height
 }
 
 func (m *SidebarModel) SetChannels(channels []ChannelView) {
@@ -92,53 +86,74 @@ func (m *SidebarModel) MoveDown() {
 }
 
 func (m *SidebarModel) Update(msg tea.Msg) (SidebarModel, tea.Cmd) {
-	var cmd tea.Cmd
-	m.viewport, cmd = m.viewport.Update(msg)
-	return *m, cmd
+	return *m, nil
 }
 
 func (m *SidebarModel) View() string {
 	var b strings.Builder
 
-	// Channels header
+	// Channels header with separator
 	b.WriteString(SidebarTitleStyle.Render("CHANNELS"))
 	b.WriteString("\n")
+	sep := strings.Repeat("─", max(0, m.width-sidebarChrome))
+	b.WriteString(SidebarSeparatorStyle.Render(sep))
+	b.WriteString("\n")
 
-	for i, ch := range m.channels {
-		line := m.renderChannel(ch, i == m.cursor)
+	// Channel rows — clamp to available height
+	avail := m.height - 1 // minus the header + separator line already rendered
+	agentSection := 0
+	if m.showAgents {
+		agentSection = 2 + len(m.agents) // blank line + MEMBERS header + agent rows
+	}
+	maxCh := avail - 1 - agentSection // -1 spare for header
+	if maxCh < 0 {
+		maxCh = 0
+	}
+	if maxCh > len(m.channels) {
+		maxCh = len(m.channels)
+	}
+
+	for i := 0; i < maxCh; i++ {
+		ch := m.channels[i]
+		atCursor := m.focused && i == m.cursor
+		line := m.renderChannel(ch, atCursor, ch.Selected && !atCursor)
 		b.WriteString(line)
 		b.WriteString("\n")
 	}
 
 	if m.showAgents {
 		b.WriteString("\n")
-		b.WriteString(SidebarTitleStyle.Render("AGENTS"))
+		b.WriteString(SidebarTitleStyle.Render("MEMBERS"))
 		b.WriteString("\n")
 
-		for i, a := range m.agents {
+		for _, a := range m.agents {
 			line := m.renderAgent(a)
 			b.WriteString(line)
 			b.WriteString("\n")
-			_ = i
 		}
 	}
 
 	content := b.String()
-	m.viewport.SetContent(content)
 
-	style := SidebarStyle.Height(m.height)
+	// Pad to height so the block fills its column
+	lines := strings.Split(content, "\n")
+	for len(lines) < m.height {
+		lines = append(lines, "")
+	}
+	if len(lines) > m.height {
+		lines = lines[:m.height]
+	}
+
+	style := SidebarStyle
 	if m.focused {
 		style = style.Background(focusBg)
 	}
-	// No .Width(): the viewport pads rows to the content width, so the block
-	// sizes naturally to border(2)+padding(2)+content (=m.width). lipgloss
-	// adds borders on top of .Width(), which would overflow by 2.
-	return style.Render(m.viewport.View())
+	return style.Render(strings.Join(lines, "\n"))
 }
 
-func (m *SidebarModel) renderChannel(ch ChannelView, selected bool) string {
+func (m *SidebarModel) renderChannel(ch ChannelView, cursor, active bool) string {
 	prefix := " "
-	if selected {
+	if cursor {
 		prefix = "> "
 	}
 
@@ -150,8 +165,6 @@ func (m *SidebarModel) renderChannel(ch ChannelView, selected bool) string {
 	}
 
 	// Build the trailing markers first so the name can be truncated to fit.
-	// (Member counts are dropped: unread + private markers matter more and
-	// the name needs the space.)
 	var suffix []string
 	if ch.Unread > 0 {
 		suffix = append(suffix, fmt.Sprintf("(%d)", ch.Unread))
@@ -175,8 +188,11 @@ func (m *SidebarModel) renderChannel(ch ChannelView, selected bool) string {
 
 	line := prefix + name + suffixStr
 
-	if selected && m.focused {
+	if cursor {
 		return ChannelSelectedStyle.Render(line)
+	}
+	if active {
+		return ChannelActiveStyle.Render(line)
 	}
 	return ChannelItemStyle.Render(line)
 }
