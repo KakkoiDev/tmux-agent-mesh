@@ -13,7 +13,7 @@ _tmux_agent_mesh_completion() {
     local cmds="init register deregister name alias roster send broadcast reply
                 inbox mark-read history thread recv watch drain ping info
                 channel dm search dispatch claim-dispatch menu goto status-bar
-                refresh cleanup hook doctor selftest"
+                refresh cleanup hook doctor selftest set-transcript transcript"
 
     if [[ $cword -eq 1 ]]; then
         COMPREPLY=($(compgen -W "$cmds" -- "$cur"))

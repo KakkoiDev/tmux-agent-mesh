@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	_ "modernc.org/sqlite"
 )
@@ -78,11 +79,52 @@ func (s *Store) migrate() error {
 	if _, err := s.db.Exec(schemaSQL); err != nil {
 		return fmt.Errorf("schema: %w", err)
 	}
+	if err := s.migrateAgentsV2(); err != nil {
+		return err
+	}
 	if _, err := s.db.Exec(
 		`INSERT INTO agents (session_id, harness, alias, turn_state)
 		 VALUES (?, 'human', ?, 'idle')
 		 ON CONFLICT(session_id) DO NOTHING`, HumanID, HumanID); err != nil {
 		return fmt.Errorf("seed human: %w", err)
+	}
+	return nil
+}
+
+// schemaVersion reads the version stamped in schema_meta, 0 if none is.
+func (s *Store) schemaVersion() (int, error) {
+	var v int
+	err := s.db.QueryRow(
+		`SELECT value FROM schema_meta WHERE key = 'schema_version'`).Scan(&v)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	return v, err
+}
+
+// migrateAgentsV2 adds the transcript_path column to databases created before
+// it existed. CREATE TABLE IF NOT EXISTS cannot add a column to an existing
+// table, so the ALTER is its own step, guarded by the schema_meta version.
+// A fresh database already has the column from schema.sql, in which case the
+// ALTER fails with "duplicate column name" and is safe to skip.
+func (s *Store) migrateAgentsV2() error {
+	v, err := s.schemaVersion()
+	if err != nil {
+		return fmt.Errorf("schema version: %w", err)
+	}
+	if v >= 2 {
+		return nil
+	}
+	if _, err := s.db.Exec(
+		`ALTER TABLE agents ADD COLUMN transcript_path TEXT NOT NULL DEFAULT ''`); err != nil {
+		if !strings.Contains(err.Error(), "duplicate column name") {
+			return fmt.Errorf("migrate agents v2: %w", err)
+		}
+	}
+	if _, err := s.db.Exec(
+		`INSERT INTO schema_meta (key, value) VALUES ('schema_version', '2')
+		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`); err != nil {
+		return fmt.Errorf("stamp schema version: %w", err)
 	}
 	return nil
 }

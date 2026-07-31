@@ -152,18 +152,20 @@ func (h *Handler) handleAgent(req Request) Response {
 		return errResponse(req.ID, errorCode(err), err.Error())
 	}
 	return okResponse(req.ID, map[string]any{
-		"session_id":   a.SessionID,
-		"harness":      a.Harness,
-		"alias":        a.Alias,
-		"model":        a.Model,
-		"host":         a.Host,
-		"project":      a.Project,
-		"state":        a.TurnState,
-		"push_capable": a.PushCapable,
-		"pending":      a.Pending,
-		"pane":         a.TmuxTarget,
-		"block_streak": a.BlockStreak,
-		"cwd":          a.Cwd,
+		"session_id":      a.SessionID,
+		"harness":         a.Harness,
+		"alias":           a.Alias,
+		"model":           a.Model,
+		"host":            a.Host,
+		"project":         a.Project,
+		"state":           a.TurnState,
+		"push_capable":    a.PushCapable,
+		"pending":         a.Pending,
+		"pane":            a.TmuxTarget,
+		"block_streak":    a.BlockStreak,
+		"cwd":             a.Cwd,
+		"transcript_path": a.TranscriptPath,
+		"last_seen":       a.LastSeen,
 	})
 }
 
@@ -183,7 +185,7 @@ func (h *Handler) handlePing(req Request) Response {
 	return okResponse(req.ID, map[string]any{
 		"session_id": a.SessionID,
 		"state":      a.TurnState,
-		"last_seen":  a.BlockStreak, // TODO: add last_seen to Agent
+		"last_seen":  a.LastSeen,
 		"pending":    a.Pending,
 		"model":      a.Model,
 	})

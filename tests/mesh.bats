@@ -168,6 +168,60 @@ _mock_tmux_pane() {
     assert_eq "$(get_alias s1)" "reviewer"
 }
 
+@test "register auto-names an agent without an alias" {
+    cmd_register --session 019fb695aaaa --harness pi
+    assert_eq "$(get_alias 019fb695aaaa)" "pi-019fb695"
+}
+
+@test "auto-names collide with a counter suffix" {
+    cmd_register --session 019fb695aaaa --harness pi
+    cmd_register --session 019fb695bbbb --harness pi
+    assert_eq "$(get_alias 019fb695aaaa)" "pi-019fb695"
+    assert_eq "$(get_alias 019fb695bbbb)" "pi-019fb695-2"
+}
+
+@test "re-register keeps the auto-name" {
+    cmd_register --session 019fb695aaaa --harness pi
+    cmd_register --session 019fb695aaaa --harness pi
+    assert_eq "$(get_alias 019fb695aaaa)" "pi-019fb695"
+}
+
+@test "re-register keeps a chosen alias, auto-name does not clobber it" {
+    cmd_register --session s1 --harness claude --alias reviewer
+    cmd_register --session s1 --harness claude
+    assert_eq "$(get_alias s1)" "reviewer"
+}
+
+# ── transcript ───────────────────────────────────────────────────────
+
+@test "set-transcript records the path and transcript prints it" {
+    cmd_register --session s1 --harness claude
+    run cmd_set_transcript --session s1 "/x/.claude/projects/slug/s1.jsonl"
+    assert_ok
+    assert_eq "$(msql "SELECT transcript_path FROM agents WHERE session_id='s1';")" "/x/.claude/projects/slug/s1.jsonl"
+    run cmd_transcript s1
+    assert_ok
+    assert_eq "$output" "/x/.claude/projects/slug/s1.jsonl"
+}
+
+@test "transcript prints (none) for an agent without one" {
+    cmd_register --session s1 --harness claude
+    run cmd_transcript s1
+    assert_eq "$output" "(none)"
+}
+
+@test "transcript resolves by alias" {
+    cmd_register --session s1 --harness claude --alias reviewer
+    run cmd_transcript reviewer
+    assert_ok
+    assert_eq "$output" "(none)"
+}
+
+@test "set-transcript requires a path" {
+    run cmd_set_transcript
+    assert_fail
+}
+
 # ── deregister ───────────────────────────────────────────────────────
 
 @test "deregister removes the agent" {
@@ -214,6 +268,20 @@ _mock_tmux_pane() {
     run cmd_alias %42 scout
     assert_ok
     assert_eq "$(get_alias s1)" "scout"
+}
+
+@test "alias with one argument names the calling session" {
+    cmd_register --session s1 --harness claude --pane %7
+    TMUX_PANE=%7 run cmd_alias scout
+    assert_ok
+    assert_eq "$(get_alias s1)" "scout"
+}
+
+@test "alias with one argument fails when the pane has no agent" {
+    TMUX_PANE=%99
+    run cmd_alias scout
+    assert_fail
+    assert_contains "$output" "no agent registered for pane"
 }
 
 @test "alias fails on an unknown ref" {

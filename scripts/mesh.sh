@@ -182,6 +182,7 @@ CREATE TABLE IF NOT EXISTS agents (
     block_streak  INTEGER NOT NULL DEFAULT 0,
     turn_state    TEXT,
     model         TEXT,
+    transcript_path TEXT NOT NULL DEFAULT '"'"''"'"',
     registered_at INTEGER NOT NULL DEFAULT (unixepoch()),
     last_seen     INTEGER NOT NULL DEFAULT (unixepoch())
 );
@@ -326,6 +327,7 @@ EOF
 _MIGRATIONS_SQL='
 ALTER TABLE agents ADD COLUMN turn_state TEXT;
 ALTER TABLE agents ADD COLUMN model TEXT;
+ALTER TABLE agents ADD COLUMN transcript_path TEXT NOT NULL DEFAULT '"'"''"'"' ;
 
 CREATE TABLE IF NOT EXISTS channels (
     id          INTEGER PRIMARY KEY,
@@ -372,10 +374,10 @@ EOF
 
 _ensure_schema() {
     [[ -f "$DB" ]] || return 0
-    [[ -f "$MESH_DIR/.schema_v2" ]] && return 0
+    [[ -f "$MESH_DIR/.schema_v3" ]] && return 0
     printf '%s\n' "$_SCHEMA_SQL" | sqlite3 "$DB" >/dev/null 2>&1 || true
     _apply_migrations
-    touch "$MESH_DIR/.schema_v2" 2>/dev/null || true
+    touch "$MESH_DIR/.schema_v3" 2>/dev/null || true
 }
 
 # ── register / deregister / alias ────────────────────────────────────
@@ -434,7 +436,23 @@ cmd_register() {
              push_capable=excluded.push_capable,
              last_seen=unixepoch();"
 
-    [[ -n "$alias" ]] && _set_alias "$sid" "$alias"
+    if [[ -n "$alias" ]]; then
+        _set_alias "$sid" "$alias"
+    elif [[ "$harness" != "human" && "$sid" != "$HUMAN_ID" ]]; then
+        # No name given: auto-name the agent <harness>-<first 8 of the session
+        # id> so the roster is readable the moment it registers. The alias is
+        # UNIQUE, so a taken name gets a counter suffix instead of failing the
+        # register; a re-register keeps the name the agent chose for itself.
+        local have cand n
+        have=$(sql "SELECT COALESCE(alias,'') FROM agents WHERE session_id='$esid';")
+        if [[ -z "$have" ]]; then
+            cand="$harness-${sid:0:8}"; n=2
+            while [[ -n "$(sql "SELECT session_id FROM agents WHERE alias='$(sql_esc "$cand")';")" ]]; do
+                cand="$harness-${sid:0:8}-$n"; n=$((n + 1))
+            done
+            sql "UPDATE agents SET alias='$(sql_esc "$cand")' WHERE session_id='$esid';"
+        fi
+    fi
     _debug_log "register sid=$sid harness=$harness pane=$pane alias=$alias"
     return 0
 }
@@ -503,16 +521,64 @@ cmd_name() {
     printf '%s is now "%s"\n' "$sid" "$alias"
 }
 
-# Label an agent other than the caller's own. `name` can only ever reach the
-# agent in the calling pane, which leaves no way to label a pane you can see.
+# Label an agent other than the caller's own, or with a single argument,
+# the caller itself: `alias <name>` is how an agent overrides the auto-name
+# it got at registration.
 cmd_alias() {
     local ref="${1:-}" alias="${2:-}" sid rc
-    [[ -n "$ref" && -n "$alias" ]] || _die "alias: usage: alias <ref> <name>"
-    set +e; sid=$(_resolve_ref "$ref"); rc=$?; set -e
-    [[ "$rc" -eq 2 ]] && exit 2
-    [[ -n "$sid" ]] || _die "alias: no agent matches '$ref'"
+    if [[ -n "$alias" ]]; then
+        [[ -n "$ref" ]] || _die "alias: usage: alias <name> | alias <ref> <name>"
+        set +e; sid=$(_resolve_ref "$ref"); rc=$?; set -e
+        [[ "$rc" -eq 2 ]] && exit 2
+        [[ -n "$sid" ]] || _die "alias: no agent matches '$ref'"
+    else
+        alias="$ref"
+        [[ -n "$alias" ]] || _die "alias: usage: alias <name> | alias <ref> <name>"
+        sid=$(_self_session "")
+        if [[ "$sid" == "$HUMAN_ID" ]]; then
+            _die "alias: no agent registered for pane ${TMUX_PANE:-<unset>}; use 'alias <ref> <name>' to label another pane"
+        fi
+    fi
     _set_alias "$sid" "$alias"
     printf '%s is now "%s"\n' "$sid" "$alias"
+}
+
+# ── transcripts ──────────────────────────────────────────────────────
+
+# An agent records where its conversation transcript lives so another agent or
+# the human can open an old conversation. Recording a path counts as activity.
+cmd_set_transcript() {
+    local path="" sid=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --session) sid="${2:-}"; shift ;;
+            -*) _die "set-transcript: unknown flag '$1'" ;;
+            *) [[ -z "$path" ]] && path="$1" || _die "set-transcript: too many arguments" ;;
+        esac
+        shift
+    done
+    [[ -n "$path" ]] || _die "set-transcript: usage: set-transcript [--session <sid>] <path>"
+    [[ -n "$sid" ]] || sid=$(_self_session "")
+    if [[ "$sid" == "$HUMAN_ID" ]]; then
+        _die "set-transcript: no agent registered for pane ${TMUX_PANE:-<unset>}"
+    fi
+    local esid epath
+    esid=$(sql_esc "$sid"); epath=$(sql_esc "$path")
+    sql "UPDATE agents SET transcript_path='$epath', last_seen=unixepoch() WHERE session_id='$esid';"
+    printf 'transcript for %s: %s\n' "$(_display_name "$sid")" "$path"
+}
+
+# Print the transcript path of an agent by reference, so another agent or the
+# human can open the conversation directly.
+cmd_transcript() {
+    local ref="${1:-}" sid rc
+    [[ -n "$ref" ]] || _die "transcript: usage: transcript <ref>"
+    set +e; sid=$(_resolve_ref "$ref"); rc=$?; set -e
+    [[ "$rc" -eq 2 ]] && exit 2
+    [[ -n "$sid" ]] || _die "transcript: no agent matches '$ref'"
+    local path
+    path=$(sql "SELECT transcript_path FROM agents WHERE session_id='$(sql_esc "$sid")';")
+    printf '%s\n' "${path:-(none)}"
 }
 
 # ── loop safety ──────────────────────────────────────────────────────
@@ -618,6 +684,7 @@ cmd_send() {
 
     local mid
     mid=$(_queue_message "$sender" "$target" "$body" "$thread" "$hops" "$expect" "$reply_to")
+    sql "UPDATE agents SET last_seen=unixepoch() WHERE session_id='$(sql_esc "$sender")';"
     printf 'queued message %s to %s (thread %s)\n' "$mid" "$(_display_name "$target")" "$thread"
 }
 
@@ -664,6 +731,7 @@ cmd_broadcast() {
 $recipients
 EOF
     printf 'broadcast to %s recipients (thread %s)\n' "$n" "$thread"
+    sql "UPDATE agents SET last_seen=unixepoch() WHERE session_id='$(sql_esc "$sender")';"
 }
 
 cmd_reply() {
@@ -703,6 +771,7 @@ EOF
 
     local new_id
     new_id=$(_queue_message "$sender" "$orig_from" "$body" "$orig_thread" "$hops" 0 "$mid")
+    sql "UPDATE agents SET last_seen=unixepoch() WHERE session_id='$(sql_esc "$sender")';"
     printf 'replied as message %s to %s (thread %s, hop %s)\n' \
         "$new_id" "$(_display_name "$orig_from")" "$orig_thread" "$hops"
 }
@@ -788,6 +857,7 @@ CREATE TEMP TABLE _claim AS
     SELECT id FROM messages WHERE to_session='$esid' AND delivered_at IS NULL;
 UPDATE messages SET delivered_at=unixepoch(), delivered_via='$evia'
     WHERE id IN (SELECT id FROM _claim);
+UPDATE agents SET last_seen=unixepoch() WHERE session_id='$esid';
 SELECT m.id, m.thread_id, m.from_session,
        COALESCE(a.alias, substr(m.from_session,1,8)) AS from_name,
        m.body, m.hops, m.expect_reply
@@ -2694,6 +2764,8 @@ case "${1:-}" in
     deregister)     shift; cmd_deregister "$@" ;;
     name)           shift; cmd_name "$@" ;;
     alias)          shift; cmd_alias "$@" ;;
+    set-transcript) shift; cmd_set_transcript "$@" ;;
+    transcript)     shift; cmd_transcript "$@" ;;
     roster)         shift; cmd_roster "$@" ;;
     send)           shift; cmd_send "$@" ;;
     broadcast)      shift; cmd_broadcast "$@" ;;
@@ -2740,7 +2812,11 @@ Registry
   register --session <id> [--harness claude|codex|gemini|pi] [--alias <a>] [--pane <%N>] [--cwd <p>]
   deregister [--session <id>]
   name <alias>                     alias the calling session
+  alias <name>                     override the auto-name of the calling session
   alias <ref> <name>               alias any agent
+  set-transcript [--session <id>] <path>
+                                   record this agent's transcript path
+  transcript <ref>                 print another agent's transcript path
   roster [--json] [--remote <host>]
 
 Messaging

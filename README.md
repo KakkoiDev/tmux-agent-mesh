@@ -293,10 +293,14 @@ flowchart LR
     DB --> Files["files/ (designed)"]
 ```
 
-Name each agent once, then message it.
+Name each agent once, then message it. Every agent gets a name at
+registration - `<harness>-<first 8 of its session id>`, e.g. `pi-019fb695`,
+with a counter suffix when the name is taken - so the roster is readable the
+moment agents show up. `alias <name>` in the agent's own pane overrides the
+auto-name, `alias <ref> <name>` labels any agent.
 
 ```bash
-tmux-agent-mesh name reviewer        # inside the agent's own pane
+tmux-agent-mesh alias reviewer        # inside the agent's own pane
 tmux-agent-mesh alias %7 builder     # or label a pane from anywhere
 tmux-agent-mesh roster
 ```
@@ -304,8 +308,16 @@ tmux-agent-mesh roster
 ```
 NAME           HARNESS  PROJECT            STATE    PUSH  PENDING  PANE
 human          human    -                  -        no    1        -
-reviewer       claude   web-app            working  no    0        work:2.1
-builder        pi       api-service        idle     yes   1        work:2.2
+pi-019fb695    pi       web-app            working  yes   0        work:2.1
+claude-019fb6a claude   api-service        idle     no    1        work:2.2
+```
+
+An agent that keeps its conversation elsewhere can record where: the human or
+another agent then prints the path and opens the conversation directly.
+
+```bash
+tmux-agent-mesh set-transcript "$HOME/.pi/agent/sessions/$SID/$SID.jsonl"
+tmux-agent-mesh transcript claude-019fb6a   # -> path, or (none)
 ```
 
 ```bash
