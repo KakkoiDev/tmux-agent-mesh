@@ -128,9 +128,7 @@ func (m *SidebarModel) View() string {
 
 	style := SidebarStyle.Height(m.height)
 	if m.focused {
-		style = style.
-			BorderForeground(accent).
-			Background(focusBg)
+		style = style.Background(focusBg)
 	}
 	// No .Width(): the viewport pads rows to the content width, so the block
 	// sizes naturally to border(2)+padding(2)+content (=m.width). lipgloss
