@@ -155,6 +155,18 @@ _display_name() {
     printf '%s' "${out:-$sid}"
 }
 
+# Human-readable relative time for message timestamps.
+_fmt_ago() {
+    local now ts diff
+    now=$(date +%s)
+    ts="${1:-$now}"
+    diff=$(( now - ts ))
+    if [[ $diff -lt 60 ]]; then printf '%ss ago' "$diff"
+    elif [[ $diff -lt 3600 ]]; then printf '%sm ago' "$(( diff / 60 ))"
+    elif [[ $diff -lt 86400 ]]; then printf '%sh ago' "$(( diff / 3600 ))"
+    else printf '%sd ago' "$(( diff / 86400 ))"; fi
+}
+
 # ── schema ───────────────────────────────────────────────────────────
 
 _SCHEMA_SQL='
@@ -168,12 +180,6 @@ CREATE TABLE IF NOT EXISTS agents (
     project_name  TEXT,
     push_capable  INTEGER NOT NULL DEFAULT 0,
     block_streak  INTEGER NOT NULL DEFAULT 0,
-    -- Turn state, from the hooks this plugin already installs: a prompt starts
-    -- a turn, a turn-end finishes one. Authoritative, unlike scraping the pane
-    -- for words like "tokens", and it decides whether an idle agent may be woken.
-    -- Nullable and unconstrained on purpose: _SCHEMA_SQL is a single-quoted
-    -- shell string and cannot contain the quotes a DEFAULT or CHECK would need.
-    -- Absent means idle, which is what a row written before this column meant.
     turn_state    TEXT,
     model         TEXT,
     registered_at INTEGER NOT NULL DEFAULT (unixepoch()),
@@ -215,6 +221,45 @@ CREATE TABLE IF NOT EXISTS dispatches (
     claimed_by       TEXT,
     claimed_at       INTEGER
 );
+
+-- Channel tables: match the Go store schema so bash and Go coexist.
+CREATE TABLE IF NOT EXISTS channels (
+    id          INTEGER PRIMARY KEY,
+    name        TEXT NOT NULL UNIQUE,
+    kind        TEXT NOT NULL DEFAULT '"'"'channel'"'"'
+        CHECK (kind IN ('"'"'channel'"'"', '"'"'dm'"'"')),
+    visibility  TEXT NOT NULL DEFAULT '"'"'public'"'"'
+        CHECK (visibility IN ('"'"'public'"'"', '"'"'private'"'"')),
+    topic       TEXT NOT NULL DEFAULT '"'"''"'"',
+    created_by  TEXT NOT NULL DEFAULT '"'"''"'"',
+    created_at  INTEGER NOT NULL DEFAULT (unixepoch()),
+    archived_at INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS channel_members (
+    channel_id INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+    session_id TEXT NOT NULL,
+    role       TEXT NOT NULL DEFAULT '"'"'member'"'"'
+        CHECK (role IN ('"'"'member'"'"', '"'"'owner'"'"')),
+    joined_at  INTEGER NOT NULL DEFAULT (unixepoch()),
+    PRIMARY KEY (channel_id, session_id)
+);
+
+CREATE TABLE IF NOT EXISTS channel_rules (
+    channel_id INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+    subject    TEXT NOT NULL CHECK (subject IN ('"'"'harness'"'"', '"'"'model'"'"')),
+    value      TEXT NOT NULL,
+    PRIMARY KEY (channel_id, subject, value)
+);
+
+CREATE TABLE IF NOT EXISTS reads (
+    id            INTEGER PRIMARY KEY,
+    message_id    INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    reader        TEXT NOT NULL,
+    read_at       INTEGER NOT NULL DEFAULT (unixepoch()),
+    source        TEXT NOT NULL CHECK (source IN ('"'"'drain'"'"', '"'"'client'"'"'))
+);
+CREATE INDEX IF NOT EXISTS idx_reads_message ON reads(message_id, read_at);
 '
 
 # ── init ─────────────────────────────────────────────────────────────
@@ -252,7 +297,26 @@ SQL
     sql "INSERT OR IGNORE INTO agents (session_id, harness, alias, push_capable)
          VALUES ('$HUMAN_ID', 'human', '$HUMAN_ID', 0);"
 
+    # Seed the general channel.
+    _seed_general_channel
     echo "Initialized: $DB"
+}
+
+_seed_general_channel() {
+    sql "INSERT OR IGNORE INTO channels (name, kind, visibility, topic, created_by)
+         VALUES ('general', 'channel', 'public', 'Default channel', '$HUMAN_ID');"
+    local agents cid
+    agents=$(sql "SELECT session_id FROM agents;")
+    cid=$(sql "SELECT id FROM channels WHERE name='general';")
+    [[ -n "$cid" ]] || return 0
+    local sid
+    while IFS= read -r sid; do
+        [[ -z "$sid" ]] && continue
+        sql "INSERT OR IGNORE INTO channel_members (channel_id, session_id)
+             VALUES ($cid, '$(sql_esc "$sid")');"
+    done <<EOF
+$agents
+EOF
 }
 
 # CREATE TABLE IF NOT EXISTS cannot add a column to a table that already exists,
@@ -262,6 +326,37 @@ SQL
 _MIGRATIONS_SQL='
 ALTER TABLE agents ADD COLUMN turn_state TEXT;
 ALTER TABLE agents ADD COLUMN model TEXT;
+
+CREATE TABLE IF NOT EXISTS channels (
+    id          INTEGER PRIMARY KEY,
+    name        TEXT NOT NULL UNIQUE,
+    kind        TEXT NOT NULL DEFAULT '"'"'channel'"'"',
+    visibility  TEXT NOT NULL DEFAULT '"'"'public'"'"',
+    topic       TEXT NOT NULL DEFAULT '"'"''"'"',
+    created_by  TEXT NOT NULL DEFAULT '"'"''"'"',
+    created_at  INTEGER NOT NULL DEFAULT (unixepoch()),
+    archived_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS channel_members (
+    channel_id INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+    session_id TEXT NOT NULL,
+    role       TEXT NOT NULL DEFAULT '"'"'member'"'"',
+    joined_at  INTEGER NOT NULL DEFAULT (unixepoch()),
+    PRIMARY KEY (channel_id, session_id)
+);
+CREATE TABLE IF NOT EXISTS channel_rules (
+    channel_id INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+    subject    TEXT NOT NULL CHECK (subject IN ('"'"'harness'"'"', '"'"'model'"'"')),
+    value      TEXT NOT NULL,
+    PRIMARY KEY (channel_id, subject, value)
+);
+CREATE TABLE IF NOT EXISTS reads (
+    id            INTEGER PRIMARY KEY,
+    message_id    INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    reader        TEXT NOT NULL,
+    read_at       INTEGER NOT NULL DEFAULT (unixepoch()),
+    source        TEXT NOT NULL CHECK (source IN ('"'"'drain'"'"', '"'"'client'"'"'))
+);
 '
 
 _apply_migrations() {
@@ -761,7 +856,8 @@ cmd_drain() {
     _debug_log "drain sid=$sid via=$via n=$n"
 
     if [[ "$as_json" -eq 1 ]]; then
-        printf '%s\n' "$json"
+        printf '%s' "$json" | jq 'map(. + {reply_command: ("tmux-agent-mesh reply --to-message \(.id) --message \"...\"")})'
+        printf '\n'
     else
         printf '%s' "$json" | _render_mail
     fi
@@ -1164,13 +1260,14 @@ cmd_hook() {
 # Polls rather than using `tmux wait-for`: this must work from a plain shell
 # outside tmux, and a 1s poll on a local SQLite file costs nothing.
 cmd_recv() {
-    local thread="" wait=0 timeout=300 sid=""
+    local thread="" wait=0 timeout=300 sid="" as_json=0
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --thread)  thread="${2:-}"; shift ;;
             --timeout) timeout="${2:-300}"; shift ;;
             --session) sid="${2:-}"; shift ;;
             --wait)    wait=1 ;;
+            --json)    as_json=1 ;;
             *) _die "recv: unknown flag '$1'" ;;
         esac
         shift
@@ -1178,16 +1275,25 @@ cmd_recv() {
     [[ -n "$thread" ]] || _die "recv: --thread is required"
     [[ -n "$sid" ]] || sid=$(_self_session "")
 
-    local q
+    local q q_json
     q="SELECT m.id, COALESCE(a.alias, m.from_session), m.body
              FROM messages m LEFT JOIN agents a ON a.session_id=m.from_session
              WHERE m.thread_id='$(sql_esc "$thread")' AND m.to_session='$(sql_esc "$sid")'
              ORDER BY m.id"
+    q_json="SELECT m.id, COALESCE(a.alias, m.from_session) AS from_name, m.body,
+              m.thread_id, m.hops, m.created_at
+       FROM messages m LEFT JOIN agents a ON a.session_id=m.from_session
+       WHERE m.thread_id='$(sql_esc "$thread")' AND m.to_session='$(sql_esc "$sid")'
+       ORDER BY m.id"
 
     local waited=0 out
     while true; do
-        out=$(sql_sep '|' "$q;")
-        if [[ -n "$out" ]]; then
+        if [[ "$as_json" -eq 1 ]]; then
+            out=$(sql_json "$q_json;")
+        else
+            out=$(sql_sep '|' "$q;")
+        fi
+        if [[ -n "$out" && "$out" != "[]" ]]; then
             printf '%s\n' "$out"
             return 0
         fi
@@ -1222,6 +1328,689 @@ $(sql_sep '|' "SELECT m.id, m.created_at,
 EOF
         sleep 1
     done
+}
+
+# ── mark-read ────────────────────────────────────────────────────────
+
+cmd_mark_read() {
+    local as="" mid=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --as) as="${2:-}"; shift ;;
+            --message-id) mid="${2:-}"; shift ;;
+            *) _die "mark-read: unknown flag '$1'" ;;
+        esac
+        shift
+    done
+
+    local sid rc
+    if [[ -n "$as" ]]; then
+        set +e; sid=$(_resolve_ref "$as"); rc=$?; set -e
+        [[ "$rc" -eq 2 ]] && exit 2
+        [[ -n "$sid" ]] || _die "mark-read: no agent matches '$as'"
+    else
+        sid=$(_self_session "")
+    fi
+
+    if [[ -n "$mid" ]]; then
+        case "$mid" in
+            *[!0-9]*) _die "mark-read: --message-id must be a number" ;;
+        esac
+        local n
+        n=$(sql "UPDATE messages SET delivered_at=unixepoch(), delivered_via='human:read'
+                 WHERE id=$mid AND to_session='$(sql_esc "$sid")' AND delivered_at IS NULL;
+                 SELECT changes();")
+        if [[ "${n:-0}" -eq 0 ]]; then
+            _die "mark-read: message $mid not found, not pending, or not addressed to you"
+        fi
+        printf 'marked message %s as read\n' "$mid"
+    else
+        local n
+        n=$(sql "SELECT COUNT(*) FROM messages WHERE to_session='$(sql_esc "$sid")' AND delivered_at IS NULL;")
+        if [[ "${n:-0}" -eq 0 ]]; then
+            printf 'no pending messages for %s\n' "$(_display_name "$sid")"
+            return 0
+        fi
+        sql "UPDATE messages SET delivered_at=unixepoch(), delivered_via='human:read'
+             WHERE to_session='$(sql_esc "$sid")' AND delivered_at IS NULL;"
+        printf 'marked %s message(s) as read for %s\n' "$n" "$(_display_name "$sid")"
+    fi
+}
+
+# ── history ──────────────────────────────────────────────────────────
+
+cmd_history() {
+    local as="" thread="" from="" since="" limit="50" as_json=0 channel=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --as) as="${2:-}"; shift ;;
+            --channel) channel="${2:-}"; shift ;;
+            --thread) thread="${2:-}"; shift ;;
+            --from) from="${2:-}"; shift ;;
+            --since) since="${2:-}"; shift ;;
+            --limit) limit="${2:-50}"; shift ;;
+            --json) as_json=1 ;;
+            *) _die "history: unknown flag '$1'" ;;
+        esac
+        shift
+    done
+
+    local sid rc
+    if [[ -n "$as" ]]; then
+        set +e; sid=$(_resolve_ref "$as"); rc=$?; set -e
+        [[ "$rc" -eq 2 ]] && exit 2
+        [[ -n "$sid" ]] || _die "history: no agent matches '$as'"
+    else
+        sid=$(_self_session "")
+    fi
+
+    local where="(m.from_session='$(sql_esc "$sid")' OR m.to_session='$(sql_esc "$sid")')"
+    [[ -n "$thread" ]] && where="$where AND m.thread_id='$(sql_esc "$thread")'"
+    if [[ -n "$from" ]]; then
+        local from_sid frc
+        set +e; from_sid=$(_resolve_ref "$from"); frc=$?; set -e
+        [[ "$frc" -eq 2 ]] && exit 2
+        [[ -n "$from_sid" ]] && where="$where AND m.from_session='$(sql_esc "$from_sid")'"
+    fi
+    [[ -n "$since" ]] && where="$where AND m.created_at >= unixepoch('$(sql_esc "$since")')"
+
+    local q="SELECT m.id, m.thread_id,
+                COALESCE(fa.alias, substr(m.from_session,1,8)),
+                COALESCE(ta.alias, substr(m.to_session,1,8)),
+                m.hops, m.created_at, m.body,
+                m.delivered_at, m.delivered_via
+         FROM messages m
+         LEFT JOIN agents fa ON fa.session_id=m.from_session
+         LEFT JOIN agents ta ON ta.session_id=m.to_session
+         WHERE $where
+         ORDER BY m.id DESC
+         LIMIT $limit"
+
+    if [[ "$as_json" -eq 1 ]]; then
+        sql_json "$q;"
+        printf '\n'
+        return 0
+    fi
+
+    local out
+    out=$(sql_sep '|' "$q;")
+    if [[ -z "$out" ]]; then
+        printf 'no messages found\n'
+        return 0
+    fi
+
+    local id tid fname tname hops created body delivered_at delivered_via
+    while IFS='|' read -r id tid fname tname hops created body delivered_at delivered_via; do
+        [[ -z "$id" ]] && continue
+        local ago dir
+        ago=$(_fmt_ago "$created")
+        if [[ "$fname" == "$(_display_name "$sid")" ]]; then dir="→" ; else dir="←"; fi
+        printf '#%-5s thread %-18s %s %-12s → %-12s  hop %s  %s\n' \
+            "$id" "$tid" "$dir" "$fname" "$tname" "$hops" "$ago"
+        printf '      %s\n' "$body"
+        if [[ -n "$delivered_at" ]]; then
+            printf '      `- read via %s %s\n' "$delivered_via" "$(_fmt_ago "$delivered_at")"
+        fi
+    done <<EOF
+$out
+EOF
+}
+
+# ── info ─────────────────────────────────────────────────────────────
+
+cmd_info() {
+    local ref="${1:-}" as_json=0
+    if [[ "$ref" == "--json" ]]; then
+        as_json=1; shift; ref="${1:-}"
+    fi
+    [[ -n "$ref" ]] || _die "info: usage: info [--json] <ref>"
+
+    local sid rc
+    set +e; sid=$(_resolve_ref "$ref"); rc=$?; set -e
+    [[ "$rc" -eq 2 ]] && exit 2
+    [[ -n "$sid" ]] || _die "info: no agent matches '$ref'"
+
+    local q="SELECT a.session_id, a.alias, a.harness, a.project_name,
+                a.tmux_pane, a.tmux_target, a.turn_state, a.model,
+                a.push_capable, a.block_streak, a.registered_at, a.last_seen,
+                (SELECT COUNT(*) FROM messages m WHERE m.to_session=a.session_id AND m.delivered_at IS NULL) AS pending
+         FROM agents a WHERE a.session_id='$(sql_esc "$sid")'"
+
+    if [[ "$as_json" -eq 1 ]]; then
+        sql_json "$q;"
+        printf '\n'
+        return 0
+    fi
+
+    local row
+    row=$(sql_sep '|' "$q;")
+    [[ -n "$row" ]] || _die "info: no data for $sid"
+
+    local session_id alias harness project pane target state model push streak reg last pending
+    IFS='|' read -r session_id alias harness project pane target state model push streak reg last pending <<EOF
+$row
+EOF
+
+    printf 'session:    %s\n' "$session_id"
+    printf 'alias:      %s\n' "${alias:-(none)}"
+    printf 'harness:    %s\n' "$harness"
+    printf 'project:    %s\n' "${project:--}"
+    printf 'pane:       %s\n' "${target:-${pane:--}}"
+    printf 'state:      %s\n' "${state:-idle}"
+    printf 'model:      %s\n' "${model:--}"
+    printf 'push:       %s\n' "$([[ "$push" == "1" ]] && printf 'yes' || printf 'no')"
+    printf 'pending:    %s\n' "${pending:-0}"
+    printf 'block streak: %s / %s\n' "${streak:-0}" "${MAX_BLOCKS:-3}"
+    printf 'registered: %s\n' "$(_fmt_time "$reg" "%Y-%m-%d %H:%M:%S")"
+    printf 'last seen:  %s\n' "$(_fmt_time "$last" "%Y-%m-%d %H:%M:%S")"
+    printf 'host:       (local)\n'
+}
+
+# ── thread ───────────────────────────────────────────────────────────
+
+cmd_thread() {
+    local tid="" as_json=0 limit=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json) as_json=1 ;;
+            --limit) limit="${2:-}"; shift ;;
+            *)
+                if [[ -z "$tid" && "$1" != -* ]]; then tid="$1"
+                else _die "thread: unknown flag '$1'"; fi ;;
+        esac
+        shift
+    done
+    [[ -n "$tid" ]] || _die "thread: usage: thread <id> [--json] [--limit <n>]"
+
+    local q="SELECT m.id,
+                COALESCE(a.alias, substr(m.from_session,1,8)) AS from_name,
+                COALESCE(r.alias, substr(m.to_session,1,8)) AS to_name,
+                m.hops, m.created_at, m.body,
+                m.delivered_at, m.delivered_via, m.reply_to_id
+         FROM messages m
+         LEFT JOIN agents a ON a.session_id=m.from_session
+         LEFT JOIN agents r ON r.session_id=m.to_session
+         WHERE m.thread_id='$(sql_esc "$tid")'
+         ORDER BY m.id ASC"
+    [[ -n "$limit" ]] && q="$q LIMIT $limit"
+
+    if [[ "$as_json" -eq 1 ]]; then
+        sql_json "$q;"
+        printf '\n'
+        return 0
+    fi
+
+    local out
+    out=$(sql_sep '|' "$q;")
+    if [[ -z "$out" ]]; then
+        printf 'thread %s: no messages found\n' "$tid"
+        return 0
+    fi
+
+    printf 'thread %s\n' "$tid"
+    local id fname tname hops created body delivered_at delivered_via reply_to
+    while IFS='|' read -r id fname tname hops created body delivered_at delivered_via reply_to; do
+        [[ -z "$id" ]] && continue
+        local indent=""
+        local i
+        for ((i=0; i<hops; i++)); do indent="  $indent"; done
+        printf '%s#%-5s %-12s → %-12s  hop %s  %s\n' \
+            "$indent" "$id" "$fname" "$tname" "$hops" "$(_fmt_ago "$created")"
+        printf '%s      %s\n' "$indent" "$body"
+        if [[ -n "$delivered_at" ]]; then
+            printf '%s      `- read by %s %s\n' "$indent" "$tname" "$(_fmt_ago "$delivered_at")"
+        fi
+    done <<EOF
+$out
+EOF
+}
+
+# ── ping ─────────────────────────────────────────────────────────────
+
+cmd_ping() {
+    local ref="${1:-}" as_json=0
+    if [[ "$ref" == "--json" ]]; then
+        as_json=1; shift; ref="${1:-}"
+    fi
+    [[ -n "$ref" ]] || _die "ping: usage: ping [--json] <ref>"
+
+    local sid rc
+    set +e; sid=$(_resolve_ref "$ref"); rc=$?; set -e
+    [[ "$rc" -eq 2 ]] && exit 2
+    [[ -n "$sid" ]] || _die "ping: no agent matches '$ref'"
+
+    local q="SELECT session_id, turn_state, last_seen, model,
+                (SELECT COUNT(*) FROM messages m WHERE m.to_session=a.session_id AND m.delivered_at IS NULL) AS pending
+         FROM agents a WHERE a.session_id='$(sql_esc "$sid")'"
+
+    if [[ "$as_json" -eq 1 ]]; then
+        sql_json "$q;"
+        printf '\n'
+        return 0
+    fi
+
+    local row
+    row=$(sql_sep '|' "$q;")
+    [[ -n "$row" ]] || _die "ping: no data for $sid"
+
+    local s_id state last model pending
+    IFS='|' read -r s_id state last model pending <<EOF
+$row
+EOF
+
+    printf 'agent %s: state=%s last_seen=%s pending=%s model=%s\n' \
+        "$(_display_name "$sid")" "${state:-idle}" "$(_fmt_ago "$last")" "${pending:-0}" "${model:--}"
+}
+
+# ── channel ──────────────────────────────────────────────────────────
+
+cmd_channel() {
+    local sub="${1:-}"
+    shift || true
+    case "$sub" in
+        create)  _channel_create "$@" ;;
+        join)    _channel_join "$@" ;;
+        leave)   _channel_leave "$@" ;;
+        list)    _channel_list "$@" ;;
+        members) _channel_members "$@" ;;
+        rule)    _channel_rule "$@" ;;
+        archive) _channel_archive "$@" ;;
+        *) _die "channel: usage: channel <create|join|leave|list|members|rule|archive> ..." ;;
+    esac
+}
+
+_channel_create() {
+    local name="" private=0 description=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --private) private=1 ;;
+            --description) description="${2:-}"; shift ;;
+            *)
+                if [[ -z "$name" && "$1" != -* ]]; then name="$1"
+                else _die "channel create: unknown flag '$1'"; fi ;;
+        esac
+        shift
+    done
+    [[ -n "$name" ]] || _die "channel create: name is required"
+    case "$name" in
+        *[!A-Za-z0-9_-]*) _die "channel create: name must be alphanumeric, dash or underscore" ;;
+    esac
+
+    local sender cid visibility
+    sender=$(_self_session "")
+    visibility="public"
+    [[ "$private" -eq 1 ]] && visibility="private"
+    cid=$(sql "INSERT INTO channels (name, kind, visibility, topic, created_by)
+               VALUES ('$(sql_esc "$name")', 'channel', '$visibility', '$(sql_esc "$description")', '$(sql_esc "$sender")');
+               SELECT last_insert_rowid();")
+    # Creator auto-joins.
+    sql "INSERT OR IGNORE INTO channel_members (channel_id, session_id)
+         VALUES ($cid, '$(sql_esc "$sender")');"
+    printf 'created channel #%s (id %s)\n' "$name" "$cid"
+}
+
+_channel_join() {
+    local name="" as=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --as) as="${2:-}"; shift ;;
+            *)
+                if [[ -z "$name" && "$1" != -* ]]; then name="$1"
+                else _die "channel join: unknown flag '$1'"; fi ;;
+        esac
+        shift
+    done
+    [[ -n "$name" ]] || _die "channel join: name is required"
+
+    local sid rc
+    if [[ -n "$as" ]]; then
+        set +e; sid=$(_resolve_ref "$as"); rc=$?; set -e
+        [[ "$rc" -eq 2 ]] && exit 2
+        [[ -n "$sid" ]] || _die "channel join: no agent matches '$as'"
+    else
+        sid=$(_self_session "")
+    fi
+
+    local cid visibility
+    cid=$(sql "SELECT id FROM channels WHERE name='$(sql_esc "$name")' AND archived_at IS NULL;")
+    [[ -n "$cid" ]] || _die "channel join: channel '$name' not found"
+    visibility=$(sql "SELECT visibility FROM channels WHERE id=$cid;")
+
+    # Access rules for private channels.
+    if [[ "$visibility" == "private" ]]; then
+        local rules
+        rules=$(sql "SELECT COUNT(*) FROM channel_rules WHERE channel_id=$cid;")
+        if [[ "${rules:-0}" -gt 0 ]]; then
+            local harness model
+            harness=$(sql "SELECT harness FROM agents WHERE session_id='$(sql_esc "$sid")';")
+            model=$(sql "SELECT COALESCE(model,'') FROM agents WHERE session_id='$(sql_esc "$sid")';")
+            local allowed
+            allowed=$(sql "SELECT COUNT(*) FROM channel_rules
+                             WHERE channel_id=$cid AND (
+                                 (subject='harness' AND value='$(sql_esc "$harness")') OR
+                                 (subject='model' AND value<>'''' AND value=substr('$(sql_esc "$model")',1,length(value)))
+                             );")
+            if [[ "${allowed:-0}" -eq 0 ]]; then
+                _die "channel join: $(_display_name "$sid") ($harness/${model:-no model}) matches no access rule on #$name"
+            fi
+        fi
+    fi
+
+    sql "INSERT OR IGNORE INTO channel_members (channel_id, session_id) VALUES ($cid, '$(sql_esc "$sid")');"
+    printf '%s joined #%s\n' "$(_display_name "$sid")" "$name"
+}
+
+_channel_leave() {
+    local name="" as=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --as) as="${2:-}"; shift ;;
+            *)
+                if [[ -z "$name" && "$1" != -* ]]; then name="$1"
+                else _die "channel leave: unknown flag '$1'"; fi ;;
+        esac
+        shift
+    done
+    [[ -n "$name" ]] || _die "channel leave: name is required"
+
+    local sid rc
+    if [[ -n "$as" ]]; then
+        set +e; sid=$(_resolve_ref "$as"); rc=$?; set -e
+        [[ "$rc" -eq 2 ]] && exit 2
+        [[ -n "$sid" ]] || _die "channel leave: no agent matches '$as'"
+    else
+        sid=$(_self_session "")
+    fi
+
+    local cid
+    cid=$(sql "SELECT id FROM channels WHERE name='$(sql_esc "$name")';")
+    [[ -n "$cid" ]] || _die "channel leave: channel '$name' not found"
+    sql "DELETE FROM channel_members WHERE channel_id=$cid AND session_id='$(sql_esc "$sid")';"
+    printf '%s left #%s\n' "$(_display_name "$sid")" "$name"
+}
+
+_channel_list() {
+    local as_json=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json) as_json=1 ;;
+            *) _die "channel list: unknown flag '$1'" ;;
+        esac
+        shift
+    done
+
+    local q="SELECT c.id, c.name, c.visibility,
+                (SELECT COUNT(*) FROM channel_members WHERE channel_id=c.id) AS member_count
+         FROM channels c WHERE c.archived_at IS NULL ORDER BY c.name"
+
+    if [[ "$as_json" -eq 1 ]]; then
+        sql_json "$q;"
+        printf '\n'
+        return 0
+    fi
+
+    printf '%-20s %-8s %s\n' NAME VISIBILITY MEMBERS
+    local id name visibility count
+    while IFS='|' read -r id name visibility count; do
+        [[ -z "$id" ]] && continue
+        printf '%-20s %-8s %s\n' "#$name" "$visibility" "$count"
+    done <<EOF
+$(sql_sep '|' "$q;")
+EOF
+}
+
+_channel_members() {
+    local name="${1:-}"
+    [[ -n "$name" ]] || _die "channel members: name is required"
+
+    local cid
+    cid=$(sql "SELECT id FROM channels WHERE name='$(sql_esc "$name")';")
+    [[ -n "$cid" ]] || _die "channel members: channel '$name' not found"
+
+    local members
+    members=$(sql "SELECT cm.session_id FROM channel_members cm WHERE cm.channel_id=$cid ORDER BY cm.joined_at;")
+    if [[ -z "$members" ]]; then
+        printf '#%s has no members\n' "$name"
+        return 0
+    fi
+    printf 'members of #%s:\n' "$name"
+    local m
+    while IFS= read -r m; do
+        [[ -z "$m" ]] && continue
+        printf '  %s\n' "$(_display_name "$m")"
+    done <<EOF
+$members
+EOF
+}
+
+_channel_rule() {
+    local channel="${1:-}"
+    shift || true
+    [[ -n "$channel" ]] || _die "channel rule: usage: channel rule <name> [--harness <h>|--model <m>] [--remove] [list]"
+    case "${1:-}" in
+        list) _channel_rule_list "$channel" ;;
+        *)
+            # Detect add/remove from flags.
+            local remove=0
+            for arg in "$@"; do
+                [[ "$arg" == "--remove" ]] && remove=1
+            done
+            if [[ "$remove" -eq 1 ]]; then
+                _channel_rule_remove "$channel" "$@"
+            else
+                _channel_rule_add "$channel" "$@"
+            fi ;;
+    esac
+}
+
+_channel_rule_add() {
+    local channel="${1:-}"
+    shift
+    local harness="" model=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --harness) harness="${2:-}"; shift ;;
+            --model)   model="${2:-}"; shift ;;
+            --remove)  ;;  # ignore, handled by caller
+            *) _die "channel rule add: unknown flag '$1'" ;;
+        esac
+        shift
+    done
+    [[ -n "$channel" ]] || _die "channel rule add: channel name is required"
+    [[ -n "$harness$model" ]] || _die "channel rule add: --harness or --model is required"
+
+    local cid
+    cid=$(sql "SELECT id FROM channels WHERE name='$(sql_esc "$channel")';")
+    [[ -n "$cid" ]] || _die "channel rule add: channel '$channel' not found"
+
+    local subject value
+    if [[ -n "$harness" ]]; then
+        subject="harness"; value="$harness"
+    else
+        subject="model"; value="$model"
+    fi
+    sql "INSERT OR IGNORE INTO channel_rules (channel_id, subject, value)
+         VALUES ($cid, '$(sql_esc "$subject")', '$(sql_esc "$value")');"
+    printf 'added rule: #%s allows %s %s\n' "$channel" "$subject" "$value"
+}
+
+_channel_rule_remove() {
+    local channel="${1:-}"
+    shift
+    local harness="" model=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --harness) harness="${2:-}"; shift ;;
+            --model)   model="${2:-}"; shift ;;
+            --remove)  ;;  # ignore, handled by caller
+            *) _die "channel rule remove: unknown flag '$1'" ;;
+        esac
+        shift
+    done
+    [[ -n "$channel" ]] || _die "channel rule remove: channel name is required"
+    [[ -n "$harness$model" ]] || _die "channel rule remove: --harness or --model is required"
+
+    local cid
+    cid=$(sql "SELECT id FROM channels WHERE name='$(sql_esc "$channel")';")
+    [[ -n "$cid" ]] || _die "channel rule remove: channel '$channel' not found"
+
+    if [[ -n "$harness" ]]; then
+        sql "DELETE FROM channel_rules WHERE channel_id=$cid AND subject='harness' AND value='$(sql_esc "$harness")';"
+    else
+        sql "DELETE FROM channel_rules WHERE channel_id=$cid AND subject='model' AND value='$(sql_esc "$model")';"
+    fi
+    printf 'removed rule from #%s\n' "$channel"
+}
+
+_channel_rule_list() {
+    local channel="${1:-}"
+    [[ -n "$channel" ]] || _die "channel rule list: channel name is required"
+
+    local cid
+    cid=$(sql "SELECT id FROM channels WHERE name='$(sql_esc "$channel")';")
+    [[ -n "$cid" ]] || _die "channel rule list: channel '$channel' not found"
+
+    local rules
+    rules=$(sql "SELECT COALESCE(subject,''), COALESCE(value,'') FROM channel_rules WHERE channel_id=$cid;")
+    if [[ -z "$rules" ]]; then
+        printf '#%s has no access rules (open to all)\n' "$channel"
+        return 0
+    fi
+    printf 'access rules for #%s:\n' "$channel"
+    local s v
+    while IFS='|' read -r s v; do
+        [[ -n "$s" ]] && printf '  %s = %s\n' "$s" "$v"
+    done <<EOF
+$rules
+EOF
+}
+
+_channel_archive() {
+    local name="${1:-}"
+    [[ -n "$name" ]] || _die "channel archive: name is required"
+    sql "UPDATE channels SET archived_at=unixepoch() WHERE name='$(sql_esc "$name")';"
+    printf 'archived channel #%s\n' "$name"
+}
+
+# ── dm ───────────────────────────────────────────────────────────────
+
+cmd_dm() {
+    local with="${1:-}"
+    [[ -n "$with" ]] || _die "dm: usage: dm <ref>"
+
+    local target rc
+    set +e; target=$(_resolve_ref "$with"); rc=$?; set -e
+    [[ "$rc" -eq 2 ]] && exit 2
+    [[ -n "$target" ]] || _die "dm: no agent matches '$with'"
+
+    local sender
+    sender=$(_self_session "")
+    [[ "$sender" == "$target" ]] && _die "dm: refusing to create DM with yourself"
+
+    # DMs are named dm-<shorter_id>-<longer_id> so either direction resolves.
+    local a b
+    if [[ "$sender" < "$target" ]]; then a="$sender"; b="$target"; else a="$target"; b="$sender"; fi
+    local name
+    name=$(printf 'dm-%s-%s' "${a:0:8}" "${b:0:8}")
+
+    local cid
+    cid=$(sql "SELECT id FROM channels WHERE name='$(sql_esc "$name")';")
+    if [[ -z "$cid" ]]; then
+        # Create the DM channel.
+        cid=$(sql "INSERT INTO channels (name, kind, visibility, topic, created_by)
+                    VALUES ('$(sql_esc "$name")', 'dm', 'private', 'DM between $(_display_name "$a") and $(_display_name "$b")', '$(sql_esc "$sender")');
+                    SELECT last_insert_rowid();")
+        # Both participants are members.
+        sql "INSERT OR IGNORE INTO channel_members (channel_id, session_id) VALUES ($cid, '$(sql_esc "$a")');"
+        sql "INSERT OR IGNORE INTO channel_members (channel_id, session_id) VALUES ($cid, '$(sql_esc "$b")');"
+    fi
+    printf 'dm channel: #%s (id %s)\n' "$name" "$cid"
+}
+
+# ── search ───────────────────────────────────────────────────────────
+
+cmd_search() {
+    local query="" channel="" from="" since="" limit="20" as_json=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --channel) channel="${2:-}"; shift ;;
+            --from) from="${2:-}"; shift ;;
+            --since) since="${2:-}"; shift ;;
+            --limit) limit="${2:-20}"; shift ;;
+            --json) as_json=1 ;;
+            *)
+                if [[ -z "$query" && "$1" != -* ]]; then query="$1"
+                else _die "search: unknown flag '$1'"; fi ;;
+        esac
+        shift
+    done
+    [[ -n "$query" ]] || _die "search: query is required"
+
+    local where="m.body LIKE '%$(sql_esc "$query")%'"
+    [[ -n "$channel" ]] && where="$where AND c.name='$(sql_esc "$channel")'"
+    if [[ -n "$from" ]]; then
+        local from_sid frc
+        set +e; from_sid=$(_resolve_ref "$from"); frc=$?; set -e
+        [[ "$frc" -eq 2 ]] && exit 2
+        [[ -n "$from_sid" ]] && where="$where AND m.from_session='$(sql_esc "$from_sid")'"
+    fi
+    [[ -n "$since" ]] && where="$where AND m.created_at >= unixepoch('$(sql_esc "$since")')"
+
+    local q="SELECT m.id, m.thread_id,
+                COALESCE(fa.alias, substr(m.from_session,1,8)),
+                COALESCE(ta.alias, substr(m.to_session,1,8)),
+                COALESCE(c.name, '-'),
+                m.created_at,
+                CASE WHEN length(m.body) > 120 THEN substr(m.body,1,120) || '...' ELSE m.body END
+         FROM messages m
+         LEFT JOIN agents fa ON fa.session_id=m.from_session
+         LEFT JOIN agents ta ON ta.session_id=m.to_session
+         LEFT JOIN channels c ON c.id = (
+             SELECT channel_id FROM channel_members cm
+             WHERE cm.session_id=m.to_session LIMIT 1
+         )
+         WHERE $where
+         ORDER BY m.id DESC
+         LIMIT $limit"
+
+    if [[ "$as_json" -eq 1 ]]; then
+        sql_json "$q;"
+        printf '\n'
+        return 0
+    fi
+
+    local out
+    out=$(sql_sep '|' "$q;")
+    if [[ -z "$out" ]]; then
+        printf 'no messages match "%s"\n' "$query"
+        return 0
+    fi
+
+    printf 'search: %s\n' "$query"
+    local id tid fname tname ch created snippet
+    while IFS='|' read -r id tid fname tname ch created snippet; do
+        [[ -z "$id" ]] && continue
+        printf '#%-5s %-12s → %-12s  %s  %s\n' \
+            "$id" "$fname" "$tname" "$(_fmt_ago "$created")" "$snippet"
+    done <<EOF
+$out
+EOF
+}
+
+# ── completion ───────────────────────────────────────────────────────
+
+cmd_completion() {
+    local shell="${1:-bash}"
+    case "$shell" in
+        bash)
+            cat "$AGENT_MESH_PLUGIN_DIR/completion.bash"
+            ;;
+        zsh)
+            printf 'autoload -Uz bashcompinit && bashcompinit\n'
+            printf 'source <(%s completion bash)\n' "$0"
+            ;;
+        *) _die "completion: unknown shell '$shell' (try bash or zsh)" ;;
+    esac
 }
 
 # ── dispatch ─────────────────────────────────────────────────────────
@@ -1915,6 +2704,14 @@ case "${1:-}" in
     reset-streak)   shift; cmd_reset_streak "$@" ;;
     recv)           shift; cmd_recv "$@" ;;
     watch)          shift; cmd_watch "$@" ;;
+    mark-read)      shift; cmd_mark_read "$@" ;;
+    history)        shift; cmd_history "$@" ;;
+    info)           shift; cmd_info "$@" ;;
+    thread)         shift; cmd_thread "$@" ;;
+    ping)           shift; cmd_ping "$@" ;;
+    channel)        shift; cmd_channel "$@" ;;
+    dm)             shift; cmd_dm "$@" ;;
+    search)         shift; cmd_search "$@" ;;
     dispatch)       shift; cmd_dispatch "$@" ;;
     claim-dispatch) shift; cmd_claim_dispatch "$@" ;;
     menu)           shift; cmd_menu "$@" ;;
@@ -1933,6 +2730,7 @@ case "${1:-}" in
         ;;
     doctor)         shift; cmd_doctor "$@" ;;
     selftest)       shift; cmd_selftest "$@" ;;
+    completion)     shift; cmd_completion "$@" ;;
     ""|-h|--help)
         cat <<'USAGE'
 tmux-agent-mesh - agent-to-agent messaging for tmux
@@ -1950,9 +2748,25 @@ Messaging
   broadcast --message <t> [--project <p>] [--harness <h>]
   reply --to-message <id> --message <t>
   inbox [--as <ref>] [--json] [--follow]
-  recv --thread <id> [--wait] [--timeout <s>]
+  mark-read [--as <ref>] [--message-id <id>]
+  history [--as <ref>] [--thread <id>] [--from <ref>] [--since <iso>] [--limit <n>] [--json]
+  thread <id> [--json] [--limit <n>]
+  recv --thread <id> [--wait] [--timeout <s>] [--json]
   watch                            live view of all traffic
   drain --session <id> --via <mode> [--json]
+  ping <ref> [--json]              read registry directly, no message sent
+  info <ref> [--json]              single-agent detail view
+  channel create <name> [--private] [--description <text>]
+  channel join <name> [--as <ref>]
+  channel leave <name> [--as <ref>]
+  channel list [--json]
+  channel members <name>
+  channel rule <name> --harness <h>|--model <m>  (add)
+  channel rule <name> --harness <h>|--model <m> --remove
+  channel rule <name> list
+  channel archive <name>
+  dm <ref>                          find or create a DM channel
+  search <query> [--channel <name>] [--from <ref>] [--since <iso>] [--limit <n>] [--json]
 
 Spawning
   dispatch --task <t> [--harness <h>] [--alias <a>] [--worktree <branch>]
@@ -1968,6 +2782,7 @@ Harness / diagnostics
   reset-streak [--session <id>]    clear the continuation budget
   doctor                           check dependencies and wiring
   selftest                         end-to-end round trip, no harness needed
+  completion [bash|zsh]            print shell completion script
 USAGE
         ;;
     *) _die "unknown command '$1' (try --help)" ;;
