@@ -120,7 +120,6 @@ var (
 // Feed — message area on the terminal-default background with a thick left
 // separator border that turns cyan when the feed has focus.
 var FeedStyle = lipgloss.NewStyle().
-	BorderLeft(true).
 	BorderStyle(lipgloss.ThickBorder()).
 	BorderForeground(border).
 	Padding(0, 1)

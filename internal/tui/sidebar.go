@@ -95,7 +95,10 @@ func (m *SidebarModel) View() string {
 	// Channels header with separator
 	b.WriteString(SidebarTitleStyle.Render("CHANNELS"))
 	b.WriteString("\n")
-	sep := strings.Repeat("─", max(0, m.width-sidebarChrome))
+	// contentW is the usable width inside borders+padding: the Width()
+	// set on SidebarStyle minus the lipgloss chrome (2 borders + 2 padding).
+	contentW := max(0, m.width-sidebarChrome-2)
+	sep := strings.Repeat("─", contentW)
 	b.WriteString(SidebarSeparatorStyle.Render(sep))
 	b.WriteString("\n")
 
