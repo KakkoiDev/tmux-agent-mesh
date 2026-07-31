@@ -51,7 +51,8 @@ func NewFeed() FeedModel {
 func (m *FeedModel) SetSize(width, height int) {
 	m.width = width
 	m.height = height
-	m.viewport.Width = width - 2
+	// FeedStyle chrome: 1 left border + 2 horizontal padding.
+	m.viewport.Width = max(0, width-3)
 	m.viewport.Height = height
 }
 
@@ -109,7 +110,11 @@ func (m *FeedModel) View() string {
 		header := MessageHeaderStyle.Render(m.channelName)
 		b.WriteString(header)
 		b.WriteString("\n")
-		b.WriteString(strings.Repeat("━", m.width-2))
+		rule := strings.Repeat("━", max(0, m.width-3))
+		if m.focused {
+			rule = MessageCursorStyle.Render(rule) // bright cyan rule when focused
+		}
+		b.WriteString(rule)
 		b.WriteString("\n")
 	}
 
@@ -127,10 +132,12 @@ func (m *FeedModel) View() string {
 	content := b.String()
 	m.viewport.SetContent(content)
 
-	style := FeedStyle.Width(m.width).Height(m.height)
+	style := FeedStyle.Height(m.height)
 	if m.focused {
 		style = style.BorderForeground(accent)
 	}
+	// No .Width(): the viewport pads rows to the content width, so the block
+	// sizes naturally to border(1)+padding(2)+content (=m.width).
 	return style.Render(m.viewport.View())
 }
 

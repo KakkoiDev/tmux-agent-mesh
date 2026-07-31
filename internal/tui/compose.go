@@ -49,7 +49,9 @@ func NewCompose() ComposeModel {
 
 func (m *ComposeModel) SetSize(width int) {
 	m.width = width
-	m.input.Width = width - 4
+	// Input sits inside the compose bar's content column (width - 1 border -
+	// 2 padding) after the prompt glyph + space.
+	m.input.Width = max(0, width-5)
 }
 
 func (m *ComposeModel) SetMode(mode ComposeMode) {
@@ -120,9 +122,13 @@ func (m *ComposeModel) View() string {
 		prompt = "#"
 	}
 
+	// Width(m.width): the top border adds no horizontal extent, so the
+	// composed bar totals exactly m.width columns.
 	style := ComposeStyle.Width(m.width)
 	if m.focused {
-		style = style.BorderForeground(accent)
+		style = style.
+			BorderForeground(accent).
+			Background(panelBg)
 	}
 
 	rendered := fmt.Sprintf("%s %s", ComposePromptStyle.Render(prompt), m.input.View())
@@ -163,8 +169,8 @@ Actions
   q / Ctrl+C     Quit
 
 Status
-  ⬤ working  ◐ idle+pending  ○ idle  ✖ dead
-  ✓ sent  ✓✓ read  ⏳ pending
+  ● working  ◐ idle+pending  ○ idle  ✕ dead
+  ✓ sent  ✓✓ read  ◔ pending
   * unread  [L] private channel`
 
 	box := HelpStyle.Width(width - 4).Height(height - 4)

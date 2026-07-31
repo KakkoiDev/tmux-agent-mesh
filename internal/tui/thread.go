@@ -76,7 +76,7 @@ func (m *ThreadModel) View() string {
 	title := "Thread #" + fmt.Sprintf("%d", m.root.ThreadID)
 	b.WriteString(MessageHeaderStyle.Render(title))
 	b.WriteString("\n")
-	b.WriteString(strings.Repeat("─", m.width-8))
+	b.WriteString(strings.Repeat("━", max(0, m.width-8)))
 	b.WriteString("\n\n")
 
 	// Root message pinned

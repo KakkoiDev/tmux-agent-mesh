@@ -365,7 +365,7 @@ agent opens or switches to the DM with that agent.
 | `◐` yellow | Idle, mail pending |
 | `○` grey | Idle, nothing pending |
 | `✕` red | Dead (pane gone, not yet reaped) |
-| `⏳` | Dispatched, not yet claimed |
+| `◔` | Dispatched, not yet claimed |
 
 **Messages:**
 
@@ -373,7 +373,7 @@ agent opens or switches to the DM with that agent.
 |---|---|
 | `✓` | Sent (delivered_at set) |
 | `✓✓` | Read by recipient |
-| `⏳` | Pending (delivered_at null) |
+| `◔` | Pending (delivered_at null) |
 
 ### 3.6 Mouse support
 

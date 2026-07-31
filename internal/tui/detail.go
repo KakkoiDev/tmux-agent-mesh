@@ -57,7 +57,7 @@ func (m *DetailModel) View() string {
 
 	b.WriteString(MessageHeaderStyle.Render("Details"))
 	b.WriteString("\n")
-	b.WriteString(strings.Repeat("━", m.width-2))
+	b.WriteString(strings.Repeat("━", max(0, m.width-3)))
 	b.WriteString("\n\n")
 
 	// Message info
@@ -97,7 +97,10 @@ func (m *DetailModel) View() string {
 	}
 
 	rendered := b.String()
-	return DetailStyle.Width(m.width).Height(m.height).Render(rendered)
+	// Width accounts for lipgloss adding the left border on top of .Width()
+	// (total = Width + 1). The rule and rows are built to m.width-3, which
+	// matches Width(m.width-1) + border(1).
+	return DetailStyle.Width(max(0, m.width-1)).Height(m.height).Render(rendered)
 }
 
 func DimText(s string) string {

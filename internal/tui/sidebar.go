@@ -30,6 +30,10 @@ type ChannelView struct {
 }
 
 // SidebarModel is the channel list + agent roster panel.
+// sidebarChrome is the column budget consumed by SidebarStyle borders (2)
+// plus horizontal padding (2); the viewport and row renderers subtract it.
+const sidebarChrome = 4
+
 type SidebarModel struct {
 	channels   []ChannelView
 	agents     []AgentView
@@ -42,7 +46,7 @@ type SidebarModel struct {
 }
 
 func NewSidebar() SidebarModel {
-	vp := viewport.New(20, 40)
+	vp := viewport.New(18, 40)
 	return SidebarModel{
 		viewport:   vp,
 		showAgents: true,
@@ -52,7 +56,7 @@ func NewSidebar() SidebarModel {
 func (m *SidebarModel) SetSize(width, height int) {
 	m.width = width
 	m.height = height
-	m.viewport.Width = width
+	m.viewport.Width = max(0, width-sidebarChrome)
 	m.viewport.Height = height
 }
 
@@ -122,12 +126,20 @@ func (m *SidebarModel) View() string {
 	content := b.String()
 	m.viewport.SetContent(content)
 
-	style := SidebarStyle.Width(m.width).Height(m.height)
+	style := SidebarStyle.Height(m.height)
+	if m.focused {
+		style = style.
+			BorderForeground(accent).
+			Background(focusBg)
+	}
+	// No .Width(): the viewport pads rows to the content width, so the block
+	// sizes naturally to border(2)+padding(2)+content (=m.width). lipgloss
+	// adds borders on top of .Width(), which would overflow by 2.
 	return style.Render(m.viewport.View())
 }
 
 func (m *SidebarModel) renderChannel(ch ChannelView, selected bool) string {
-	prefix := "  "
+	prefix := " "
 	if selected {
 		prefix = "> "
 	}
@@ -154,8 +166,8 @@ func (m *SidebarModel) renderChannel(ch ChannelView, selected bool) string {
 		suffixStr = " " + strings.Join(suffix, " ")
 	}
 
-	// Content width: sidebar width minus left/right padding.
-	contentW := 20 - 2
+	// Content width: sidebar width minus borders and horizontal padding.
+	contentW := m.width - sidebarChrome
 	avail := contentW - len(prefix) - lipgloss.Width(suffixStr)
 	if avail < 1 {
 		name = ""
@@ -173,8 +185,8 @@ func (m *SidebarModel) renderChannel(ch ChannelView, selected bool) string {
 
 func (m *SidebarModel) renderAgent(a AgentView) string {
 	dot := AgentDot(a)
-	name := Truncate(a.Name, 16)
-	line := fmt.Sprintf("  %s %s", dot, name)
+	name := Truncate(a.Name, max(1, m.width-sidebarChrome-3))
+	line := fmt.Sprintf(" %s %s", dot, name)
 	return AgentItemStyle.Render(line)
 }
 

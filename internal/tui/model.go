@@ -200,8 +200,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	key := msg.String()
 
-	// Global quit
-	if key == "ctrl+c" || key == "q" {
+	// Global quit. ctrl+c always quits; 'q' quits everywhere except while
+	// composing, where it is a letter to be typed.
+	if key == "ctrl+c" || (key == "q" && m.focusedPanel != PanelCompose) {
 		if m.showPicker {
 			m.picker.Deactivate()
 			m.showPicker = false
@@ -257,7 +258,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	// Global toggles
-	if key == "?" {
+	if key == "?" && m.focusedPanel != PanelCompose {
 		m.showHelp = !m.showHelp
 		return m, nil
 	}
@@ -288,14 +289,14 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleThreadKey(msg)
 	}
 
-	// Toggle sidebar agents
-	if key == "s" {
+	// Toggle sidebar agents — not while composing (letters type).
+	if key == "s" && m.focusedPanel != PanelCompose {
 		m.sidebar.showAgents = !m.sidebar.showAgents
 		return m, nil
 	}
 
 	// Toggle detail
-	if key == "i" {
+	if key == "i" && m.focusedPanel != PanelCompose {
 		if m.detail.visible {
 			m.detail.Hide()
 		} else if sel := m.feed.SelectedMessage(); sel != nil {
@@ -308,8 +309,29 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// Normal mode keys
+	// Normal mode keys. When the compose panel has focus, character input
+	// goes to the compose input (global actions are handled above);
+	// otherwise navigation/action keys are handled in normal mode.
+	if m.focusedPanel == PanelCompose {
+		return m.handleComposeKey(msg)
+	}
 	return m.handleNormalKey(msg)
+}
+
+// handleComposeKey routes keys to the compose text input. Global keys
+// (quit, esc, tab, ?, s, i, ctrl+n, ctrl+k) are handled before this runs.
+func (m *Model) handleComposeKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "enter":
+		return m.handleEnter()
+	case "ctrl+n", "ctrl+k":
+		// Global shortcuts stay available while typing.
+		return m.handleNormalKey(msg)
+	default:
+		var cmd tea.Cmd
+		m.compose, cmd = m.compose.Update(msg)
+		return m, cmd
+	}
 }
 
 func (m *Model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -639,7 +661,7 @@ func (m *Model) handleThreadReplies(msg threadRepliesMsg) {
 }
 
 func (m *Model) resize() {
-	sidebarW := 20
+	sidebarW := 22
 	detailW := 0
 	if m.detail.visible {
 		detailW = 30
@@ -654,7 +676,8 @@ func (m *Model) resize() {
 
 	m.sidebar.SetSize(sidebarW, feedH)
 	m.feed.SetSize(feedW, feedH)
-	m.compose.SetSize(feedW)
+	// The compose bar spans the full terminal width (sidebar + feed + detail).
+	m.compose.SetSize(m.width)
 	m.detail.SetSize(detailW, feedH)
 	m.thread.SetSize(m.width, m.height)
 	m.search.SetSize(m.width, m.height)
@@ -849,7 +872,7 @@ func (m *Model) View() string {
 		feedH = 0
 	}
 
-	sidebarW := 20
+	sidebarW := 22
 	detailW := 0
 	if m.detail.visible {
 		detailW = 30
@@ -864,10 +887,12 @@ func (m *Model) View() string {
 	compose := m.compose.View()
 	detail := m.detail.View()
 
-	// Arrange panels
+	// Arrange panels: sidebar + feed side by side, then the detail panel
+	// joined to the feed's right (a plain concatenation would append detail
+	// below the grid and get truncated by heightLimit).
 	topContent := joinHorizontal(sidebarW, sidebar, feedW, feed)
 	if detailW > 0 && detail != "" {
-		topContent += detail
+		topContent = joinHorizontal(sidebarW+feedW, topContent, detailW, detail)
 	}
 	topContent = heightLimit(feedH, topContent)
 

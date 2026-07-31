@@ -21,6 +21,7 @@ var (
 	red      = lipgloss.Color("#FF5252") // red — dead/error
 	border   = lipgloss.Color("#6E7681") // visible panel borders
 	panelBg  = lipgloss.Color("#161B22") // panel tint (sidebar, overlays)
+	focusBg  = lipgloss.Color("#232B3A") // brighter panel tint when focused
 	statusBg = lipgloss.Color("#23272E") // status bar background
 	placeBg  = lipgloss.Color("#9CA3AF") // input placeholders
 )
@@ -29,30 +30,35 @@ var (
 var BaseStyle = lipgloss.NewStyle().
 	Foreground(white)
 
-// Sidebar — subtle dark tint so it reads as a distinct panel. The separator
-// border to the feed is owned by the feed's left border (see FeedStyle).
+// Sidebar — subtle dark tint so it reads as a distinct panel. Thick vertical
+// borders frame it; both turn bright cyan (and the background brightens)
+// when the sidebar has focus.
 var SidebarStyle = lipgloss.NewStyle().
-	Width(20).
+	Width(22).
 	Background(panelBg).
+	BorderLeft(true).
+	BorderRight(true).
+	BorderStyle(lipgloss.ThickBorder()).
+	BorderForeground(border).
 	Padding(0, 1)
 
 // SidebarTitleStyle — bold cyan section headers.
 var SidebarTitleStyle = lipgloss.NewStyle().
 	Bold(true).
-	Foreground(accent).
-	MarginBottom(1)
+	Foreground(accent)
 
 // ChannelItemStyle — bright white channel rows.
 var ChannelItemStyle = lipgloss.NewStyle().
 	Foreground(white).
 	Padding(0, 0)
 
-// ChannelSelectedStyle — high-contrast yellow pill for the selected channel.
+// ChannelSelectedStyle — full-width yellow pill for the selected channel.
+// No side padding: the pill must fit the 18-column content area exactly
+// (SidebarStyle chrome: 2 borders + 2 padding).
 var ChannelSelectedStyle = lipgloss.NewStyle().
 	Bold(true).
 	Background(yellow).
-	Foreground(onYellow).
-	Padding(0, 1)
+	Foreground(onYellow)
 
 // ChannelUnreadStyle — bold yellow unread counts.
 var ChannelUnreadStyle = lipgloss.NewStyle().
@@ -72,31 +78,33 @@ var AgentItemStyle = lipgloss.NewStyle().
 	Foreground(white).
 	Padding(0, 0)
 
-// Status dots — large, bright, bold glyphs.
+// Status dots — single-width text-size glyphs from one consistent family
+// (U+25xx geometric shapes, U+2715 ✕). Variable-width glyphs (emoji like
+// ⏳, "large" variants like ⬤) would overflow the sidebar.
 var (
 	AgentWorkingDot = lipgloss.NewStyle().
 			Bold(true).
 			Foreground(green).
-			SetString("⬤") // U+2B24 BLACK LARGE CIRCLE — bigger than ●
+			SetString("●") // U+25CF BLACK CIRCLE
 
 	AgentIdlePendingDot = lipgloss.NewStyle().
 				Bold(true).
 				Foreground(amber).
-				SetString("◐")
+				SetString("◐") // U+25D0 CIRCLE WITH LEFT HALF BLACK
 
 	AgentIdleDot = lipgloss.NewStyle().
 			Foreground(placeBg).
-			SetString("○")
+			SetString("○") // U+25CB WHITE CIRCLE
 
 	AgentDeadDot = lipgloss.NewStyle().
 			Bold(true).
 			Foreground(red).
-			SetString("✖") // U+2716 HEAVY MULTIPLICATION X — bigger than ✕
+			SetString("✕") // U+2715 MULTIPLICATION X
 
 	AgentDispatchedDot = lipgloss.NewStyle().
 				Bold(true).
 				Foreground(amber).
-				SetString("⏳")
+				SetString("◔") // U+25D4 CIRCLE WITH UPPER RIGHT QUADRANT BLACK
 )
 
 // Feed — message area on the terminal-default background with a thick left
@@ -119,7 +127,7 @@ var MessageTimestampStyle = lipgloss.NewStyle().
 // MessageBodyStyle — bright white message bodies.
 var MessageBodyStyle = lipgloss.NewStyle().
 	Foreground(white).
-	PaddingLeft(2)
+	PaddingLeft(1)
 
 // MessageOwnStyle — bold yellow header for your own messages.
 var MessageOwnStyle = lipgloss.NewStyle().
@@ -150,7 +158,7 @@ var (
 	ReceiptPendingStyle = lipgloss.NewStyle().
 				Bold(true).
 				Foreground(amber).
-				SetString("⏳")
+				SetString("◔") // U+25D4 — same family/size as ● ○ ◐
 )
 
 // Compose bar — clearly separated from the feed by a thick top border that

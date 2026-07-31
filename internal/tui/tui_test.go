@@ -263,7 +263,7 @@ func TestModelSidebarToggle(t *testing.T) {
 
 func TestSidebarRendersChannels(t *testing.T) {
 	sm := NewSidebar()
-	sm.SetSize(20, 20)
+	sm.SetSize(22, 20)
 	sm.focused = true
 
 	sm.SetChannels([]ChannelView{
@@ -297,7 +297,7 @@ func TestSidebarRendersChannels(t *testing.T) {
 
 func TestSidebarRendersAgents(t *testing.T) {
 	sm := NewSidebar()
-	sm.SetSize(20, 20)
+	sm.SetSize(22, 20)
 	sm.showAgents = true
 
 	sm.SetAgents([]AgentView{
@@ -509,7 +509,7 @@ func TestFeedReceiptIcons(t *testing.T) {
 	if !strings.Contains(view, "✓✓") {
 		t.Error("feed should show read icon")
 	}
-	if !strings.Contains(view, "⏳") {
+	if !strings.Contains(view, "◔") {
 		t.Error("feed should show pending icon")
 	}
 }
@@ -560,6 +560,46 @@ func TestComposeDoesNotSendEmpty(t *testing.T) {
 	}
 	if cmd != nil {
 		t.Error("empty compose should not trigger send")
+	}
+}
+
+func TestComposeAcceptsTypingWhenFocused(t *testing.T) {
+	s := openTestStore(t)
+	m := newTestModel(s)
+	m.focusedPanel = PanelCompose
+	m.updateFocus()
+
+	// Letters that double as global bindings must type, not trigger.
+	for _, r := range []rune("qi?/s") {
+		newModel, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		m = newModel.(*Model)
+	}
+
+	if got := m.compose.Value(); got != "qi?/s" {
+		t.Errorf("typing should reach compose input, got %q", got)
+	}
+	if m.quitting {
+		t.Error("typing 'q' while composing should not quit")
+	}
+	if m.showHelp {
+		t.Error("typing '?' while composing should not open help")
+	}
+	if !m.sidebar.showAgents {
+		t.Error("typing 's' while composing should not toggle agents")
+	}
+}
+
+func TestComposeTypingDoesNotLeakWhenUnfocused(t *testing.T) {
+	s := openTestStore(t)
+	m := newTestModel(s)
+	m.focusedPanel = PanelFeed
+	m.updateFocus()
+
+	newModel, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'h'}})
+	m2 := newModel.(*Model)
+
+	if m2.compose.Value() != "" {
+		t.Error("typing while feed focused should not reach compose input")
 	}
 }
 
@@ -831,11 +871,11 @@ func TestAgentDots(t *testing.T) {
 		agent AgentView
 		want  string
 	}{
-		{AgentView{TurnState: "working", Pending: 0}, "⬤"},
+		{AgentView{TurnState: "working", Pending: 0}, "●"},
 		{AgentView{TurnState: "idle", Pending: 0}, "○"},
 		{AgentView{TurnState: "idle", Pending: 3}, "◐"},
 		{AgentView{TurnState: "working", Pending: 1}, "◐"},
-		{AgentView{Dead: true}, "✖"},
+		{AgentView{Dead: true}, "✕"},
 	}
 
 	for _, tt := range tests {
@@ -858,8 +898,8 @@ func TestReceiptIcons(t *testing.T) {
 	}
 
 	pending := ReceiptIcon(false, false, true)
-	if pending != "⏳" {
-		t.Errorf("pending receipt icon should be ⏳, got %q", pending)
+	if pending != "◔" {
+		t.Errorf("pending receipt icon should be ◔, got %q", pending)
 	}
 
 	none := ReceiptIcon(false, false, false)
