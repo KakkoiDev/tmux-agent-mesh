@@ -180,12 +180,6 @@ CREATE TABLE IF NOT EXISTS agents (
     project_name  TEXT,
     push_capable  INTEGER NOT NULL DEFAULT 0,
     block_streak  INTEGER NOT NULL DEFAULT 0,
-    -- Turn state, from the hooks this plugin already installs: a prompt starts
-    -- a turn, a turn-end finishes one. Authoritative, unlike scraping the pane
-    -- for words like "tokens", and it decides whether an idle agent may be woken.
-    -- Nullable and unconstrained on purpose: _SCHEMA_SQL is a single-quoted
-    -- shell string and cannot contain the quotes a DEFAULT or CHECK would need.
-    -- Absent means idle, which is what a row written before this column meant.
     turn_state    TEXT,
     model         TEXT,
     registered_at INTEGER NOT NULL DEFAULT (unixepoch()),
@@ -227,6 +221,45 @@ CREATE TABLE IF NOT EXISTS dispatches (
     claimed_by       TEXT,
     claimed_at       INTEGER
 );
+
+-- Channel tables: match the Go store schema so bash and Go coexist.
+CREATE TABLE IF NOT EXISTS channels (
+    id          INTEGER PRIMARY KEY,
+    name        TEXT NOT NULL UNIQUE,
+    kind        TEXT NOT NULL DEFAULT '"'"'channel'"'"'
+        CHECK (kind IN ('"'"'channel'"'"', '"'"'dm'"'"')),
+    visibility  TEXT NOT NULL DEFAULT '"'"'public'"'"'
+        CHECK (visibility IN ('"'"'public'"'"', '"'"'private'"'"')),
+    topic       TEXT NOT NULL DEFAULT '"'"''"'"',
+    created_by  TEXT NOT NULL DEFAULT '"'"''"'"',
+    created_at  INTEGER NOT NULL DEFAULT (unixepoch()),
+    archived_at INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS channel_members (
+    channel_id INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+    session_id TEXT NOT NULL,
+    role       TEXT NOT NULL DEFAULT '"'"'member'"'"'
+        CHECK (role IN ('"'"'member'"'"', '"'"'owner'"'"')),
+    joined_at  INTEGER NOT NULL DEFAULT (unixepoch()),
+    PRIMARY KEY (channel_id, session_id)
+);
+
+CREATE TABLE IF NOT EXISTS channel_rules (
+    channel_id INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+    subject    TEXT NOT NULL CHECK (subject IN ('"'"'harness'"'"', '"'"'model'"'"')),
+    value      TEXT NOT NULL,
+    PRIMARY KEY (channel_id, subject, value)
+);
+
+CREATE TABLE IF NOT EXISTS reads (
+    id            INTEGER PRIMARY KEY,
+    message_id    INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    reader        TEXT NOT NULL,
+    read_at       INTEGER NOT NULL DEFAULT (unixepoch()),
+    source        TEXT NOT NULL CHECK (source IN ('"'"'drain'"'"', '"'"'client'"'"'))
+);
+CREATE INDEX IF NOT EXISTS idx_reads_message ON reads(message_id, read_at);
 '
 
 # ── init ─────────────────────────────────────────────────────────────
@@ -264,7 +297,26 @@ SQL
     sql "INSERT OR IGNORE INTO agents (session_id, harness, alias, push_capable)
          VALUES ('$HUMAN_ID', 'human', '$HUMAN_ID', 0);"
 
+    # Seed the general channel.
+    _seed_general_channel
     echo "Initialized: $DB"
+}
+
+_seed_general_channel() {
+    sql "INSERT OR IGNORE INTO channels (name, kind, visibility, topic, created_by)
+         VALUES ('general', 'channel', 'public', 'Default channel', '$HUMAN_ID');"
+    local agents cid
+    agents=$(sql "SELECT session_id FROM agents;")
+    cid=$(sql "SELECT id FROM channels WHERE name='general';")
+    [[ -n "$cid" ]] || return 0
+    local sid
+    while IFS= read -r sid; do
+        [[ -z "$sid" ]] && continue
+        sql "INSERT OR IGNORE INTO channel_members (channel_id, session_id)
+             VALUES ($cid, '$(sql_esc "$sid")');"
+    done <<EOF
+$agents
+EOF
 }
 
 # CREATE TABLE IF NOT EXISTS cannot add a column to a table that already exists,
@@ -274,6 +326,37 @@ SQL
 _MIGRATIONS_SQL='
 ALTER TABLE agents ADD COLUMN turn_state TEXT;
 ALTER TABLE agents ADD COLUMN model TEXT;
+
+CREATE TABLE IF NOT EXISTS channels (
+    id          INTEGER PRIMARY KEY,
+    name        TEXT NOT NULL UNIQUE,
+    kind        TEXT NOT NULL DEFAULT '"'"'channel'"'"',
+    visibility  TEXT NOT NULL DEFAULT '"'"'public'"'"',
+    topic       TEXT NOT NULL DEFAULT '"'"''"'"',
+    created_by  TEXT NOT NULL DEFAULT '"'"''"'"',
+    created_at  INTEGER NOT NULL DEFAULT (unixepoch()),
+    archived_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS channel_members (
+    channel_id INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+    session_id TEXT NOT NULL,
+    role       TEXT NOT NULL DEFAULT '"'"'member'"'"',
+    joined_at  INTEGER NOT NULL DEFAULT (unixepoch()),
+    PRIMARY KEY (channel_id, session_id)
+);
+CREATE TABLE IF NOT EXISTS channel_rules (
+    channel_id INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+    subject    TEXT NOT NULL CHECK (subject IN ('"'"'harness'"'"', '"'"'model'"'"')),
+    value      TEXT NOT NULL,
+    PRIMARY KEY (channel_id, subject, value)
+);
+CREATE TABLE IF NOT EXISTS reads (
+    id            INTEGER PRIMARY KEY,
+    message_id    INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    reader        TEXT NOT NULL,
+    read_at       INTEGER NOT NULL DEFAULT (unixepoch()),
+    source        TEXT NOT NULL CHECK (source IN ('"'"'drain'"'"', '"'"'client'"'"'))
+);
 '
 
 _apply_migrations() {
@@ -1519,6 +1602,331 @@ EOF
         "$(_display_name "$sid")" "${state:-idle}" "$(_fmt_ago "$last")" "${pending:-0}" "${model:--}"
 }
 
+# ── channel ──────────────────────────────────────────────────────────
+
+cmd_channel() {
+    local sub="${1:-}"
+    shift || true
+    case "$sub" in
+        create)  _channel_create "$@" ;;
+        join)    _channel_join "$@" ;;
+        leave)   _channel_leave "$@" ;;
+        list)    _channel_list "$@" ;;
+        members) _channel_members "$@" ;;
+        rule)    _channel_rule "$@" ;;
+        archive) _channel_archive "$@" ;;
+        *) _die "channel: usage: channel <create|join|leave|list|members|rule|archive> ..." ;;
+    esac
+}
+
+_channel_create() {
+    local name="" private=0 description=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --private) private=1 ;;
+            --description) description="${2:-}"; shift ;;
+            *)
+                if [[ -z "$name" && "$1" != -* ]]; then name="$1"
+                else _die "channel create: unknown flag '$1'"; fi ;;
+        esac
+        shift
+    done
+    [[ -n "$name" ]] || _die "channel create: name is required"
+    case "$name" in
+        *[!A-Za-z0-9_-]*) _die "channel create: name must be alphanumeric, dash or underscore" ;;
+    esac
+
+    local sender cid visibility
+    sender=$(_self_session "")
+    visibility="public"
+    [[ "$private" -eq 1 ]] && visibility="private"
+    cid=$(sql "INSERT INTO channels (name, kind, visibility, topic, created_by)
+               VALUES ('$(sql_esc "$name")', 'channel', '$visibility', '$(sql_esc "$description")', '$(sql_esc "$sender")');
+               SELECT last_insert_rowid();")
+    # Creator auto-joins.
+    sql "INSERT OR IGNORE INTO channel_members (channel_id, session_id)
+         VALUES ($cid, '$(sql_esc "$sender")');"
+    printf 'created channel #%s (id %s)\n' "$name" "$cid"
+}
+
+_channel_join() {
+    local name="" as=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --as) as="${2:-}"; shift ;;
+            *)
+                if [[ -z "$name" && "$1" != -* ]]; then name="$1"
+                else _die "channel join: unknown flag '$1'"; fi ;;
+        esac
+        shift
+    done
+    [[ -n "$name" ]] || _die "channel join: name is required"
+
+    local sid rc
+    if [[ -n "$as" ]]; then
+        set +e; sid=$(_resolve_ref "$as"); rc=$?; set -e
+        [[ "$rc" -eq 2 ]] && exit 2
+        [[ -n "$sid" ]] || _die "channel join: no agent matches '$as'"
+    else
+        sid=$(_self_session "")
+    fi
+
+    local cid visibility
+    cid=$(sql "SELECT id FROM channels WHERE name='$(sql_esc "$name")' AND archived_at IS NULL;")
+    [[ -n "$cid" ]] || _die "channel join: channel '$name' not found"
+    visibility=$(sql "SELECT visibility FROM channels WHERE id=$cid;")
+
+    # Access rules for private channels.
+    if [[ "$visibility" == "private" ]]; then
+        local rules
+        rules=$(sql "SELECT COUNT(*) FROM channel_rules WHERE channel_id=$cid;")
+        if [[ "${rules:-0}" -gt 0 ]]; then
+            local harness model
+            harness=$(sql "SELECT harness FROM agents WHERE session_id='$(sql_esc "$sid")';")
+            model=$(sql "SELECT COALESCE(model,'') FROM agents WHERE session_id='$(sql_esc "$sid")';")
+            local allowed
+            allowed=$(sql "SELECT COUNT(*) FROM channel_rules
+                             WHERE channel_id=$cid AND (
+                                 (subject='harness' AND value='$(sql_esc "$harness")') OR
+                                 (subject='model' AND value<>'''' AND value=substr('$(sql_esc "$model")',1,length(value)))
+                             );")
+            if [[ "${allowed:-0}" -eq 0 ]]; then
+                _die "channel join: $(_display_name "$sid") ($harness/${model:-no model}) matches no access rule on #$name"
+            fi
+        fi
+    fi
+
+    sql "INSERT OR IGNORE INTO channel_members (channel_id, session_id) VALUES ($cid, '$(sql_esc "$sid")');"
+    printf '%s joined #%s\n' "$(_display_name "$sid")" "$name"
+}
+
+_channel_leave() {
+    local name="" as=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --as) as="${2:-}"; shift ;;
+            *)
+                if [[ -z "$name" && "$1" != -* ]]; then name="$1"
+                else _die "channel leave: unknown flag '$1'"; fi ;;
+        esac
+        shift
+    done
+    [[ -n "$name" ]] || _die "channel leave: name is required"
+
+    local sid rc
+    if [[ -n "$as" ]]; then
+        set +e; sid=$(_resolve_ref "$as"); rc=$?; set -e
+        [[ "$rc" -eq 2 ]] && exit 2
+        [[ -n "$sid" ]] || _die "channel leave: no agent matches '$as'"
+    else
+        sid=$(_self_session "")
+    fi
+
+    local cid
+    cid=$(sql "SELECT id FROM channels WHERE name='$(sql_esc "$name")';")
+    [[ -n "$cid" ]] || _die "channel leave: channel '$name' not found"
+    sql "DELETE FROM channel_members WHERE channel_id=$cid AND session_id='$(sql_esc "$sid")';"
+    printf '%s left #%s\n' "$(_display_name "$sid")" "$name"
+}
+
+_channel_list() {
+    local as_json=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json) as_json=1 ;;
+            *) _die "channel list: unknown flag '$1'" ;;
+        esac
+        shift
+    done
+
+    local q="SELECT c.id, c.name, c.visibility,
+                (SELECT COUNT(*) FROM channel_members WHERE channel_id=c.id) AS member_count
+         FROM channels c WHERE c.archived_at IS NULL ORDER BY c.name"
+
+    if [[ "$as_json" -eq 1 ]]; then
+        sql_json "$q;"
+        printf '\n'
+        return 0
+    fi
+
+    printf '%-20s %-8s %s\n' NAME VISIBILITY MEMBERS
+    local id name visibility count
+    while IFS='|' read -r id name visibility count; do
+        [[ -z "$id" ]] && continue
+        printf '%-20s %-8s %s\n' "#$name" "$visibility" "$count"
+    done <<EOF
+$(sql_sep '|' "$q;")
+EOF
+}
+
+_channel_members() {
+    local name="${1:-}"
+    [[ -n "$name" ]] || _die "channel members: name is required"
+
+    local cid
+    cid=$(sql "SELECT id FROM channels WHERE name='$(sql_esc "$name")';")
+    [[ -n "$cid" ]] || _die "channel members: channel '$name' not found"
+
+    local members
+    members=$(sql "SELECT cm.session_id FROM channel_members cm WHERE cm.channel_id=$cid ORDER BY cm.joined_at;")
+    if [[ -z "$members" ]]; then
+        printf '#%s has no members\n' "$name"
+        return 0
+    fi
+    printf 'members of #%s:\n' "$name"
+    local m
+    while IFS= read -r m; do
+        [[ -z "$m" ]] && continue
+        printf '  %s\n' "$(_display_name "$m")"
+    done <<EOF
+$members
+EOF
+}
+
+_channel_rule() {
+    local channel="${1:-}"
+    shift || true
+    [[ -n "$channel" ]] || _die "channel rule: usage: channel rule <name> [--harness <h>|--model <m>] [--remove] [list]"
+    case "${1:-}" in
+        list) _channel_rule_list "$channel" ;;
+        *)
+            # Detect add/remove from flags.
+            local remove=0
+            for arg in "$@"; do
+                [[ "$arg" == "--remove" ]] && remove=1
+            done
+            if [[ "$remove" -eq 1 ]]; then
+                _channel_rule_remove "$channel" "$@"
+            else
+                _channel_rule_add "$channel" "$@"
+            fi ;;
+    esac
+}
+
+_channel_rule_add() {
+    local channel="${1:-}"
+    shift
+    local harness="" model=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --harness) harness="${2:-}"; shift ;;
+            --model)   model="${2:-}"; shift ;;
+            --remove)  ;;  # ignore, handled by caller
+            *) _die "channel rule add: unknown flag '$1'" ;;
+        esac
+        shift
+    done
+    [[ -n "$channel" ]] || _die "channel rule add: channel name is required"
+    [[ -n "$harness$model" ]] || _die "channel rule add: --harness or --model is required"
+
+    local cid
+    cid=$(sql "SELECT id FROM channels WHERE name='$(sql_esc "$channel")';")
+    [[ -n "$cid" ]] || _die "channel rule add: channel '$channel' not found"
+
+    local subject value
+    if [[ -n "$harness" ]]; then
+        subject="harness"; value="$harness"
+    else
+        subject="model"; value="$model"
+    fi
+    sql "INSERT OR IGNORE INTO channel_rules (channel_id, subject, value)
+         VALUES ($cid, '$(sql_esc "$subject")', '$(sql_esc "$value")');"
+    printf 'added rule: #%s allows %s %s\n' "$channel" "$subject" "$value"
+}
+
+_channel_rule_remove() {
+    local channel="${1:-}"
+    shift
+    local harness="" model=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --harness) harness="${2:-}"; shift ;;
+            --model)   model="${2:-}"; shift ;;
+            --remove)  ;;  # ignore, handled by caller
+            *) _die "channel rule remove: unknown flag '$1'" ;;
+        esac
+        shift
+    done
+    [[ -n "$channel" ]] || _die "channel rule remove: channel name is required"
+    [[ -n "$harness$model" ]] || _die "channel rule remove: --harness or --model is required"
+
+    local cid
+    cid=$(sql "SELECT id FROM channels WHERE name='$(sql_esc "$channel")';")
+    [[ -n "$cid" ]] || _die "channel rule remove: channel '$channel' not found"
+
+    if [[ -n "$harness" ]]; then
+        sql "DELETE FROM channel_rules WHERE channel_id=$cid AND subject='harness' AND value='$(sql_esc "$harness")';"
+    else
+        sql "DELETE FROM channel_rules WHERE channel_id=$cid AND subject='model' AND value='$(sql_esc "$model")';"
+    fi
+    printf 'removed rule from #%s\n' "$channel"
+}
+
+_channel_rule_list() {
+    local channel="${1:-}"
+    [[ -n "$channel" ]] || _die "channel rule list: channel name is required"
+
+    local cid
+    cid=$(sql "SELECT id FROM channels WHERE name='$(sql_esc "$channel")';")
+    [[ -n "$cid" ]] || _die "channel rule list: channel '$channel' not found"
+
+    local rules
+    rules=$(sql "SELECT COALESCE(subject,''), COALESCE(value,'') FROM channel_rules WHERE channel_id=$cid;")
+    if [[ -z "$rules" ]]; then
+        printf '#%s has no access rules (open to all)\n' "$channel"
+        return 0
+    fi
+    printf 'access rules for #%s:\n' "$channel"
+    local s v
+    while IFS='|' read -r s v; do
+        [[ -n "$s" ]] && printf '  %s = %s\n' "$s" "$v"
+    done <<EOF
+$rules
+EOF
+}
+
+_channel_archive() {
+    local name="${1:-}"
+    [[ -n "$name" ]] || _die "channel archive: name is required"
+    sql "UPDATE channels SET archived_at=unixepoch() WHERE name='$(sql_esc "$name")';"
+    printf 'archived channel #%s\n' "$name"
+}
+
+# ── dm ───────────────────────────────────────────────────────────────
+
+cmd_dm() {
+    local with="${1:-}"
+    [[ -n "$with" ]] || _die "dm: usage: dm <ref>"
+
+    local target rc
+    set +e; target=$(_resolve_ref "$with"); rc=$?; set -e
+    [[ "$rc" -eq 2 ]] && exit 2
+    [[ -n "$target" ]] || _die "dm: no agent matches '$with'"
+
+    local sender
+    sender=$(_self_session "")
+    [[ "$sender" == "$target" ]] && _die "dm: refusing to create DM with yourself"
+
+    # DMs are named dm-<shorter_id>-<longer_id> so either direction resolves.
+    local a b
+    if [[ "$sender" < "$target" ]]; then a="$sender"; b="$target"; else a="$target"; b="$sender"; fi
+    local name
+    name=$(printf 'dm-%s-%s' "${a:0:8}" "${b:0:8}")
+
+    local cid
+    cid=$(sql "SELECT id FROM channels WHERE name='$(sql_esc "$name")';")
+    if [[ -z "$cid" ]]; then
+        # Create the DM channel.
+        cid=$(sql "INSERT INTO channels (name, kind, visibility, topic, created_by)
+                    VALUES ('$(sql_esc "$name")', 'dm', 'private', 'DM between $(_display_name "$a") and $(_display_name "$b")', '$(sql_esc "$sender")');
+                    SELECT last_insert_rowid();")
+        # Both participants are members.
+        sql "INSERT OR IGNORE INTO channel_members (channel_id, session_id) VALUES ($cid, '$(sql_esc "$a")');"
+        sql "INSERT OR IGNORE INTO channel_members (channel_id, session_id) VALUES ($cid, '$(sql_esc "$b")');"
+    fi
+    printf 'dm channel: #%s (id %s)\n' "$name" "$cid"
+}
+
 # ── dispatch ─────────────────────────────────────────────────────────
 
 _harness_command() {
@@ -2215,6 +2623,8 @@ case "${1:-}" in
     info)           shift; cmd_info "$@" ;;
     thread)         shift; cmd_thread "$@" ;;
     ping)           shift; cmd_ping "$@" ;;
+    channel)        shift; cmd_channel "$@" ;;
+    dm)             shift; cmd_dm "$@" ;;
     dispatch)       shift; cmd_dispatch "$@" ;;
     claim-dispatch) shift; cmd_claim_dispatch "$@" ;;
     menu)           shift; cmd_menu "$@" ;;
@@ -2258,6 +2668,16 @@ Messaging
   drain --session <id> --via <mode> [--json]
   ping <ref> [--json]              read registry directly, no message sent
   info <ref> [--json]              single-agent detail view
+  channel create <name> [--private] [--description <text>]
+  channel join <name> [--as <ref>]
+  channel leave <name> [--as <ref>]
+  channel list [--json]
+  channel members <name>
+  channel rule <name> --harness <h>|--model <m>  (add)
+  channel rule <name> --harness <h>|--model <m> --remove
+  channel rule <name> list
+  channel archive <name>
+  dm <ref>                          find or create a DM channel
 
 Spawning
   dispatch --task <t> [--harness <h>] [--alias <a>] [--worktree <branch>]
