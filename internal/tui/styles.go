@@ -34,12 +34,12 @@ var BaseStyle = lipgloss.NewStyle().
 // borders frame it in bright cyan so the panel is always visible; the
 // background brightens further when the sidebar has focus.
 var SidebarStyle = lipgloss.NewStyle().
-	Width(22).
-	Background(panelBg).
+	Width(18).
 	BorderLeft(true).
 	BorderRight(true).
 	BorderStyle(lipgloss.ThickBorder()).
 	BorderForeground(accent).
+	Background(panelBg).
 	Padding(0, 1)
 
 // SidebarTitleStyle — bold cyan section headers.
