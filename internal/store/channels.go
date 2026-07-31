@@ -283,6 +283,52 @@ func (s *Store) Channels() ([]Channel, error) {
 	return out, nil
 }
 
+// ArchiveChannel soft-deletes a channel by setting archived_at.
+func (s *Store) ArchiveChannel(channelID int64) error {
+	res, err := s.db.Exec(
+		`UPDATE channels SET archived_at = unixepoch() WHERE id = ? AND archived_at IS NULL`,
+		channelID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("%w: channel %d", ErrNotFound, channelID)
+	}
+	return nil
+}
+
+// RenameChannel updates the name of a channel.
+func (s *Store) RenameChannel(channelID int64, newName string) error {
+	if !aliasRe.MatchString(newName) {
+		return errors.New("channel name must be alphanumeric, dash or underscore")
+	}
+	res, err := s.db.Exec(
+		`UPDATE channels SET name = ? WHERE id = ? AND archived_at IS NULL`, newName, channelID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("%w: channel %d", ErrNotFound, channelID)
+	}
+	return nil
+}
+
+// SetChannelVisibility changes a channel's visibility.
+func (s *Store) SetChannelVisibility(channelID int64, visibility string) error {
+	if visibility != "public" && visibility != "private" {
+		return fmt.Errorf("unknown visibility %q", visibility)
+	}
+	res, err := s.db.Exec(
+		`UPDATE channels SET visibility = ? WHERE id = ? AND archived_at IS NULL`, visibility, channelID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("%w: channel %d", ErrNotFound, channelID)
+	}
+	return nil
+}
+
 func shortID(id string) string {
 	if len(id) > 8 {
 		return id[:8]

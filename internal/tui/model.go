@@ -20,6 +20,19 @@ const (
 	PanelCompose
 )
 
+// PromptAction tracks what to do when a prompt is confirmed.
+type PromptAction int
+
+const (
+	ActionNone PromptAction = iota
+	ActionCreateChannel
+	ActionRenameChannel
+	ActionDeleteChannel
+	ActionToggleVisibility
+	ActionInviteMember
+	ActionRenameAgent
+)
+
 // Model is the top-level Bubble Tea model for the mesh TUI.
 type Model struct {
 	store *store.Store
@@ -32,6 +45,7 @@ type Model struct {
 	thread  ThreadModel
 	search  SearchModel
 	picker  PickerModel
+	prompt  PromptModel
 
 	// Data
 	channels    []store.Channel
@@ -45,11 +59,15 @@ type Model struct {
 	focusedPanel int
 
 	// View state
-	showHelp     bool
-	showThread   bool
-	showSearch   bool
-	showPicker   bool
-	waitingForGG bool // second 'g' for gg binding
+	showHelp          bool
+	showThread        bool
+	showSearch        bool
+	showPicker        bool
+	showPrompt        bool
+	promptAction      PromptAction
+	promptCtxID       int64  // channel ID or agent index
+	promptChannelName string // temp storage for channel name during creation
+	waitingForGG      bool   // second 'g' for gg binding
 
 	// Dimensions
 	width  int
@@ -71,6 +89,7 @@ func New(s *store.Store) Model {
 		thread:       NewThread(),
 		search:       NewSearch(),
 		picker:       NewPicker(),
+		prompt:       NewPrompt(),
 		channelIdx:   make(map[int64]store.Channel),
 		allMessages:  make(map[int64][]store.Message),
 		focusedPanel: PanelFeed,
@@ -130,6 +149,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
+		// Reset gg on any non-g key
+		if msg.String() != "g" {
+			m.waitingForGG = false
+		}
 		return m.handleKey(msg)
 
 	case channelsMsg:
@@ -203,6 +226,13 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// Global quit. ctrl+c always quits; 'q' quits everywhere except while
 	// composing, where it is a letter to be typed.
 	if key == "ctrl+c" || (key == "q" && m.focusedPanel != PanelCompose) {
+		if m.showPrompt {
+			m.prompt.Deactivate()
+			m.showPrompt = false
+			m.promptAction = ActionNone
+			m.promptChannelName = ""
+			return m, nil
+		}
 		if m.showPicker {
 			m.picker.Deactivate()
 			m.showPicker = false
@@ -228,6 +258,12 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	// Global escape
 	if key == "esc" {
+		if m.showPrompt {
+			m.prompt.Deactivate()
+			m.showPrompt = false
+			m.promptAction = ActionNone
+			return m, nil
+		}
 		if m.showHelp {
 			m.showHelp = false
 			return m, nil
@@ -279,6 +315,9 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.showHelp {
 		return m, nil
 	}
+	if m.showPrompt {
+		return m.handlePromptKey(msg)
+	}
 	if m.showPicker {
 		return m.handlePickerKey(msg)
 	}
@@ -295,8 +334,8 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// Toggle detail
-	if key == "i" && m.focusedPanel != PanelCompose {
+	// Toggle detail (not while composing or in sidebar)
+	if key == "i" && m.focusedPanel != PanelCompose && m.focusedPanel != PanelSidebar {
 		if m.detail.visible {
 			m.detail.Hide()
 		} else if sel := m.feed.SelectedMessage(); sel != nil {
@@ -350,7 +389,11 @@ func (m *Model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "g":
 		if m.waitingForGG {
 			m.waitingForGG = false
-			m.feed.ScrollToTop()
+			if m.focusedPanel == PanelFeed {
+				m.feed.ScrollToTop()
+			} else if m.focusedPanel == PanelSidebar {
+				m.sidebar.ScrollToTop()
+			}
 			return m, nil
 		}
 		m.waitingForGG = true
@@ -358,10 +401,38 @@ func (m *Model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "G":
 		m.waitingForGG = false
-		m.feed.ScrollToBottom()
+		if m.focusedPanel == PanelFeed {
+			m.feed.ScrollToBottom()
+		} else if m.focusedPanel == PanelSidebar {
+			m.sidebar.ScrollToBottom()
+		}
+		return m, nil
+
+	case "ctrl+d":
+		m.waitingForGG = false
+		if m.focusedPanel == PanelFeed {
+			m.feed.PageDown()
+		}
+		return m, nil
+
+	case "ctrl+u":
+		m.waitingForGG = false
+		if m.focusedPanel == PanelFeed {
+			m.feed.PageUp()
+		}
 		return m, nil
 
 	case "r":
+		if m.focusedPanel == PanelSidebar {
+			// Rename channel
+			if ch := m.sidebar.CursorChannel(); ch != nil {
+				m.promptAction = ActionRenameChannel
+				m.promptCtxID = ch.ID
+				m.prompt.ActivateText("Rename channel #"+ch.Name, "New name...")
+				m.showPrompt = true
+			}
+			return m, nil
+		}
 		if m.focusedPanel == PanelFeed {
 			if sel := m.feed.SelectedMessage(); sel != nil {
 				m.compose.SetMode(ComposeReply)
@@ -370,6 +441,23 @@ func (m *Model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.focusedPanel = PanelCompose
 				m.updateFocus()
 			}
+		}
+		return m, nil
+
+	case "t":
+		if m.focusedPanel == PanelFeed {
+			if sel := m.feed.SelectedMessage(); sel != nil {
+				return m, m.openThread(sel.ThreadID)
+			}
+		}
+		return m, nil
+
+	case "h":
+		// Close thread view
+		if m.showThread {
+			m.thread.Close()
+			m.showThread = false
+			return m, nil
 		}
 		return m, nil
 
@@ -387,11 +475,80 @@ func (m *Model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case "d":
+		if m.focusedPanel == PanelSidebar {
+			// Delete channel
+			if ch := m.sidebar.CursorChannel(); ch != nil {
+				m.promptAction = ActionDeleteChannel
+				m.promptCtxID = ch.ID
+				m.prompt.ActivateConfirm("Delete channel #" + ch.Name + "?")
+				m.showPrompt = true
+			}
+			return m, nil
+		}
 		if m.focusedPanel == PanelFeed {
 			if sel := m.feed.SelectedMessage(); sel != nil && sel.IsOwn {
 				// Soft-delete would go here when store supports it.
 				_ = sel
 			}
+		}
+		return m, nil
+
+	case "c":
+		if m.focusedPanel == PanelSidebar {
+			m.promptAction = ActionCreateChannel
+			m.prompt.ActivateText("Create channel", "Channel name...")
+			m.showPrompt = true
+		}
+		return m, nil
+
+	case "R":
+		if m.focusedPanel == PanelSidebar {
+			// Rename agent: show agent picker
+			m.promptAction = ActionRenameAgent
+			m.showPicker = true
+			var items []PickerItem
+			for _, a := range m.agents {
+				if a.SessionID != ViewerSession {
+					items = append(items, PickerItem{
+						Name:   a.Name(),
+						Detail: a.Harness,
+					})
+				}
+			}
+			m.picker.Activate(PickerAgent, items)
+		}
+		return m, nil
+
+	case "p":
+		if m.focusedPanel == PanelSidebar {
+			if ch := m.sidebar.CursorChannel(); ch != nil {
+				m.promptAction = ActionToggleVisibility
+				m.promptCtxID = ch.ID
+				newVis := "public"
+				if ch.Visibility == "public" {
+					newVis = "private"
+				}
+				m.prompt.ActivateConfirm("Make #" + ch.Name + " " + newVis + "?")
+				m.showPrompt = true
+			}
+		}
+		return m, nil
+
+	case "i":
+		if m.focusedPanel == PanelSidebar {
+			// Invite opens the agent picker
+			m.promptAction = ActionInviteMember
+			m.showPicker = true
+			var items []PickerItem
+			for _, a := range m.agents {
+				if a.SessionID != ViewerSession {
+					items = append(items, PickerItem{
+						Name:   a.Name(),
+						Detail: a.Harness,
+					})
+				}
+			}
+			m.picker.Activate(PickerAgent, items)
 		}
 		return m, nil
 
@@ -469,6 +626,13 @@ func (m *Model) handleEnter() (tea.Model, tea.Cmd) {
 		}
 	}
 
+	if m.focusedPanel == PanelFeed {
+		if sel := m.feed.SelectedMessage(); sel != nil {
+			return m, m.openThread(sel.ThreadID)
+		}
+		return m, nil
+	}
+
 	if m.focusedPanel == PanelSidebar {
 		if ch := m.sidebar.CursorChannel(); ch != nil {
 			m.currentChID = ch.ID
@@ -533,6 +697,48 @@ func (m *Model) handlePickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 		switch m.picker.mode {
 		case PickerAgent:
+			if m.promptAction == ActionRenameAgent {
+				// Find agent by name and prompt for rename
+				for _, a := range m.agents {
+					if a.Name() == sel.Name && a.SessionID != ViewerSession {
+						m.promptCtxID = 0
+						// Store session ID in a way we can retrieve — use agents index
+						for idx, ag := range m.agents {
+							if ag.SessionID == a.SessionID {
+								m.promptCtxID = int64(idx)
+								break
+							}
+						}
+						m.prompt.ActivateText("Rename agent "+a.Name(), "New name...")
+						m.showPrompt = true
+						return m, nil
+					}
+				}
+				m.promptAction = ActionNone
+				return m, nil
+			}
+			if m.promptAction == ActionInviteMember {
+				// Invite to current channel
+				if ch := m.sidebar.CursorChannel(); ch != nil {
+					for _, a := range m.agents {
+						if a.Name() == sel.Name && a.SessionID != ViewerSession {
+							err := m.store.Join(ch.ID, a.SessionID)
+							if err == nil {
+								// Reload channels
+								return m, tea.Batch(
+									func() tea.Msg {
+										channels, _ := m.store.Channels()
+										return channelsMsg{channels}
+									},
+								)
+							}
+						}
+					}
+				}
+				m.promptAction = ActionNone
+				return m, nil
+			}
+			// Default: DM
 			for _, a := range m.agents {
 				if a.Name() == sel.Name && a.SessionID != ViewerSession {
 					ch, err := m.store.DMChannel(ViewerSession, a.SessionID)
@@ -623,7 +829,7 @@ func (m *Model) handleThreadKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	key := msg.String()
 
 	switch key {
-	case "esc", "ctrl+t":
+	case "esc", "h":
 		m.thread.Close()
 		m.showThread = false
 		return m, nil
@@ -635,10 +841,70 @@ func (m *Model) handleThreadKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "down", "j":
 		m.thread.MoveDown()
 		return m, nil
+
+	case "r":
+		// Reply in thread
+		if m.thread.root != nil {
+			m.compose.SetMode(ComposeReply)
+			m.compose.replyToID = m.thread.root.ID
+			m.compose.Focus()
+			m.focusedPanel = PanelCompose
+			m.updateFocus()
+			// Keep thread visible so user sees context while composing
+		}
+		return m, nil
+
+	case "enter":
+		// If compose is focused and thread is showing, Enter sends the reply
+		if m.focusedPanel == PanelCompose {
+			body := strings.TrimSpace(m.compose.Value())
+			if body == "" {
+				return m, nil
+			}
+			m.compose.Reset()
+			return m, m.sendMessage(body)
+		}
+		return m, nil
 	}
 
 	var cmd tea.Cmd
 	m.thread, cmd = m.thread.Update(msg)
+	return m, cmd
+}
+
+func (m *Model) handlePromptKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	key := msg.String()
+
+	switch key {
+	case "esc", "ctrl+c":
+		m.prompt.Deactivate()
+		m.showPrompt = false
+		m.promptAction = ActionNone
+		m.promptChannelName = ""
+		return m, nil
+
+	case "enter":
+		m.prompt.Deactivate()
+		m.showPrompt = false
+		action := m.promptAction
+		m.promptAction = ActionNone
+		return m, m.executePromptAction(action, m.prompt.input.Value(), m.prompt.confirmVal)
+
+	case "y":
+		if m.prompt.mode == PromptConfirm {
+			m.prompt.confirmVal = true
+		}
+		return m, nil
+
+	case "n":
+		if m.prompt.mode == PromptConfirm {
+			m.prompt.confirmVal = false
+		}
+		return m, nil
+	}
+
+	var cmd tea.Cmd
+	m.prompt, cmd = m.prompt.Update(msg)
 	return m, cmd
 }
 
@@ -658,6 +924,128 @@ func (m *Model) handleThreadReplies(msg threadRepliesMsg) {
 	}
 	m.thread.Open(root, views)
 	m.showThread = true
+}
+
+// executePromptAction runs the action after a prompt is confirmed.
+func (m *Model) executePromptAction(action PromptAction, text string, confirmed bool) tea.Cmd {
+	switch action {
+	case ActionCreateChannel:
+		if m.promptChannelName == "" {
+			// First step: got channel name, now ask about visibility
+			if text == "" {
+				return nil
+			}
+			m.promptChannelName = text
+			m.promptAction = ActionCreateChannel
+			m.prompt.ActivateConfirm("Make #" + text + " private?")
+			m.showPrompt = true
+			return nil
+		}
+		// Second step: confirmed visibility choice
+		name := m.promptChannelName
+		m.promptChannelName = ""
+		visibility := "public"
+		if confirmed {
+			visibility = "private"
+		}
+		return m.createChannel(name, visibility)
+
+	case ActionRenameChannel:
+		if text == "" {
+			return nil
+		}
+		return m.renameChannel(m.promptCtxID, text)
+
+	case ActionDeleteChannel:
+		if !confirmed {
+			return nil
+		}
+		return m.deleteChannel(m.promptCtxID)
+
+	case ActionToggleVisibility:
+		if !confirmed {
+			return nil
+		}
+		return m.toggleVisibility(m.promptCtxID)
+
+	case ActionInviteMember:
+		// handled via picker, not prompt
+		return nil
+
+	case ActionRenameAgent:
+		if text == "" {
+			return nil
+		}
+		agentIdx := int(m.promptCtxID)
+		if agentIdx >= 0 && agentIdx < len(m.agents) {
+			return m.renameAgent(m.agents[agentIdx].SessionID, text)
+		}
+		return nil
+	}
+	return nil
+}
+
+func (m Model) createChannel(name, visibility string) tea.Cmd {
+	return func() tea.Msg {
+		_, err := m.store.CreateChannel(name, "channel", visibility, "", ViewerSession)
+		if err != nil {
+			return errMsg{err}
+		}
+		channels, _ := m.store.Channels()
+		return channelsMsg{channels}
+	}
+}
+
+func (m Model) renameChannel(channelID int64, newName string) tea.Cmd {
+	return func() tea.Msg {
+		err := m.store.RenameChannel(channelID, newName)
+		if err != nil {
+			return errMsg{err}
+		}
+		channels, _ := m.store.Channels()
+		return channelsMsg{channels}
+	}
+}
+
+func (m Model) deleteChannel(channelID int64) tea.Cmd {
+	return func() tea.Msg {
+		err := m.store.ArchiveChannel(channelID)
+		if err != nil {
+			return errMsg{err}
+		}
+		channels, _ := m.store.Channels()
+		return channelsMsg{channels}
+	}
+}
+
+func (m Model) toggleVisibility(channelID int64) tea.Cmd {
+	return func() tea.Msg {
+		ch, ok := m.channelIdx[channelID]
+		if !ok {
+			return errMsg{fmt.Errorf("channel not found")}
+		}
+		newVis := "public"
+		if ch.Visibility == "public" {
+			newVis = "private"
+		}
+		err := m.store.SetChannelVisibility(channelID, newVis)
+		if err != nil {
+			return errMsg{err}
+		}
+		channels, _ := m.store.Channels()
+		return channelsMsg{channels}
+	}
+}
+
+func (m Model) renameAgent(sessionID, newName string) tea.Cmd {
+	return func() tea.Msg {
+		err := m.store.SetAlias(sessionID, newName)
+		if err != nil {
+			return errMsg{err}
+		}
+		agents, _ := m.store.Roster()
+		return agentsMsg{agents}
+	}
 }
 
 func (m *Model) resize() {
@@ -682,6 +1070,7 @@ func (m *Model) resize() {
 	m.thread.SetSize(m.width, m.height)
 	m.search.SetSize(m.width, m.height)
 	m.picker.SetSize(m.width, m.height)
+	m.prompt.SetSize(m.width, m.height)
 }
 
 func (m *Model) updateFocus() {
@@ -689,8 +1078,13 @@ func (m *Model) updateFocus() {
 	m.feed.focused = m.focusedPanel == PanelFeed
 	if m.focusedPanel == PanelCompose {
 		m.compose.Focus()
-	} else {
+		m.compose.SetHint("enter: send  shift+enter: newline  esc: feed  tab: sidebar")
+	} else if m.focusedPanel == PanelSidebar {
 		m.compose.Blur()
+		m.compose.SetHint("j/k: navigate  space: mark read  d: delete channel  c: create  r: rename  R: rename agent  p: toggle private  i: invite  tab: feed")
+	} else if m.focusedPanel == PanelFeed {
+		m.compose.Blur()
+		m.compose.SetHint("j/k: scroll  enter/t: thread  r: reply  i: detail  /: search  tab: sidebar")
 	}
 }
 
@@ -785,11 +1179,25 @@ func (m Model) loadReceipts(messageID int64) tea.Cmd {
 }
 
 func (m Model) sendMessage(body string) tea.Cmd {
+	replyToID := m.compose.replyToID
+	isReply := m.compose.mode == ComposeReply
 	return func() tea.Msg {
 		post := store.Post{
 			ChannelID: m.currentChID,
 			From:      ViewerSession,
 			Body:      body,
+		}
+		// If replying, set thread linkage
+		if isReply && replyToID != 0 {
+			for _, msgs := range m.allMessages {
+				for _, storeMsg := range msgs {
+					if storeMsg.ID == replyToID {
+						post.ThreadID = storeMsg.ThreadID
+						post.ReplyToID = replyToID
+						break
+					}
+				}
+			}
 		}
 		msg, err := m.store.Send(post, store.DefaultCaps())
 		if err != nil {
@@ -855,6 +1263,9 @@ func (m *Model) View() string {
 	}
 
 	// Full-screen overlays
+	if m.showPrompt && m.prompt.active {
+		return m.prompt.View()
+	}
 	if m.showThread && m.thread.active {
 		return m.thread.View()
 	}
