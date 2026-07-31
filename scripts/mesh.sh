@@ -1927,6 +1927,92 @@ cmd_dm() {
     printf 'dm channel: #%s (id %s)\n' "$name" "$cid"
 }
 
+# ── search ───────────────────────────────────────────────────────────
+
+cmd_search() {
+    local query="" channel="" from="" since="" limit="20" as_json=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --channel) channel="${2:-}"; shift ;;
+            --from) from="${2:-}"; shift ;;
+            --since) since="${2:-}"; shift ;;
+            --limit) limit="${2:-20}"; shift ;;
+            --json) as_json=1 ;;
+            *)
+                if [[ -z "$query" && "$1" != -* ]]; then query="$1"
+                else _die "search: unknown flag '$1'"; fi ;;
+        esac
+        shift
+    done
+    [[ -n "$query" ]] || _die "search: query is required"
+
+    local where="m.body LIKE '%$(sql_esc "$query")%'"
+    [[ -n "$channel" ]] && where="$where AND c.name='$(sql_esc "$channel")'"
+    if [[ -n "$from" ]]; then
+        local from_sid frc
+        set +e; from_sid=$(_resolve_ref "$from"); frc=$?; set -e
+        [[ "$frc" -eq 2 ]] && exit 2
+        [[ -n "$from_sid" ]] && where="$where AND m.from_session='$(sql_esc "$from_sid")'"
+    fi
+    [[ -n "$since" ]] && where="$where AND m.created_at >= unixepoch('$(sql_esc "$since")')"
+
+    local q="SELECT m.id, m.thread_id,
+                COALESCE(fa.alias, substr(m.from_session,1,8)),
+                COALESCE(ta.alias, substr(m.to_session,1,8)),
+                COALESCE(c.name, '-'),
+                m.created_at,
+                CASE WHEN length(m.body) > 120 THEN substr(m.body,1,120) || '...' ELSE m.body END
+         FROM messages m
+         LEFT JOIN agents fa ON fa.session_id=m.from_session
+         LEFT JOIN agents ta ON ta.session_id=m.to_session
+         LEFT JOIN channels c ON c.id = (
+             SELECT channel_id FROM channel_members cm
+             WHERE cm.session_id=m.to_session LIMIT 1
+         )
+         WHERE $where
+         ORDER BY m.id DESC
+         LIMIT $limit"
+
+    if [[ "$as_json" -eq 1 ]]; then
+        sql_json "$q;"
+        printf '\n'
+        return 0
+    fi
+
+    local out
+    out=$(sql_sep '|' "$q;")
+    if [[ -z "$out" ]]; then
+        printf 'no messages match "%s"\n' "$query"
+        return 0
+    fi
+
+    printf 'search: %s\n' "$query"
+    local id tid fname tname ch created snippet
+    while IFS='|' read -r id tid fname tname ch created snippet; do
+        [[ -z "$id" ]] && continue
+        printf '#%-5s %-12s → %-12s  %s  %s\n' \
+            "$id" "$fname" "$tname" "$(_fmt_ago "$created")" "$snippet"
+    done <<EOF
+$out
+EOF
+}
+
+# ── completion ───────────────────────────────────────────────────────
+
+cmd_completion() {
+    local shell="${1:-bash}"
+    case "$shell" in
+        bash)
+            cat "$AGENT_MESH_PLUGIN_DIR/completion.bash"
+            ;;
+        zsh)
+            printf 'autoload -Uz bashcompinit && bashcompinit\n'
+            printf 'source <(%s completion bash)\n' "$0"
+            ;;
+        *) _die "completion: unknown shell '$shell' (try bash or zsh)" ;;
+    esac
+}
+
 # ── dispatch ─────────────────────────────────────────────────────────
 
 _harness_command() {
@@ -2625,6 +2711,7 @@ case "${1:-}" in
     ping)           shift; cmd_ping "$@" ;;
     channel)        shift; cmd_channel "$@" ;;
     dm)             shift; cmd_dm "$@" ;;
+    search)         shift; cmd_search "$@" ;;
     dispatch)       shift; cmd_dispatch "$@" ;;
     claim-dispatch) shift; cmd_claim_dispatch "$@" ;;
     menu)           shift; cmd_menu "$@" ;;
@@ -2643,6 +2730,7 @@ case "${1:-}" in
         ;;
     doctor)         shift; cmd_doctor "$@" ;;
     selftest)       shift; cmd_selftest "$@" ;;
+    completion)     shift; cmd_completion "$@" ;;
     ""|-h|--help)
         cat <<'USAGE'
 tmux-agent-mesh - agent-to-agent messaging for tmux
@@ -2678,6 +2766,7 @@ Messaging
   channel rule <name> list
   channel archive <name>
   dm <ref>                          find or create a DM channel
+  search <query> [--channel <name>] [--from <ref>] [--since <iso>] [--limit <n>] [--json]
 
 Spawning
   dispatch --task <t> [--harness <h>] [--alias <a>] [--worktree <branch>]
@@ -2693,6 +2782,7 @@ Harness / diagnostics
   reset-streak [--session <id>]    clear the continuation budget
   doctor                           check dependencies and wiring
   selftest                         end-to-end round trip, no harness needed
+  completion [bash|zsh]            print shell completion script
 USAGE
         ;;
     *) _die "unknown command '$1' (try --help)" ;;
