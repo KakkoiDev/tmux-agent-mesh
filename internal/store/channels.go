@@ -187,6 +187,148 @@ func (s *Store) Leave(channelID int64, sessionID string) error {
 	return err
 }
 
+// MemberInfo is a channel member with display details from the agents table.
+type MemberInfo struct {
+	SessionID string
+	Name      string
+	Role      string
+	TurnState string
+	Harness   string
+}
+
+// ChannelMembers returns the member list for a channel, enriched with agent
+// display names and roles, ordered by role (owners first) then name.
+func (s *Store) ChannelMembers(channelID int64) ([]MemberInfo, error) {
+	rows, err := s.db.Query(`
+		SELECT cm.session_id,
+		       COALESCE(a.alias, substr(cm.session_id, 1, 8)) AS name,
+		       cm.role,
+		       COALESCE(a.turn_state, 'idle'),
+		       COALESCE(a.harness, 'gone')
+		  FROM channel_members cm
+		  LEFT JOIN agents a ON a.session_id = cm.session_id
+		 WHERE cm.channel_id = ?
+		 ORDER BY (cm.role = 'owner') DESC, name`, channelID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []MemberInfo
+	for rows.Next() {
+		var m MemberInfo
+		if err := rows.Scan(&m.SessionID, &m.Name, &m.Role, &m.TurnState, &m.Harness); err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+// SwapChannelOrder swaps the sort_order of two adjacent channels so the user
+// can reorder the sidebar with J/K. direction > 0 moves the channel DOWN (swaps
+// with the next one), direction < 0 moves it UP (swaps with the previous one).
+func (s *Store) SwapChannelOrder(channelID int64, direction int) error {
+	return s.tx(func(tx *sql.Tx) error {
+		// Get current sort_order of the target channel.
+		var curOrder int
+		if err := tx.QueryRow(
+			`SELECT sort_order FROM channels WHERE id = ? AND archived_at IS NULL`,
+			channelID).Scan(&curOrder); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("%w: channel %d", ErrNotFound, channelID)
+			}
+			return err
+		}
+
+		var otherID int64
+		var otherOrder int
+		if direction > 0 {
+			// Find the next channel (higher sort_order, then higher id).
+			err := tx.QueryRow(`
+				SELECT id, sort_order FROM channels
+				 WHERE archived_at IS NULL
+				   AND (sort_order > ? OR (sort_order = ? AND id > ?))
+				 ORDER BY sort_order, id
+				 LIMIT 1`, curOrder, curOrder, channelID).Scan(&otherID, &otherOrder)
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil // at bottom, nothing to swap with
+			}
+			if err != nil {
+				return err
+			}
+		} else {
+			// Find the previous channel (lower sort_order, then lower id).
+			err := tx.QueryRow(`
+				SELECT id, sort_order FROM channels
+				 WHERE archived_at IS NULL
+				   AND (sort_order < ? OR (sort_order = ? AND id < ?))
+				 ORDER BY sort_order DESC, id DESC
+				 LIMIT 1`, curOrder, curOrder, channelID).Scan(&otherID, &otherOrder)
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil // at top, nothing to swap with
+			}
+			if err != nil {
+				return err
+			}
+		}
+
+		// Swap sort_order values.
+		if _, err := tx.Exec(
+			`UPDATE channels SET sort_order = ? WHERE id = ?`, otherOrder, channelID); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(
+			`UPDATE channels SET sort_order = ? WHERE id = ?`, curOrder, otherID); err != nil {
+			return err
+		}
+
+		// When both channels had the same sort_order (common when all are
+		// default 0), the swap above was a no-op because 0 == 0. Compact
+		// sort_orders by position so every channel gets a distinct value.
+		if curOrder == otherOrder {
+			rows, err := tx.Query(
+				`SELECT id FROM channels WHERE archived_at IS NULL ORDER BY sort_order, id`)
+			if err != nil {
+				return err
+			}
+			var ids []int64
+			for rows.Next() {
+				var id int64
+				if err := rows.Scan(&id); err != nil {
+					rows.Close()
+					return err
+				}
+				ids = append(ids, id)
+			}
+			rows.Close()
+
+			// Swap the two channels in the position list.
+			pos1, pos2 := -1, -1
+			for i, id := range ids {
+				if id == channelID {
+					pos1 = i
+				}
+				if id == otherID {
+					pos2 = i
+				}
+			}
+			if pos1 >= 0 && pos2 >= 0 {
+				ids[pos1], ids[pos2] = ids[pos2], ids[pos1]
+			}
+
+			// Reassign sort_orders by position.
+			for i, id := range ids {
+				if _, err := tx.Exec(
+					`UPDATE channels SET sort_order = ? WHERE id = ?`, i, id); err != nil {
+					return err
+				}
+			}
+		}
+
+		return nil
+	})
+}
+
 func (s *Store) IsMember(channelID int64, sessionID string) (bool, error) {
 	var n int
 	err := s.db.QueryRow(
@@ -259,7 +401,7 @@ func (s *Store) DMChannel(a, b string) (Channel, error) {
 func (s *Store) Channels() ([]Channel, error) {
 	rows, err := s.db.Query(`
 		SELECT id, name, kind, visibility, topic, created_by FROM channels
-		 WHERE archived_at IS NULL ORDER BY kind, name`)
+		 WHERE archived_at IS NULL ORDER BY sort_order, id`)
 	if err != nil {
 		return nil, err
 	}

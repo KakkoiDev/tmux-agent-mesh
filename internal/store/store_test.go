@@ -497,3 +497,199 @@ func TestTurnStateRoundTrips(t *testing.T) {
 		t.Fatal("an unknown turn state should be refused")
 	}
 }
+
+// ── channel members ─────────────────────────────────────────────────
+
+func TestChannelMembersReturnsOwnersFirst(t *testing.T) {
+	s := open(t)
+	register(t, s, "owner1", "claude", "", "")
+	register(t, s, "memb2", "codex", "", "")
+	register(t, s, "memb3", "pi", "", "")
+	ch, _ := s.CreateChannel("team", "channel", "public", "", "owner1")
+	s.Join(ch.ID, "memb2")
+	s.Join(ch.ID, "memb3")
+
+	members, err := s.ChannelMembers(ch.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(members) != 3 {
+		t.Fatalf("got %d members, want 3", len(members))
+	}
+	if members[0].SessionID != "owner1" || members[0].Role != "owner" {
+		t.Fatalf("first member should be owner, got %s (%s)", members[0].SessionID, members[0].Role)
+	}
+}
+
+func TestChannelMembersHandlesAgentGone(t *testing.T) {
+	s := open(t)
+	register(t, s, "a", "claude", "", "")
+	ch, _ := s.CreateChannel("team", "channel", "public", "", "a")
+	// Add a member that does not have an agent row (simulates deregistered).
+	s.db.Exec(`INSERT INTO channel_members (channel_id, session_id) VALUES (?, ?)`,
+		ch.ID, "ghost")
+
+	members, err := s.ChannelMembers(ch.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(members) != 2 {
+		t.Fatalf("got %d members, want 2", len(members))
+	}
+	// The ghost agent gets harness='gone' via COALESCE.
+	for _, m := range members {
+		if m.SessionID == "ghost" {
+			if m.Harness != "gone" {
+				t.Fatalf("gone agent should show harness='gone', got %q", m.Harness)
+			}
+		}
+	}
+}
+
+// ── channel reorder ─────────────────────────────────────────────────
+
+func TestSwapChannelOrderDownThenUp(t *testing.T) {
+	s := open(t)
+	register(t, s, "a", "claude", "", "")
+	c1, _ := s.CreateChannel("first", "channel", "public", "", "a")
+	_, _ = s.CreateChannel("second", "channel", "public", "", "a")
+	_, _ = s.CreateChannel("third", "channel", "public", "", "a")
+
+	// Initially all have sort_order 0, ordered by id.
+	chs, _ := s.Channels()
+	if chs[0].Name != "first" || chs[1].Name != "second" || chs[2].Name != "third" {
+		t.Fatalf("initial order: got %v", names(chs))
+	}
+
+	// Move first DOWN (swap with second).
+	if err := s.SwapChannelOrder(c1.ID, 1); err != nil {
+		t.Fatal(err)
+	}
+	chs, _ = s.Channels()
+	if chs[0].Name != "second" || chs[1].Name != "first" || chs[2].Name != "third" {
+		t.Fatalf("after moving first down: got %v", names(chs))
+	}
+
+	// Move it UP (back).
+	if err := s.SwapChannelOrder(c1.ID, -1); err != nil {
+		t.Fatal(err)
+	}
+	chs, _ = s.Channels()
+	if chs[0].Name != "first" || chs[1].Name != "second" || chs[2].Name != "third" {
+		t.Fatalf("after moving back up: got %v", names(chs))
+	}
+}
+
+func TestSwapChannelOrderAtEdgeIsNoop(t *testing.T) {
+	s := open(t)
+	register(t, s, "a", "claude", "", "")
+	c1, _ := s.CreateChannel("top", "channel", "public", "", "a")
+	c2, _ := s.CreateChannel("bottom", "channel", "public", "", "a")
+
+	// Move top UP (no prev).
+	if err := s.SwapChannelOrder(c1.ID, -1); err != nil {
+		t.Fatal(err)
+	}
+	chs, _ := s.Channels()
+	if chs[0].Name != "top" {
+		t.Fatalf("top should stay: got %v", names(chs))
+	}
+
+	// Move bottom DOWN (no next).
+	if err := s.SwapChannelOrder(c2.ID, 1); err != nil {
+		t.Fatal(err)
+	}
+	chs, _ = s.Channels()
+	if chs[1].Name != "bottom" {
+		t.Fatalf("bottom should stay: got %v", names(chs))
+	}
+}
+
+func TestSwapChannelOrderPreservesOrderAcrossMixedValues(t *testing.T) {
+	s := open(t)
+	register(t, s, "a", "claude", "", "")
+	c1, _ := s.CreateChannel("a", "channel", "public", "", "a")
+	c2, _ := s.CreateChannel("b", "channel", "public", "", "a")
+	// Manually set different sort_orders.
+	s.db.Exec(`UPDATE channels SET sort_order = 10 WHERE id = ?`, c1.ID)
+	s.db.Exec(`UPDATE channels SET sort_order = 20 WHERE id = ?`, c2.ID)
+
+	// Swap first DOWN.
+	if err := s.SwapChannelOrder(c1.ID, 1); err != nil {
+		t.Fatal(err)
+	}
+	chs, _ := s.Channels()
+	if chs[0].Name != "b" || chs[1].Name != "a" {
+		t.Fatalf("after swapping different orders: got %v", names(chs))
+	}
+}
+
+// ── migration v3 ────────────────────────────────────────────────────
+
+const v2ChannelsSchema = `
+CREATE TABLE channels (
+    id          INTEGER PRIMARY KEY,
+    name        TEXT NOT NULL UNIQUE,
+    kind        TEXT NOT NULL DEFAULT 'channel',
+    visibility  TEXT NOT NULL DEFAULT 'public',
+    topic       TEXT NOT NULL DEFAULT '',
+    created_by  TEXT NOT NULL DEFAULT '',
+    created_at  INTEGER NOT NULL DEFAULT (unixepoch()),
+    archived_at INTEGER
+);
+CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+INSERT INTO schema_meta (key, value) VALUES ('schema_version', '2');
+`
+
+func TestMigrationAddsSortOrder(t *testing.T) {
+	dir := t.TempDir()
+	v2, err := sql.Open("sqlite", filepath.Join(dir, "mesh.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := v2.Exec(v2ChannelsSchema); err != nil {
+		t.Fatal(err)
+	}
+	if err := v2.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatalf("open migrated store: %v", err)
+	}
+	defer s.Close()
+
+	var count int
+	if err := s.db.QueryRow(`
+		SELECT COUNT(*) FROM pragma_table_info('channels')
+		 WHERE name = 'sort_order'`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatal("sort_order column missing after migration")
+	}
+
+	// Create a channel — it should get sort_order=0 and be queryable.
+	register(t, s, "a", "claude", "", "")
+	ch, err := s.CreateChannel("test", "channel", "public", "", "a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	chs, err := s.Channels()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chs) != 1 || chs[0].Name != "test" {
+		t.Fatalf("channel query after migration: got %v", names(chs))
+	}
+	_ = ch
+}
+
+func names(chs []Channel) []string {
+	out := make([]string, len(chs))
+	for i, c := range chs {
+		out[i] = c.Name
+	}
+	return out
+}

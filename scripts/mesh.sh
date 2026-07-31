@@ -234,8 +234,10 @@ CREATE TABLE IF NOT EXISTS channels (
     topic       TEXT NOT NULL DEFAULT '"'"''"'"',
     created_by  TEXT NOT NULL DEFAULT '"'"''"'"',
     created_at  INTEGER NOT NULL DEFAULT (unixepoch()),
-    archived_at INTEGER
+    archived_at INTEGER,
+    sort_order  INTEGER NOT NULL DEFAULT 0
 );
+CREATE INDEX IF NOT EXISTS idx_channels_sort ON channels(sort_order, id);
 
 CREATE TABLE IF NOT EXISTS channel_members (
     channel_id INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
@@ -328,6 +330,7 @@ _MIGRATIONS_SQL='
 ALTER TABLE agents ADD COLUMN turn_state TEXT;
 ALTER TABLE agents ADD COLUMN model TEXT;
 ALTER TABLE agents ADD COLUMN transcript_path TEXT NOT NULL DEFAULT '"'"''"'"' ;
+ALTER TABLE channels ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0;
 
 CREATE TABLE IF NOT EXISTS channels (
     id          INTEGER PRIMARY KEY,
@@ -374,10 +377,10 @@ EOF
 
 _ensure_schema() {
     [[ -f "$DB" ]] || return 0
-    [[ -f "$MESH_DIR/.schema_v3" ]] && return 0
+    [[ -f "$MESH_DIR/.schema_v4" ]] && return 0
     printf '%s\n' "$_SCHEMA_SQL" | sqlite3 "$DB" >/dev/null 2>&1 || true
     _apply_migrations
-    touch "$MESH_DIR/.schema_v3" 2>/dev/null || true
+    touch "$MESH_DIR/.schema_v4" 2>/dev/null || true
 }
 
 # ── register / deregister / alias ────────────────────────────────────

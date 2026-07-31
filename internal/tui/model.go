@@ -129,6 +129,10 @@ type receiptsMsg struct {
 }
 type errMsg struct{ error }
 type sentMsg struct{ message store.Message }
+type channelMembersMsg struct {
+	channelID int64
+	members   []store.MemberInfo
+}
 type searchResultsMsg struct{ results []SearchResult }
 type threadRepliesMsg struct {
 	threadID int64
@@ -183,6 +187,12 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case sentMsg:
 		return m, m.loadHistory(m.currentChID)
+
+	case channelMembersMsg:
+		if msg.channelID == m.currentChID {
+			m.sidebar.SetChannelMembers(msg.members)
+		}
+		return m, nil
 
 	case receiptsMsg:
 		if m.detail.visible {
@@ -452,6 +462,22 @@ func (m *Model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case "J":
+		if m.focusedPanel == PanelSidebar {
+			if ch := m.sidebar.CursorChannel(); ch != nil {
+				return m, m.swapChannelOrder(ch.ID, 1)
+			}
+		}
+		return m, nil
+
+	case "K":
+		if m.focusedPanel == PanelSidebar {
+			if ch := m.sidebar.CursorChannel(); ch != nil {
+				return m, m.swapChannelOrder(ch.ID, -1)
+			}
+		}
+		return m, nil
+
 	case "h":
 		// Close thread view
 		if m.showThread {
@@ -637,8 +663,9 @@ func (m *Model) handleEnter() (tea.Model, tea.Cmd) {
 		if ch := m.sidebar.CursorChannel(); ch != nil {
 			m.currentChID = ch.ID
 			m.currentCh = ch.Name
+			m.sidebar.showMembers = true
 			m.updateSidebar()
-			return m, m.loadHistory(ch.ID)
+			return m, tea.Batch(m.loadHistory(ch.ID), m.loadChannelMembers(ch.ID))
 		}
 	}
 
@@ -1048,6 +1075,27 @@ func (m Model) renameAgent(sessionID, newName string) tea.Cmd {
 	}
 }
 
+func (m Model) loadChannelMembers(channelID int64) tea.Cmd {
+	return func() tea.Msg {
+		members, err := m.store.ChannelMembers(channelID)
+		if err != nil {
+			return errMsg{err}
+		}
+		return channelMembersMsg{channelID: channelID, members: members}
+	}
+}
+
+func (m Model) swapChannelOrder(channelID int64, direction int) tea.Cmd {
+	return func() tea.Msg {
+		err := m.store.SwapChannelOrder(channelID, direction)
+		if err != nil {
+			return errMsg{err}
+		}
+		channels, _ := m.store.Channels()
+		return channelsMsg{channels}
+	}
+}
+
 func (m *Model) resize() {
 	sidebarW := m.width * 25 / 100; if sidebarW < 18 { sidebarW = 18 }; if sidebarW > 30 { sidebarW = 30 }
 	detailW := 0
@@ -1081,7 +1129,7 @@ func (m *Model) updateFocus() {
 		m.compose.SetHint("enter: send  shift+enter: newline  esc: feed  tab: sidebar")
 	} else if m.focusedPanel == PanelSidebar {
 		m.compose.Blur()
-		m.compose.SetHint("j/k: navigate  space: mark read  d: delete channel  c: create  r: rename  R: rename agent  p: toggle private  i: invite  tab: feed")
+		m.compose.SetHint("j/k: navigate  J/K: reorder  d: delete  c: create  r: rename  R: rename agent  p: toggle private  i: invite  tab: feed")
 	} else if m.focusedPanel == PanelFeed {
 		m.compose.Blur()
 		m.compose.SetHint("j/k: scroll  enter/t: thread  r: reply  i: detail  /: search  tab: sidebar")

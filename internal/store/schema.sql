@@ -51,7 +51,8 @@ CREATE TABLE IF NOT EXISTS channels (
     topic       TEXT NOT NULL DEFAULT '',
     created_by  TEXT NOT NULL DEFAULT '',
     created_at  INTEGER NOT NULL DEFAULT (unixepoch()),
-    archived_at INTEGER
+    archived_at INTEGER,
+    sort_order  INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS channel_members (

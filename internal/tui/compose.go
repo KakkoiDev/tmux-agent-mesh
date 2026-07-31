@@ -166,6 +166,7 @@ Actions
   r              Reply to selected
   e              Edit your message
   d              Delete your message
+  J / K          Reorder channel (sidebar)
   Ctrl+T         Thread view
   Ctrl+N         New direct message
   Ctrl+K         Create/join channel

@@ -82,6 +82,9 @@ func (s *Store) migrate() error {
 	if err := s.migrateAgentsV2(); err != nil {
 		return err
 	}
+	if err := s.migrateChannelsV3(); err != nil {
+		return err
+	}
 	if _, err := s.db.Exec(
 		`INSERT INTO agents (session_id, harness, alias, turn_state)
 		 VALUES (?, 'human', ?, 'idle')
@@ -107,6 +110,34 @@ func (s *Store) schemaVersion() (int, error) {
 // table, so the ALTER is its own step, guarded by the schema_meta version.
 // A fresh database already has the column from schema.sql, in which case the
 // ALTER fails with "duplicate column name" and is safe to skip.
+// migrateChannelsV3 adds the sort_order column to databases created before it
+// existed, and stamps schema_version 3.
+func (s *Store) migrateChannelsV3() error {
+	v, err := s.schemaVersion()
+	if err != nil {
+		return fmt.Errorf("schema version: %w", err)
+	}
+	if v >= 3 {
+		return nil
+	}
+	if _, err := s.db.Exec(
+		`ALTER TABLE channels ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0`); err != nil {
+		if !strings.Contains(err.Error(), "duplicate column name") {
+			return fmt.Errorf("migrate channels v3: %w", err)
+		}
+	}
+	if _, err := s.db.Exec(
+		`CREATE INDEX IF NOT EXISTS idx_channels_sort ON channels(sort_order, id)`); err != nil {
+		return fmt.Errorf("migrate channels v3 index: %w", err)
+	}
+	if _, err := s.db.Exec(
+		`INSERT INTO schema_meta (key, value) VALUES ('schema_version', '3')
+		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`); err != nil {
+		return fmt.Errorf("stamp schema version: %w", err)
+	}
+	return nil
+}
+
 func (s *Store) migrateAgentsV2() error {
 	v, err := s.schemaVersion()
 	if err != nil {
