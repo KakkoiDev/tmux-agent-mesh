@@ -76,12 +76,18 @@ func (m *SidebarModel) MoveUp() {
 }
 
 func (m *SidebarModel) MoveDown() {
-	max := len(m.channels) - 1
-	if m.showAgents {
-		max += len(m.agents) + 2 // +2 for spacer and header
-	}
-	if m.cursor < max && m.cursor < len(m.channels)-1 {
+	if m.cursor < len(m.channels)-1 {
 		m.cursor++
+	}
+}
+
+func (m *SidebarModel) ScrollToTop() {
+	m.cursor = 0
+}
+
+func (m *SidebarModel) ScrollToBottom() {
+	if len(m.channels) > 0 {
+		m.cursor = len(m.channels) - 1
 	}
 }
 
@@ -209,6 +215,13 @@ func (m *SidebarModel) renderAgent(a AgentView) string {
 
 func max(a, b int) int {
 	if a > b {
+		return a
+	}
+	return b
+}
+
+func min(a, b int) int {
+	if a < b {
 		return a
 	}
 	return b

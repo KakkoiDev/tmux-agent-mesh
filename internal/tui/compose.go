@@ -28,6 +28,7 @@ type ComposeModel struct {
 	editID    int64
 	focused   bool
 	width     int
+	hint      string
 }
 
 func NewCompose() ComposeModel {
@@ -45,6 +46,10 @@ func NewCompose() ComposeModel {
 		input: ti,
 		mode:  ComposeNormal,
 	}
+}
+
+func (m *ComposeModel) SetHint(hint string) {
+	m.hint = hint
 }
 
 func (m *ComposeModel) SetSize(width int) {
@@ -132,8 +137,11 @@ func (m *ComposeModel) View() string {
 	}
 
 	rendered := fmt.Sprintf("%s %s", ComposePromptStyle.Render(prompt), m.input.View())
-	// Status bar hints
-	hints := "enter: send  tab: switch  ctrl+t: thread  ctrl+n: dm  ctrl+k: channel  ?: help  ctrl+c: quit"
+	// Status bar hints — use dynamic hint if set, otherwise default
+	hints := m.hint
+	if hints == "" {
+		hints = "enter: send  tab: switch  ctrl+t: thread  ctrl+n: dm  ctrl+k: channel  ?: help  ctrl+c: quit"
+	}
 	rendered += "\n" + StatusBarStyle.Width(m.width-3).Render(hints)
 	rendered = style.Render(rendered)
 

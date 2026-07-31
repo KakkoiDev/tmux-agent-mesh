@@ -96,6 +96,22 @@ func (m *FeedModel) ScrollToBottom() {
 	m.viewport.GotoBottom()
 }
 
+func (m *FeedModel) PageDown() {
+	page := m.viewport.Height
+	if page < 1 {
+		page = 10
+	}
+	m.cursor = min(m.cursor+page, len(m.messages)-1)
+}
+
+func (m *FeedModel) PageUp() {
+	page := m.viewport.Height
+	if page < 1 {
+		page = 10
+	}
+	m.cursor = max(0, m.cursor-page)
+}
+
 func (m *FeedModel) Update(msg tea.Msg) (FeedModel, tea.Cmd) {
 	var cmd tea.Cmd
 	m.viewport, cmd = m.viewport.Update(msg)
@@ -104,6 +120,12 @@ func (m *FeedModel) Update(msg tea.Msg) (FeedModel, tea.Cmd) {
 
 func (m *FeedModel) View() string {
 	var b strings.Builder
+
+	// Channel name header
+	if m.channelName != "" {
+		b.WriteString(MessageHeaderStyle.Render(m.channelName))
+		b.WriteString("\n")
+	}
 
 	// Messages
 	msgs := m.messages
