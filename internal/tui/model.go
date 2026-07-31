@@ -893,14 +893,14 @@ func (m *Model) handlePromptKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "y":
 		if m.prompt.mode == PromptConfirm {
 			m.prompt.confirmVal = true
+			return m, nil
 		}
-		return m, nil
 
 	case "n":
 		if m.prompt.mode == PromptConfirm {
 			m.prompt.confirmVal = false
+			return m, nil
 		}
-		return m, nil
 	}
 
 	var cmd tea.Cmd
