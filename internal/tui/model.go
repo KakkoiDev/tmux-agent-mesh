@@ -661,7 +661,7 @@ func (m *Model) handleThreadReplies(msg threadRepliesMsg) {
 }
 
 func (m *Model) resize() {
-	sidebarW := 24
+	sidebarW := m.width * 25 / 100; if sidebarW < 18 { sidebarW = 18 }; if sidebarW > 30 { sidebarW = 30 }
 	detailW := 0
 	if m.detail.visible {
 		detailW = 30
@@ -872,7 +872,7 @@ func (m *Model) View() string {
 		feedH = 0
 	}
 
-	sidebarW := 24
+	sidebarW := m.width * 25 / 100; if sidebarW < 18 { sidebarW = 18 }; if sidebarW > 30 { sidebarW = 30 }
 	detailW := 0
 	if m.detail.visible {
 		detailW = 30

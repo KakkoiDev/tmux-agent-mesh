@@ -34,7 +34,6 @@ var BaseStyle = lipgloss.NewStyle().
 // borders frame it in bright cyan so the panel is always visible; the
 // background brightens further when the sidebar has focus.
 var SidebarStyle = lipgloss.NewStyle().
-	Width(18).
 	BorderLeft(true).
 	BorderRight(true).
 	BorderStyle(lipgloss.ThickBorder()).
@@ -120,8 +119,6 @@ var (
 // Feed — message area on the terminal-default background with a thick left
 // separator border that turns cyan when the feed has focus.
 var FeedStyle = lipgloss.NewStyle().
-	BorderStyle(lipgloss.ThickBorder()).
-	BorderForeground(border).
 	Padding(0, 1)
 
 // MessageHeaderStyle — bold cyan sender/channel headers.

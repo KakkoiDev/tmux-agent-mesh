@@ -105,19 +105,7 @@ func (m *FeedModel) Update(msg tea.Msg) (FeedModel, tea.Cmd) {
 func (m *FeedModel) View() string {
 	var b strings.Builder
 
-	// Channel name header
-	if m.channelName != "" {
-		header := MessageHeaderStyle.Render(m.channelName)
-		b.WriteString(header)
-		b.WriteString("\n")
-		rule := strings.Repeat("━", max(0, m.width-3))
-		if m.focused {
-			rule = MessageCursorStyle.Render(rule) // bright cyan rule when focused
-		}
-		b.WriteString(rule)
-		b.WriteString("\n")
-	}
-
+	// Messages
 	msgs := m.messages
 	if m.showThread {
 		msgs = m.threadMsgs
