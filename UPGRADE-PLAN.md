@@ -3,6 +3,11 @@
 > Audit of every gap between what mesh ships today and what it takes to be a
 > first-class communication layer for humans and agents. Written from the
 > outside in: human UX first, then agent API, then internals.
+>
+> **Update 2025-07-31:** The Go store (`internal/store/`) has been recovered
+> from git history and restored. 36 tests pass against `modernc.org/sqlite`.
+> The store is the foundation for channels, read receipts, access rules, and
+> the TUI — all of which were previously blocked on it.
 
 ---
 
@@ -674,32 +679,239 @@ server is proven.
 
 ---
 
-## 9. Order of work
+## 9. Go store recovery
+
+The `internal/store/` package was deleted in commit `87f6c2d` because it was
+unreachable (`internal/` with no `package main`) and its schema was incompatible
+with bash's `_SCHEMA_SQL`. Both problems are now fixable.
+
+**Recovered files** (from `d452213`):
+
+```
+internal/store/
+  schema.sql          # single source of truth for all tables
+  store.go            # Open, Close, migrate, tx helper
+  agents.go           # Register, Deregister, SetAlias, SetTurnState,
+                      #   Resolve, Agent, Roster
+  channels.go         # CreateChannel, ChannelByName, Join, Leave,
+                      #   IsMember, MayJoin, MayRead, AddRule, Rules,
+                      #   Channels, DMChannel
+  messages.go         # Send (with Caps), Pending, Claim (atomic),
+                      #   History, MarkRead, Receipts,
+                      #   BlockStreak, BumpStreak, ResetStreak
+  messages_test.go    # 16 tests: delivery, caps, receipts, history
+  store_test.go       # 20 tests: agents, channels, rules, DMs
+```
+
+**Key differences from the bash schema** (these are intentional improvements):
+
+| Concern | Bash `_SCHEMA_SQL` | Go `schema.sql` |
+|---|---|---|
+| Recipients | `messages.to_session` — one agent per message | `channel_members` — one channel, N recipients |
+| Delivery | `messages.delivered_at` / `delivered_via` on the message row | `deliveries` table — per-recipient delivery tracking |
+| Read receipts | None | `reads` table — append-only, source-tagged (`drain` vs `client`) |
+| Files | None | `files` table + `file_access` audit log |
+| Host column | None | `agents.host` — empty = local, else the machine name |
+| Channel rules | None | `channel_rules` — allow-list by harness or model |
+| Message edits | None | Schema has `edit_of` column ready (not yet in Go code) |
+| Soft deletes | None | Schema has `deleted_at` column ready |
+
+**What the recovery unlocks:**
+
+1. The TUI has a real API to call instead of shelling out to bash
+2. Channels and read receipts work without new schema design
+3. The `host` column makes a distributed roster possible without reshaping every row
+4. The `internal/` restriction is resolved by putting `cmd/mesh/` at the module root
+
+---
+
+## 10. Protocol: client ↔ server communication
+
+The Go server (`mesh serve` / `mesh serve-stdio`) needs a well-defined protocol
+before a single line of handler code is written. Every client (CLI, TUI, hooks)
+depends on it.
+
+### 10.1 Transport
+
+| Transport | Listener | Client connects via |
+|---|---|---|
+| Unix socket | `mesh serve --addr /var/run/mesh/mesh.sock` | `mesh --server /var/run/mesh/mesh.sock <cmd>` |
+| SSH stdio | `mesh serve-stdio` (forced command in `authorized_keys`) | `ssh mesh@host mesh <cmd>` |
+| Local (no server) | N/A — client opens database directly | Default when no `--server` and `MESH_SERVER` unset |
+
+### 10.2 Message format
+
+Line-delimited JSON (JSON Lines, `application/jsonlines`). One request or
+response per line, terminated by `\n`. No framing headers, no length prefix.
+
+**Rationale:**
+- Trivial to implement in bash (`printf '%s\n' | jq -c`)
+- Trivial to implement in Go (`json.NewEncoder`, `bufio.Scanner`)
+- Human-debuggable with `nc -U` or `socat`
+- No dependency on a schema registry or codegen
+- Forwards-compatible: unknown fields are ignored
+
+### 10.3 Request envelope
+
+```json
+{
+  "id": "req-001",
+  "method": "send",
+  "params": {
+    "channel": "general",
+    "body": "status check",
+    "expect_reply": false
+  },
+  "auth": {
+    "session_id": "019fb5d8",
+    "host": "laptop"
+  }
+}
+```
+
+| Field | Type | Required | Purpose |
+|---|---|---|---|
+| `id` | string | yes | Client-chosen, echoed in the response. UUID or counter. |
+| `method` | string | yes | The subcommand name: `send`, `roster`, `drain`, etc. |
+| `params` | object | yes | Method-specific arguments. Same names as CLI flags. |
+| `auth` | object | yes | Caller identity. Server trusts the transport (uid on unix socket, ssh key) but still needs the session_id to apply access rules. |
+
+### 10.4 Response envelope
+
+```json
+{
+  "id": "req-001",
+  "ok": true,
+  "result": {
+    "id": 42,
+    "thread": "t-1785462851-88360"
+  }
+}
+```
+
+```json
+{
+  "id": "req-002",
+  "ok": false,
+  "error": {
+    "code": "forbidden",
+    "message": "019fb5d8 is not a member of #sensitive"
+  }
+}
+```
+
+| Field | Type | Always present | Purpose |
+|---|---|---|---|
+| `id` | string | yes | Echo of the request id for correlation |
+| `ok` | bool | yes | `true` = success, `false` = error |
+| `result` | any | on success | Method-specific return value, always an object or array |
+| `error.code` | string | on error | Machine-readable: `not_found`, `ambiguous`, `forbidden`, `invalid`, `internal` |
+| `error.message` | string | on error | Human-readable, safe to show to the user |
+
+### 10.5 Server-push (notifications)
+
+For the TUI's live-update path, the server can push events without a
+corresponding request:
+
+```json
+{
+  "event": "message",
+  "channel": "general",
+  "data": {
+    "id": 43,
+    "from": "builder",
+    "body": "migration done"
+  }
+}
+```
+
+```json
+{"event": "agent_joined", "channel": "general", "agent": "auditor"}
+{"event": "agent_left", "channel": "general", "agent": "auditor"}
+{"event": "delivery", "message_id": 42, "to": "reviewer", "via": "claude:turn-end"}
+{"event": "read", "message_id": 42, "reader": "builder", "source": "client"}
+```
+
+The client subscribes by sending a `watch` request. The server holds the
+connection open (no response to `watch`) and streams events. Closing the
+connection unsubscribes.
+
+### 10.6 Method index
+
+Every CLI subcommand becomes a method. The server validates and executes.
+
+| Method | Params | Result | Notes |
+|---|---|---|---|
+| `roster` | `{}` | `[{session_id, harness, alias, host, project, state, push, pending, pane, model}]` | |
+| `agent` | `{ref}` | `{session_id, harness, alias, ...}` | Single agent detail |
+| `send` | `{channel, body, [expect_reply], [thread]}` | `{id, thread}` | Caps enforced server-side |
+| `reply` | `{to_message, body}` | `{id, thread, hops}` | Validates sender is original recipient |
+| `pending` | `{}` | `[{id, channel, from, body, ...}]` | Read-only, does not claim |
+| `claim` | `{via}` | `[{id, channel, from, body, ...}]` | Atomic claim + delivery |
+| `history` | `{channel, [limit], [before]}` | `[{id, from, body, created_at, ...}]` | Pagination via `before` cursor |
+| `mark_read` | `{message_ids: [int]}` | `{count}` | Client read receipts |
+| `receipts` | `{message_id}` | `[{reader, name, at, source}]` | |
+| `channel_list` | `{}` | `[{id, name, kind, visibility, member_count}]` | |
+| `channel_create` | `{name, [private], [description]}` | `{id, name}` | |
+| `channel_join` | `{channel}` | `{id}` | Subject to access rules |
+| `channel_leave` | `{channel}` | `{}` | |
+| `channel_rule_add` | `{channel, subject, value}` | `{}` | |
+| `channel_rule_list` | `{channel}` | `[{subject, value}]` | |
+| `dm` | `{with}` | `{channel_id, name}` | Idempotent: finds or creates |
+| `search` | `{query, [channel], [limit]}` | `[{id, channel, from, body_preview, created_at}]` | FTS5 |
+| `ping` | `{ref}` | `{session_id, state, last_seen, pending}` | Reads registry, no message |
+| `status` | `{state, [detail]}` | `{}` | Updates own status field |
+| `watch` | `{channels: [string]}` | *(stream of events)* | Long-lived, server push |
+| `file_put` | `{channel, name, body_b64}` | `{id, sha256}` | Binary-safe via base64 |
+| `file_get` | `{id}` | `{name, size, sha256, body_b64}` | Membership-gated |
+| `dispatch` | `{task, harness, [alias], [worktree], [env]}` | `{pane}` | Needs tmux on the same host |
+
+### 10.7 Auth model
+
+On a unix socket: the server reads `SO_PEERCRED` to get the caller's uid. The
+`auth.session_id` in the request is trusted only if the uid matches the agent's
+registered uid or the socket owner.
+
+Over ssh: the forced command carries no auth field. The server derives identity
+from the ssh key fingerprint, which maps to a host identity configured in
+`mesh config`. The session_id in each request is validated against agents
+registered on that host.
+
+No bearer tokens, no API keys, no OAuth. The transport is the credential.
+
+---
+
+## 11. Order of work (revised)
 
 Dependencies force the order, not preference.
 
 ```
- 1. mark-read, history, info        (pure CLI, bash, no schema changes)
- 2. Schema migrations               (channel tables, FTS, new columns)
- 3. channel subcommands             (create, join, leave, list, rule)
- 4. search                          (FTS5 CLI)
- 5. Go server + client              (ROADMAP.md §1)
- 6. Hook rewiring to Go client      (ROADMAP.md §2)
- 7. Wake path for non-Pi agents     (ROADMAP.md §3)
- 8. File upload/download            (store + CLI + TUI)
- 9. TUI                             (Bubble Tea, consumes server)
-10. Resident helper agent           (Pi, dispatched, read-only)
-11. Remote: serve, serve-stdio, ssh  (ROADMAP.md, already designed)
-12. Enforcement: sandbox/dispatch    (ROADMAP.md §5)
-13. Shell completion                 (low cost, high convenience, anytime)
+ ✓ Go store recovered                     (36 tests passing)
+ 1. mark-read, history, info              (pure CLI, bash, no schema changes)
+ 2. Protocol spec finalized               (this document, §10)
+ 3. Go server + unix socket transport     (`mesh serve`)
+ 4. Go client library                     (`mesh <cmd> --server ...`)
+ 5. Schema migration: bash → Go schema    (one-shot, applied by server on start)
+ 6. Channel subcommands                   (create, join, leave, list, rule)
+ 7. Search                                (FTS5)
+ 8. Hook rewiring to Go client            (ROADMAP.md §2)
+ 9. Wake path for non-Pi agents           (ROADMAP.md §3)
+10. File upload/download                  (store ready, needs CLI + TUI)
+11. TUI                                   (Bubble Tea, consumes server + client)
+12. Edit / delete messages                (edit_of + deleted_at in schema)
+13. Resident helper agent                 (Pi, dispatched, read-only)
+14. ssh transport (`mesh serve-stdio`)    (ROADMAP.md, remote deployment)
+15. Enforcement: sandbox on dispatch      (ROADMAP.md §5)
+16. Shell completion                      (low cost, high convenience)
 ```
 
-Steps 1–4 can happen in parallel with step 5 if different people own them.
-Everything after 6 waits on 5.
+Steps 1–2 can happen in parallel with 3. Step 5 is the hard cutover: once the
+Go schema is live, bash hooks must go through the server or be retired.
+Everything after 8 waits on the server.
 
 ---
 
-## 10. Immediate low-cost wins
+## 12. Immediate low-cost wins
 
 Things that take under an hour and fix real friction:
 
@@ -711,5 +923,5 @@ Things that take under an hour and fix real friction:
 | 4 | `--json` on every data command | wrap existing JSON output paths |
 | 5 | `thread <id>` subcommand | same as history, filtered by thread_id |
 | 6 | Add `reply_command` field to drain JSON | 1 line in `_render_mail` |
-| 7 | Add `host` and `status` columns to schema | 2 ALTER TABLE statements |
-| 8 | `ping <ref>` subcommand | 15 lines, reads registry, no message |
+| 7 | `ping <ref>` subcommand | 15 lines, reads registry, no message |
+| 8 | Run `go test ./...` in CI | 5 lines in `.github/workflows/ci.yml` |
