@@ -63,7 +63,7 @@ CLEANUP_HOOKS="pane-exited after-kill-pane window-unlinked session-closed"
     run_plugin
     local h
     for h in $CLEANUP_HOOKS; do
-        assert_contains "$(hooks_for "$h")" "mesh.sh cleanup"
+        assert_contains "$(hooks_for "$h")" "mesh-wrapper.sh cleanup"
     done
 }
 
@@ -74,7 +74,7 @@ CLEANUP_HOOKS="pane-exited after-kill-pane window-unlinked session-closed"
     done
     run_plugin
     for h in $CLEANUP_HOOKS; do
-        assert_contains "$(hooks_for "$h")" "mesh.sh cleanup"
+        assert_contains "$(hooks_for "$h")" "mesh-wrapper.sh cleanup"
         assert_contains "$(hooks_for "$h")" "echo other"
     done
 }
@@ -86,7 +86,7 @@ CLEANUP_HOOKS="pane-exited after-kill-pane window-unlinked session-closed"
     run_plugin
     local h
     for h in $CLEANUP_HOOKS; do
-        assert_eq "$(hooks_for "$h" | grep -c 'mesh.sh cleanup')" "1"
+        assert_eq "$(hooks_for "$h" | grep -c 'mesh-wrapper.sh cleanup')" "1"
     done
 }
 

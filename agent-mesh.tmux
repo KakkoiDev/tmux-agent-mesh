@@ -102,7 +102,7 @@ tmux show-hooks -g pane-died 2>/dev/null \
 # `show-hooks -g` omits names that are unset.
 for _hook in $MESH_CLEANUP_HOOKS; do
     tmux show-hooks -g "$_hook" >/dev/null 2>&1 || continue
-    if ! tmux show-hooks -g "$_hook" 2>/dev/null | grep -qF "$SCRIPTS_DIR/mesh.sh cleanup"; then
+    if ! tmux show-hooks -g "$_hook" 2>/dev/null | grep -qF "$SCRIPTS_DIR/mesh-wrapper.sh cleanup"; then
         tmux set-hook -ga "$_hook" "run-shell -b '$SCRIPTS_DIR/mesh-wrapper.sh cleanup'"
     fi
 done

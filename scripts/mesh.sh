@@ -2434,7 +2434,7 @@ _cleanup_hooks_registered() {
     local h
     for h in pane-exited after-kill-pane window-unlinked session-closed; do
         tmux show-hooks -g "$h" >/dev/null 2>&1 || continue
-        tmux show-hooks -g "$h" 2>/dev/null | grep -qF "mesh.sh cleanup" || return 1
+        tmux show-hooks -g "$h" 2>/dev/null | grep -qF "mesh-wrapper.sh cleanup" || return 1
     done
     return 0
 }
