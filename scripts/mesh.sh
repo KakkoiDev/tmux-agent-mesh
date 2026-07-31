@@ -155,6 +155,18 @@ _display_name() {
     printf '%s' "${out:-$sid}"
 }
 
+# Human-readable relative time for message timestamps.
+_fmt_ago() {
+    local now ts diff
+    now=$(date +%s)
+    ts="${1:-$now}"
+    diff=$(( now - ts ))
+    if [[ $diff -lt 60 ]]; then printf '%ss ago' "$diff"
+    elif [[ $diff -lt 3600 ]]; then printf '%sm ago' "$(( diff / 60 ))"
+    elif [[ $diff -lt 86400 ]]; then printf '%sh ago' "$(( diff / 3600 ))"
+    else printf '%sd ago' "$(( diff / 86400 ))"; fi
+}
+
 # ── schema ───────────────────────────────────────────────────────────
 
 _SCHEMA_SQL='
@@ -761,7 +773,8 @@ cmd_drain() {
     _debug_log "drain sid=$sid via=$via n=$n"
 
     if [[ "$as_json" -eq 1 ]]; then
-        printf '%s\n' "$json"
+        printf '%s' "$json" | jq 'map(. + {reply_command: ("tmux-agent-mesh reply --to-message \(.id) --message \"...\"")})'
+        printf '\n'
     else
         printf '%s' "$json" | _render_mail
     fi
@@ -1164,13 +1177,14 @@ cmd_hook() {
 # Polls rather than using `tmux wait-for`: this must work from a plain shell
 # outside tmux, and a 1s poll on a local SQLite file costs nothing.
 cmd_recv() {
-    local thread="" wait=0 timeout=300 sid=""
+    local thread="" wait=0 timeout=300 sid="" as_json=0
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --thread)  thread="${2:-}"; shift ;;
             --timeout) timeout="${2:-300}"; shift ;;
             --session) sid="${2:-}"; shift ;;
             --wait)    wait=1 ;;
+            --json)    as_json=1 ;;
             *) _die "recv: unknown flag '$1'" ;;
         esac
         shift
@@ -1178,16 +1192,25 @@ cmd_recv() {
     [[ -n "$thread" ]] || _die "recv: --thread is required"
     [[ -n "$sid" ]] || sid=$(_self_session "")
 
-    local q
+    local q q_json
     q="SELECT m.id, COALESCE(a.alias, m.from_session), m.body
              FROM messages m LEFT JOIN agents a ON a.session_id=m.from_session
              WHERE m.thread_id='$(sql_esc "$thread")' AND m.to_session='$(sql_esc "$sid")'
              ORDER BY m.id"
+    q_json="SELECT m.id, COALESCE(a.alias, m.from_session) AS from_name, m.body,
+              m.thread_id, m.hops, m.created_at
+       FROM messages m LEFT JOIN agents a ON a.session_id=m.from_session
+       WHERE m.thread_id='$(sql_esc "$thread")' AND m.to_session='$(sql_esc "$sid")'
+       ORDER BY m.id"
 
     local waited=0 out
     while true; do
-        out=$(sql_sep '|' "$q;")
-        if [[ -n "$out" ]]; then
+        if [[ "$as_json" -eq 1 ]]; then
+            out=$(sql_json "$q_json;")
+        else
+            out=$(sql_sep '|' "$q;")
+        fi
+        if [[ -n "$out" && "$out" != "[]" ]]; then
             printf '%s\n' "$out"
             return 0
         fi
@@ -1222,6 +1245,278 @@ $(sql_sep '|' "SELECT m.id, m.created_at,
 EOF
         sleep 1
     done
+}
+
+# ── mark-read ────────────────────────────────────────────────────────
+
+cmd_mark_read() {
+    local as="" mid=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --as) as="${2:-}"; shift ;;
+            --message-id) mid="${2:-}"; shift ;;
+            *) _die "mark-read: unknown flag '$1'" ;;
+        esac
+        shift
+    done
+
+    local sid rc
+    if [[ -n "$as" ]]; then
+        set +e; sid=$(_resolve_ref "$as"); rc=$?; set -e
+        [[ "$rc" -eq 2 ]] && exit 2
+        [[ -n "$sid" ]] || _die "mark-read: no agent matches '$as'"
+    else
+        sid=$(_self_session "")
+    fi
+
+    if [[ -n "$mid" ]]; then
+        case "$mid" in
+            *[!0-9]*) _die "mark-read: --message-id must be a number" ;;
+        esac
+        local n
+        n=$(sql "UPDATE messages SET delivered_at=unixepoch(), delivered_via='human:read'
+                 WHERE id=$mid AND to_session='$(sql_esc "$sid")' AND delivered_at IS NULL;
+                 SELECT changes();")
+        if [[ "${n:-0}" -eq 0 ]]; then
+            _die "mark-read: message $mid not found, not pending, or not addressed to you"
+        fi
+        printf 'marked message %s as read\n' "$mid"
+    else
+        local n
+        n=$(sql "SELECT COUNT(*) FROM messages WHERE to_session='$(sql_esc "$sid")' AND delivered_at IS NULL;")
+        if [[ "${n:-0}" -eq 0 ]]; then
+            printf 'no pending messages for %s\n' "$(_display_name "$sid")"
+            return 0
+        fi
+        sql "UPDATE messages SET delivered_at=unixepoch(), delivered_via='human:read'
+             WHERE to_session='$(sql_esc "$sid")' AND delivered_at IS NULL;"
+        printf 'marked %s message(s) as read for %s\n' "$n" "$(_display_name "$sid")"
+    fi
+}
+
+# ── history ──────────────────────────────────────────────────────────
+
+cmd_history() {
+    local as="" thread="" from="" since="" limit="50" as_json=0 channel=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --as) as="${2:-}"; shift ;;
+            --channel) channel="${2:-}"; shift ;;
+            --thread) thread="${2:-}"; shift ;;
+            --from) from="${2:-}"; shift ;;
+            --since) since="${2:-}"; shift ;;
+            --limit) limit="${2:-50}"; shift ;;
+            --json) as_json=1 ;;
+            *) _die "history: unknown flag '$1'" ;;
+        esac
+        shift
+    done
+
+    local sid rc
+    if [[ -n "$as" ]]; then
+        set +e; sid=$(_resolve_ref "$as"); rc=$?; set -e
+        [[ "$rc" -eq 2 ]] && exit 2
+        [[ -n "$sid" ]] || _die "history: no agent matches '$as'"
+    else
+        sid=$(_self_session "")
+    fi
+
+    local where="(m.from_session='$(sql_esc "$sid")' OR m.to_session='$(sql_esc "$sid")')"
+    [[ -n "$thread" ]] && where="$where AND m.thread_id='$(sql_esc "$thread")'"
+    if [[ -n "$from" ]]; then
+        local from_sid frc
+        set +e; from_sid=$(_resolve_ref "$from"); frc=$?; set -e
+        [[ "$frc" -eq 2 ]] && exit 2
+        [[ -n "$from_sid" ]] && where="$where AND m.from_session='$(sql_esc "$from_sid")'"
+    fi
+    [[ -n "$since" ]] && where="$where AND m.created_at >= unixepoch('$(sql_esc "$since")')"
+
+    local q="SELECT m.id, m.thread_id,
+                COALESCE(fa.alias, substr(m.from_session,1,8)),
+                COALESCE(ta.alias, substr(m.to_session,1,8)),
+                m.hops, m.created_at, m.body,
+                m.delivered_at, m.delivered_via
+         FROM messages m
+         LEFT JOIN agents fa ON fa.session_id=m.from_session
+         LEFT JOIN agents ta ON ta.session_id=m.to_session
+         WHERE $where
+         ORDER BY m.id DESC
+         LIMIT $limit"
+
+    if [[ "$as_json" -eq 1 ]]; then
+        sql_json "$q;"
+        printf '\n'
+        return 0
+    fi
+
+    local out
+    out=$(sql_sep '|' "$q;")
+    if [[ -z "$out" ]]; then
+        printf 'no messages found\n'
+        return 0
+    fi
+
+    local id tid fname tname hops created body delivered_at delivered_via
+    while IFS='|' read -r id tid fname tname hops created body delivered_at delivered_via; do
+        [[ -z "$id" ]] && continue
+        local ago dir
+        ago=$(_fmt_ago "$created")
+        if [[ "$fname" == "$(_display_name "$sid")" ]]; then dir="→" ; else dir="←"; fi
+        printf '#%-5s thread %-18s %s %-12s → %-12s  hop %s  %s\n' \
+            "$id" "$tid" "$dir" "$fname" "$tname" "$hops" "$ago"
+        printf '      %s\n' "$body"
+        if [[ -n "$delivered_at" ]]; then
+            printf '      `- read via %s %s\n' "$delivered_via" "$(_fmt_ago "$delivered_at")"
+        fi
+    done <<EOF
+$out
+EOF
+}
+
+# ── info ─────────────────────────────────────────────────────────────
+
+cmd_info() {
+    local ref="${1:-}" as_json=0
+    if [[ "$ref" == "--json" ]]; then
+        as_json=1; shift; ref="${1:-}"
+    fi
+    [[ -n "$ref" ]] || _die "info: usage: info [--json] <ref>"
+
+    local sid rc
+    set +e; sid=$(_resolve_ref "$ref"); rc=$?; set -e
+    [[ "$rc" -eq 2 ]] && exit 2
+    [[ -n "$sid" ]] || _die "info: no agent matches '$ref'"
+
+    local q="SELECT a.session_id, a.alias, a.harness, a.project_name,
+                a.tmux_pane, a.tmux_target, a.turn_state, a.model,
+                a.push_capable, a.block_streak, a.registered_at, a.last_seen,
+                (SELECT COUNT(*) FROM messages m WHERE m.to_session=a.session_id AND m.delivered_at IS NULL) AS pending
+         FROM agents a WHERE a.session_id='$(sql_esc "$sid")'"
+
+    if [[ "$as_json" -eq 1 ]]; then
+        sql_json "$q;"
+        printf '\n'
+        return 0
+    fi
+
+    local row
+    row=$(sql_sep '|' "$q;")
+    [[ -n "$row" ]] || _die "info: no data for $sid"
+
+    local session_id alias harness project pane target state model push streak reg last pending
+    IFS='|' read -r session_id alias harness project pane target state model push streak reg last pending <<EOF
+$row
+EOF
+
+    printf 'session:    %s\n' "$session_id"
+    printf 'alias:      %s\n' "${alias:-(none)}"
+    printf 'harness:    %s\n' "$harness"
+    printf 'project:    %s\n' "${project:--}"
+    printf 'pane:       %s\n' "${target:-${pane:--}}"
+    printf 'state:      %s\n' "${state:-idle}"
+    printf 'model:      %s\n' "${model:--}"
+    printf 'push:       %s\n' "$([[ "$push" == "1" ]] && printf 'yes' || printf 'no')"
+    printf 'pending:    %s\n' "${pending:-0}"
+    printf 'block streak: %s / %s\n' "${streak:-0}" "${MAX_BLOCKS:-3}"
+    printf 'registered: %s\n' "$(_fmt_time "$reg" "%Y-%m-%d %H:%M:%S")"
+    printf 'last seen:  %s\n' "$(_fmt_time "$last" "%Y-%m-%d %H:%M:%S")"
+    printf 'host:       (local)\n'
+}
+
+# ── thread ───────────────────────────────────────────────────────────
+
+cmd_thread() {
+    local tid="" as_json=0 limit=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json) as_json=1 ;;
+            --limit) limit="${2:-}"; shift ;;
+            *)
+                if [[ -z "$tid" && "$1" != -* ]]; then tid="$1"
+                else _die "thread: unknown flag '$1'"; fi ;;
+        esac
+        shift
+    done
+    [[ -n "$tid" ]] || _die "thread: usage: thread <id> [--json] [--limit <n>]"
+
+    local q="SELECT m.id,
+                COALESCE(a.alias, substr(m.from_session,1,8)) AS from_name,
+                COALESCE(r.alias, substr(m.to_session,1,8)) AS to_name,
+                m.hops, m.created_at, m.body,
+                m.delivered_at, m.delivered_via, m.reply_to_id
+         FROM messages m
+         LEFT JOIN agents a ON a.session_id=m.from_session
+         LEFT JOIN agents r ON r.session_id=m.to_session
+         WHERE m.thread_id='$(sql_esc "$tid")'
+         ORDER BY m.id ASC"
+    [[ -n "$limit" ]] && q="$q LIMIT $limit"
+
+    if [[ "$as_json" -eq 1 ]]; then
+        sql_json "$q;"
+        printf '\n'
+        return 0
+    fi
+
+    local out
+    out=$(sql_sep '|' "$q;")
+    if [[ -z "$out" ]]; then
+        printf 'thread %s: no messages found\n' "$tid"
+        return 0
+    fi
+
+    printf 'thread %s\n' "$tid"
+    local id fname tname hops created body delivered_at delivered_via reply_to
+    while IFS='|' read -r id fname tname hops created body delivered_at delivered_via reply_to; do
+        [[ -z "$id" ]] && continue
+        local indent=""
+        local i
+        for ((i=0; i<hops; i++)); do indent="  $indent"; done
+        printf '%s#%-5s %-12s → %-12s  hop %s  %s\n' \
+            "$indent" "$id" "$fname" "$tname" "$hops" "$(_fmt_ago "$created")"
+        printf '%s      %s\n' "$indent" "$body"
+        if [[ -n "$delivered_at" ]]; then
+            printf '%s      `- read by %s %s\n' "$indent" "$tname" "$(_fmt_ago "$delivered_at")"
+        fi
+    done <<EOF
+$out
+EOF
+}
+
+# ── ping ─────────────────────────────────────────────────────────────
+
+cmd_ping() {
+    local ref="${1:-}" as_json=0
+    if [[ "$ref" == "--json" ]]; then
+        as_json=1; shift; ref="${1:-}"
+    fi
+    [[ -n "$ref" ]] || _die "ping: usage: ping [--json] <ref>"
+
+    local sid rc
+    set +e; sid=$(_resolve_ref "$ref"); rc=$?; set -e
+    [[ "$rc" -eq 2 ]] && exit 2
+    [[ -n "$sid" ]] || _die "ping: no agent matches '$ref'"
+
+    local q="SELECT session_id, turn_state, last_seen, model,
+                (SELECT COUNT(*) FROM messages m WHERE m.to_session=a.session_id AND m.delivered_at IS NULL) AS pending
+         FROM agents a WHERE a.session_id='$(sql_esc "$sid")'"
+
+    if [[ "$as_json" -eq 1 ]]; then
+        sql_json "$q;"
+        printf '\n'
+        return 0
+    fi
+
+    local row
+    row=$(sql_sep '|' "$q;")
+    [[ -n "$row" ]] || _die "ping: no data for $sid"
+
+    local s_id state last model pending
+    IFS='|' read -r s_id state last model pending <<EOF
+$row
+EOF
+
+    printf 'agent %s: state=%s last_seen=%s pending=%s model=%s\n' \
+        "$(_display_name "$sid")" "${state:-idle}" "$(_fmt_ago "$last")" "${pending:-0}" "${model:--}"
 }
 
 # ── dispatch ─────────────────────────────────────────────────────────
@@ -1915,6 +2210,11 @@ case "${1:-}" in
     reset-streak)   shift; cmd_reset_streak "$@" ;;
     recv)           shift; cmd_recv "$@" ;;
     watch)          shift; cmd_watch "$@" ;;
+    mark-read)      shift; cmd_mark_read "$@" ;;
+    history)        shift; cmd_history "$@" ;;
+    info)           shift; cmd_info "$@" ;;
+    thread)         shift; cmd_thread "$@" ;;
+    ping)           shift; cmd_ping "$@" ;;
     dispatch)       shift; cmd_dispatch "$@" ;;
     claim-dispatch) shift; cmd_claim_dispatch "$@" ;;
     menu)           shift; cmd_menu "$@" ;;
@@ -1950,9 +2250,14 @@ Messaging
   broadcast --message <t> [--project <p>] [--harness <h>]
   reply --to-message <id> --message <t>
   inbox [--as <ref>] [--json] [--follow]
-  recv --thread <id> [--wait] [--timeout <s>]
+  mark-read [--as <ref>] [--message-id <id>]
+  history [--as <ref>] [--thread <id>] [--from <ref>] [--since <iso>] [--limit <n>] [--json]
+  thread <id> [--json] [--limit <n>]
+  recv --thread <id> [--wait] [--timeout <s>] [--json]
   watch                            live view of all traffic
   drain --session <id> --via <mode> [--json]
+  ping <ref> [--json]              read registry directly, no message sent
+  info <ref> [--json]              single-agent detail view
 
 Spawning
   dispatch --task <t> [--harness <h>] [--alias <a>] [--worktree <branch>]
