@@ -156,7 +156,7 @@ Every CLI subcommand becomes a method. The server validates and executes.
 | Method | Params | Result | Notes |
 |---|---|---|---|
 | `roster` | `{}` | `[{session_id, harness, alias, host, project, state, push, pending, pane, model}]` | |
-| `agent` | `{ref}` | `{session_id, harness, alias, ...}` | Single agent detail |
+| `agent` | `{ref}` | `{session_id, harness, alias, model, host, project, state, push_capable, pending, pane, block_streak, cwd, transcript_path, last_seen}` | Single agent detail |
 | `send` | `{channel, body, [expect_reply], [thread]}` | `{id, thread}` | Caps enforced server-side |
 | `reply` | `{to_message, body}` | `{id, thread, hops}` | Validates sender is original recipient |
 | `pending` | `{}` | `[{id, channel, from, body, ...}]` | Read-only, does not claim |

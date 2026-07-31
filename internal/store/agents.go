@@ -9,19 +9,21 @@ import (
 )
 
 type Agent struct {
-	SessionID   string
-	Harness     string
-	Alias       string
-	Model       string
-	Host        string
-	TmuxPane    string
-	TmuxTarget  string
-	Cwd         string
-	Project     string
-	PushCapable bool
-	BlockStreak int
-	TurnState   string
-	Pending     int
+	SessionID      string
+	Harness        string
+	Alias          string
+	Model          string
+	Host           string
+	TmuxPane       string
+	TmuxTarget     string
+	Cwd            string
+	Project        string
+	PushCapable    bool
+	BlockStreak    int
+	TurnState      string
+	TranscriptPath string
+	LastSeen       int64
+	Pending        int
 }
 
 // Name is what a person should see: the alias if it has one, otherwise enough of
@@ -30,10 +32,7 @@ func (a Agent) Name() string {
 	if a.Alias != "" {
 		return a.Alias
 	}
-	if len(a.SessionID) > 8 {
-		return a.SessionID[:8]
-	}
-	return a.SessionID
+	return shortID(a.SessionID)
 }
 
 // Only pi can be reached while it is idle without typing into its pane, because
@@ -49,12 +48,29 @@ var aliasRe = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 // Register upserts an agent. A pane hosts at most one agent, so registering on a
 // known pane evicts the stale row: otherwise addressing by pane resolves to an
 // agent that is no longer there.
+//
+// An agent without an alias gets one: <harness>-<first 8 of the session id>,
+// so a roster is readable the moment agents show up. The alias is UNIQUE, so a
+// generated name that is already taken gets a counter suffix rather than
+// failing the registration; re-registering never replaces a name the agent
+// chose for itself.
 func (s *Store) Register(a Agent) error {
 	if a.SessionID == "" {
 		return errors.New("register: session id is required")
 	}
 	if !knownHarness[a.Harness] {
 		return fmt.Errorf("register: unknown harness %q", a.Harness)
+	}
+	explicit := a.Alias != ""
+	if explicit && !aliasRe.MatchString(a.Alias) {
+		return errors.New("alias must be alphanumeric, dash or underscore")
+	}
+	// The human row is seeded by name and keeps it.
+	auto := !explicit && a.Harness != "human" && a.SessionID != HumanID
+	base := ""
+	if auto {
+		base = fmt.Sprintf("%s-%s", a.Harness, shortID(a.SessionID))
+		a.Alias = base
 	}
 	return s.tx(func(tx *sql.Tx) error {
 		if a.TmuxPane != "" {
@@ -64,24 +80,47 @@ func (s *Store) Register(a Agent) error {
 				return err
 			}
 		}
-		_, err := tx.Exec(`
-			INSERT INTO agents (session_id, harness, model, host, tmux_pane, tmux_target,
-			                    cwd, project_name, push_capable, last_seen)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
-			ON CONFLICT(session_id) DO UPDATE SET
-				harness      = excluded.harness,
-				model        = COALESCE(NULLIF(excluded.model, ''), agents.model),
-				host         = excluded.host,
-				tmux_pane    = CASE WHEN excluded.tmux_pane <> '' THEN excluded.tmux_pane ELSE agents.tmux_pane END,
-				tmux_target  = CASE WHEN excluded.tmux_target <> '' THEN excluded.tmux_target ELSE agents.tmux_target END,
-				cwd          = excluded.cwd,
-				project_name = excluded.project_name,
-				push_capable = excluded.push_capable,
-				last_seen    = unixepoch()`,
-			a.SessionID, a.Harness, a.Model, a.Host, a.TmuxPane, a.TmuxTarget,
-			a.Cwd, a.Project, boolInt(pushCapable(a.Harness)))
-		return err
+		// INSERT OR IGNORE style: a UNIQUE alias collision costs the generated
+		// name, not the registration, so retry with a counter suffix. The loop
+		// terminates because every candidate is a fresh alias.
+		alias := a.Alias
+		for n := 2; ; n++ {
+			err := upsertAgent(tx, a, alias, explicit)
+			if err == nil {
+				return nil
+			}
+			if !auto || !strings.Contains(err.Error(), "UNIQUE") {
+				return err
+			}
+			alias = fmt.Sprintf("%s-%d", base, n)
+		}
 	})
+}
+
+// upsertAgent writes one agent row. The alias lands only when the caller
+// explicitly passed one, or when the row has none yet: a session that
+// re-registers without a name keeps the alias it already has.
+func upsertAgent(tx *sql.Tx, a Agent, alias string, explicit bool) error {
+	_, err := tx.Exec(`
+		INSERT INTO agents (session_id, harness, alias, model, host, tmux_pane, tmux_target,
+		                    cwd, project_name, push_capable, last_seen)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
+		ON CONFLICT(session_id) DO UPDATE SET
+			harness      = excluded.harness,
+			alias        = CASE
+			                 WHEN excluded.alias <> '' AND (? = 1 OR agents.alias IS NULL) THEN excluded.alias
+			                 ELSE agents.alias END,
+			model        = COALESCE(NULLIF(excluded.model, ''), agents.model),
+			host         = excluded.host,
+			tmux_pane    = CASE WHEN excluded.tmux_pane <> '' THEN excluded.tmux_pane ELSE agents.tmux_pane END,
+			tmux_target  = CASE WHEN excluded.tmux_target <> '' THEN excluded.tmux_target ELSE agents.tmux_target END,
+			cwd          = excluded.cwd,
+			project_name = excluded.project_name,
+			push_capable = excluded.push_capable,
+			last_seen    = unixepoch()`,
+		a.SessionID, a.Harness, alias, a.Model, a.Host, a.TmuxPane, a.TmuxTarget,
+		a.Cwd, a.Project, boolInt(pushCapable(a.Harness)), boolInt(explicit))
+	return err
 }
 
 func (s *Store) SetAlias(sessionID, alias string) error {
@@ -109,6 +148,37 @@ func (s *Store) SetAlias(sessionID, alias string) error {
 		return fmt.Errorf("%w: agent %s", ErrNotFound, sessionID)
 	}
 	return nil
+}
+
+// SetTranscript records the full path of the agent's conversation transcript,
+// reported by the agent itself so another agent or the human can open the
+// conversation later. Recording a path counts as activity.
+func (s *Store) SetTranscript(sessionID, path string) error {
+	if path == "" {
+		return errors.New("set-transcript: a path is required")
+	}
+	res, err := s.db.Exec(
+		`UPDATE agents SET transcript_path = ?, last_seen = unixepoch() WHERE session_id = ?`,
+		path, sessionID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("%w: agent %s", ErrNotFound, sessionID)
+	}
+	return nil
+}
+
+// Transcript returns the stored transcript path for an agent, "" when the
+// agent has not reported one.
+func (s *Store) Transcript(sessionID string) (string, error) {
+	var path string
+	err := s.db.QueryRow(
+		`SELECT transcript_path FROM agents WHERE session_id = ?`, sessionID).Scan(&path)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", fmt.Errorf("%w: agent %s", ErrNotFound, sessionID)
+	}
+	return path, err
 }
 
 func (s *Store) SetTurnState(sessionID, state string) error {
@@ -186,10 +256,12 @@ func (s *Store) Agent(sessionID string) (Agent, error) {
 	var alias, model sql.NullString
 	err := s.db.QueryRow(`
 		SELECT session_id, harness, alias, model, host, tmux_pane, tmux_target,
-		       cwd, project_name, push_capable, block_streak, turn_state
+		       cwd, project_name, push_capable, block_streak, turn_state,
+		       transcript_path, last_seen
 		  FROM agents WHERE session_id = ?`, sessionID).Scan(
 		&a.SessionID, &a.Harness, &alias, &model, &a.Host, &a.TmuxPane,
-		&a.TmuxTarget, &a.Cwd, &a.Project, &a.PushCapable, &a.BlockStreak, &a.TurnState)
+		&a.TmuxTarget, &a.Cwd, &a.Project, &a.PushCapable, &a.BlockStreak,
+		&a.TurnState, &a.TranscriptPath, &a.LastSeen)
 	if errors.Is(err, sql.ErrNoRows) {
 		return a, fmt.Errorf("%w: agent %s", ErrNotFound, sessionID)
 	}

@@ -127,6 +127,12 @@ func (s *Store) Send(p Post, caps Caps) (Message, error) {
 
 		msg = Message{ID: id, ChannelID: p.ChannelID, ThreadID: thread, From: p.From,
 			Body: p.Body, Hops: p.Hops, ExpectReply: p.ExpectReply, ReplyToID: p.ReplyToID}
+		// Sending is activity: the roster's liveness column has to move even for
+		// an agent that only talks and never turns.
+		if _, err := tx.Exec(
+			`UPDATE agents SET last_seen = unixepoch() WHERE session_id = ?`, p.From); err != nil {
+			return err
+		}
 		return nil
 	})
 	return msg, err
@@ -212,6 +218,12 @@ func (s *Store) Claim(sessionID, via string) ([]Message, error) {
 				m.ID, sessionID); err != nil {
 				return err
 			}
+		}
+		// Claiming mail is the strongest liveness signal a harness gives: the
+		// agent's context consumed the text just now.
+		if _, err := tx.Exec(
+			`UPDATE agents SET last_seen = unixepoch() WHERE session_id = ?`, sessionID); err != nil {
+			return err
 		}
 		out = claimed
 		return nil

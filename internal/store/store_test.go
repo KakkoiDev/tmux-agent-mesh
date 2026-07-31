@@ -1,7 +1,9 @@
 package store
 
 import (
+	"database/sql"
 	"errors"
+	"path/filepath"
 	"testing"
 )
 
@@ -124,6 +126,184 @@ func TestOnlyPiIsPushCapable(t *testing.T) {
 	}
 	if a, _ := s.Agent("c"); a.PushCapable {
 		t.Fatal("claude cannot be reached while idle without keystrokes")
+	}
+}
+
+// The agents table as it was before transcript_path existed. Opening such a
+// database must add the column and keep old rows readable.
+const v1AgentsSchema = `
+CREATE TABLE agents (
+    session_id    TEXT PRIMARY KEY,
+    harness       TEXT NOT NULL,
+    alias         TEXT UNIQUE,
+    model         TEXT,
+    host          TEXT NOT NULL DEFAULT '',
+    tmux_pane     TEXT NOT NULL DEFAULT '',
+    tmux_target   TEXT NOT NULL DEFAULT '',
+    cwd           TEXT NOT NULL DEFAULT '',
+    project_name  TEXT NOT NULL DEFAULT '',
+    push_capable  INTEGER NOT NULL DEFAULT 0,
+    block_streak  INTEGER NOT NULL DEFAULT 0,
+    turn_state    TEXT NOT NULL DEFAULT 'idle'
+        CHECK (turn_state IN ('idle', 'working')),
+    registered_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    last_seen     INTEGER NOT NULL DEFAULT (unixepoch())
+);`
+
+func TestRegisterAutoNamesAgents(t *testing.T) {
+	s := open(t)
+	if err := s.Register(Agent{SessionID: "019fb695aaaa", Harness: "pi"}); err != nil {
+		t.Fatal(err)
+	}
+	a, err := s.Agent("019fb695aaaa")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Alias != "pi-019fb695" {
+		t.Fatalf("auto alias: got %q, want pi-019fb695", a.Alias)
+	}
+	// The human row is seeded by name and registering as the human must not
+	// give it a generated one.
+	if err := s.Register(Agent{SessionID: HumanID, Harness: "human"}); err != nil {
+		t.Fatal(err)
+	}
+	if a, _ := s.Agent(HumanID); a.Alias != "human" {
+		t.Fatalf("the human alias should be untouched, got %q", a.Alias)
+	}
+}
+
+// The alias is UNIQUE, so two agents sharing a session-id prefix must get
+// distinct generated names instead of failing the second registration.
+func TestRegisterAutoAliasHandlesCollisions(t *testing.T) {
+	s := open(t)
+	for _, id := range []string{"019fb695aaaa", "019fb695bbbb"} {
+		if err := s.Register(Agent{SessionID: id, Harness: "pi"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first, _ := s.Agent("019fb695aaaa")
+	second, _ := s.Agent("019fb695bbbb")
+	if first.Alias != "pi-019fb695" {
+		t.Fatalf("first: got %q", first.Alias)
+	}
+	if second.Alias != "pi-019fb695-2" {
+		t.Fatalf("collision: got %q, want pi-019fb695-2", second.Alias)
+	}
+}
+
+func TestRegisterKeepsAnAliasTheAgentChose(t *testing.T) {
+	s := open(t)
+	if err := s.Register(Agent{SessionID: "019fb695aaaa", Harness: "pi", Alias: "builder"}); err != nil {
+		t.Fatal(err)
+	}
+	if a, _ := s.Agent("019fb695aaaa"); a.Alias != "builder" {
+		t.Fatalf("explicit alias: got %q", a.Alias)
+	}
+	// Re-registering without a name must not replace the chosen one.
+	if err := s.Register(Agent{SessionID: "019fb695aaaa", Harness: "pi"}); err != nil {
+		t.Fatal(err)
+	}
+	if a, _ := s.Agent("019fb695aaaa"); a.Alias != "builder" {
+		t.Fatalf("re-register should keep the alias, got %q", a.Alias)
+	}
+	// Re-registering with a new explicit name replaces it.
+	if err := s.Register(Agent{SessionID: "019fb695aaaa", Harness: "pi", Alias: "scout"}); err != nil {
+		t.Fatal(err)
+	}
+	if a, _ := s.Agent("019fb695aaaa"); a.Alias != "scout" {
+		t.Fatalf("an explicit alias should win, got %q", a.Alias)
+	}
+	if err := s.Register(Agent{SessionID: "bad", Harness: "pi", Alias: "bad name!"}); err == nil {
+		t.Fatal("a malformed explicit alias should be refused")
+	}
+}
+
+func TestTranscriptPathRoundTrips(t *testing.T) {
+	s := open(t)
+	register(t, s, "a", "claude", "", "")
+	if p, err := s.Transcript("a"); err != nil || p != "" {
+		t.Fatalf("no transcript yet: got %q %v", p, err)
+	}
+	const path = "/home/x/.claude/projects/slug/019fb695aaaa.jsonl"
+	if err := s.SetTranscript("a", path); err != nil {
+		t.Fatal(err)
+	}
+	if p, err := s.Transcript("a"); err != nil || p != path {
+		t.Fatalf("round trip: got %q %v", p, err)
+	}
+	if err := s.SetTranscript("ghost", "/tmp/x.jsonl"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unknown agent: got %v", err)
+	}
+	if err := s.SetTranscript("a", ""); err == nil {
+		t.Fatal("an empty path should be refused")
+	}
+}
+
+// A database created before transcript_path existed must gain the column on
+// Open, with the NOT NULL DEFAULT ” shape, and stay fully usable.
+func TestMigrationAddsTranscriptPath(t *testing.T) {
+	dir := t.TempDir()
+	v1, err := sql.Open("sqlite", filepath.Join(dir, "mesh.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := v1.Exec(v1AgentsSchema); err != nil {
+		t.Fatal(err)
+	}
+	if err := v1.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatalf("open migrated store: %v", err)
+	}
+	defer s.Close()
+
+	var count int
+	if err := s.db.QueryRow(`
+		SELECT COUNT(*) FROM pragma_table_info('agents')
+		 WHERE name = 'transcript_path'`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatal("transcript_path column missing after migration")
+	}
+	// And the column is usable end to end on the migrated database.
+	if err := s.Register(Agent{SessionID: "019fb695aaaa", Harness: "pi"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetTranscript("019fb695aaaa", "/x/a.jsonl"); err != nil {
+		t.Fatal(err)
+	}
+	if p, _ := s.Transcript("019fb695aaaa"); p != "/x/a.jsonl" {
+		t.Fatalf("got %q", p)
+	}
+}
+
+// unixepoch() is second-grained, so age the rows first: the movement has to be
+// observable no matter when the test runs.
+func TestSendAndClaimMoveLastSeen(t *testing.T) {
+	s := open(t)
+	register(t, s, "sender", "claude", "", "")
+	register(t, s, "reader", "pi", "", "")
+	ch := channelWith(t, s, "team", "sender", "reader")
+	if _, err := s.db.Exec(
+		`UPDATE agents SET last_seen = 1 WHERE session_id IN ('sender', 'reader')`); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.Send(Post{ChannelID: ch.ID, From: "sender", Body: "hi"}, DefaultCaps()); err != nil {
+		t.Fatal(err)
+	}
+	if a, _ := s.Agent("sender"); a.LastSeen <= 1 {
+		t.Fatalf("send should move last_seen, got %d", a.LastSeen)
+	}
+	if _, err := s.Claim("reader", "test"); err != nil {
+		t.Fatal(err)
+	}
+	if a, _ := s.Agent("reader"); a.LastSeen <= 1 {
+		t.Fatalf("claim should move last_seen, got %d", a.LastSeen)
 	}
 }
 

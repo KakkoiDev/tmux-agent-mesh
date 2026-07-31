@@ -32,6 +32,9 @@ CREATE TABLE IF NOT EXISTS agents (
     -- From this plugin's own turn hooks, not from scraping the pane.
     turn_state    TEXT NOT NULL DEFAULT 'idle'
         CHECK (turn_state IN ('idle', 'working')),
+    -- Full path to the agent's conversation transcript, so another agent or
+    -- the human can open an old conversation. Empty until the agent reports it.
+    transcript_path TEXT NOT NULL DEFAULT '',
     registered_at INTEGER NOT NULL DEFAULT (unixepoch()),
     last_seen     INTEGER NOT NULL DEFAULT (unixepoch())
 );
