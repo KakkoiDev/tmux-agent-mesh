@@ -320,6 +320,63 @@ func (s *Store) MarkRead(messageID int64, reader string) error {
 	return err
 }
 
+// UnreadCounts is how many messages in each of the viewer's channels they have
+// not left a read receipt on, keyed by channel id. Channels with nothing unread
+// are absent rather than zero.
+//
+// One grouped query rather than a receipt lookup per message: the sidebar draws
+// on every keystroke, and the count it used to show was the number of messages
+// nobody at all had read, in the open channel only.
+func (s *Store) UnreadCounts(viewer string) (map[int64]int, error) {
+	rows, err := s.db.Query(`
+		SELECT m.channel_id, COUNT(*)
+		  FROM messages m
+		  JOIN channel_members cm
+		    ON cm.channel_id = m.channel_id AND cm.session_id = ?
+		 WHERE m.from_session <> ?
+		   AND NOT EXISTS (SELECT 1 FROM reads r
+		                    WHERE r.message_id = m.id AND r.reader = ?)
+		 GROUP BY m.channel_id`, viewer, viewer, viewer)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[int64]int)
+	for rows.Next() {
+		var id int64
+		var n int
+		if err := rows.Scan(&id, &n); err != nil {
+			return nil, err
+		}
+		out[id] = n
+	}
+	return out, rows.Err()
+}
+
+// MarkChannelRead leaves a receipt on everything in a channel the reader has
+// not already read. For a person, displaying a message is reading it, and a
+// badge that never clears is worse than no badge.
+//
+// Own messages are excluded, the same way UnreadCounts excludes them.
+func (s *Store) MarkChannelRead(channelID int64, reader string) (int, error) {
+	if err := s.MayRead(channelID, reader); err != nil {
+		return 0, err
+	}
+	res, err := s.db.Exec(`
+		INSERT INTO reads (message_id, reader, source)
+		SELECT m.id, ?, 'client' FROM messages m
+		 WHERE m.channel_id = ?
+		   AND m.from_session <> ?
+		   AND NOT EXISTS (SELECT 1 FROM reads r
+		                    WHERE r.message_id = m.id AND r.reader = ?)`,
+		reader, channelID, reader, reader)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
+}
+
 func (s *Store) Receipts(messageID int64, viewer string) ([]Receipt, error) {
 	var channelID int64
 	err := s.db.QueryRow(`SELECT channel_id FROM messages WHERE id = ?`, messageID).

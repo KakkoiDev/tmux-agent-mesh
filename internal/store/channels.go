@@ -109,6 +109,26 @@ func (s *Store) AddRule(channelID int64, subject, value string) error {
 	return err
 }
 
+// RemoveRule drops one access rule.
+//
+// Removing the last rule reopens the channel to every member, because MayJoin
+// reads an empty rule set as "membership is the only gate". That is the same
+// state the channel was created in, so it is a widening and not a deletion of
+// history: callers that mean to lock a channel replace the rule rather than
+// removing it.
+func (s *Store) RemoveRule(channelID int64, subject, value string) error {
+	res, err := s.db.Exec(
+		`DELETE FROM channel_rules WHERE channel_id = ? AND subject = ? AND value = ?`,
+		channelID, subject, value)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("%w: no %s rule %q on channel %d", ErrNotFound, subject, value, channelID)
+	}
+	return nil
+}
+
 type Rule struct {
 	Subject string
 	Value   string
@@ -472,6 +492,20 @@ func (s *Store) RenameChannel(channelID int64, newName string) error {
 	}
 	res, err := s.db.Exec(
 		`UPDATE channels SET name = ? WHERE id = ? AND archived_at IS NULL`, newName, channelID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("%w: channel %d", ErrNotFound, channelID)
+	}
+	return nil
+}
+
+// SetChannelTopic sets the one-line topic shown in the channel header. An empty
+// topic clears it, which is why there is no non-empty check here.
+func (s *Store) SetChannelTopic(channelID int64, topic string) error {
+	res, err := s.db.Exec(
+		`UPDATE channels SET topic = ? WHERE id = ? AND archived_at IS NULL`, topic, channelID)
 	if err != nil {
 		return err
 	}

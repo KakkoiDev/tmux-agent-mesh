@@ -481,6 +481,172 @@ func TestChannelNameIsValidatedAndUnique(t *testing.T) {
 	}
 }
 
+func TestChannelTopicRoundTrips(t *testing.T) {
+	s := open(t)
+	register(t, s, "a", "claude", "", "")
+	ch, _ := s.CreateChannel("general", "channel", "public", "", "a")
+
+	if err := s.SetChannelTopic(ch.ID, "the release"); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.ChannelByName("general"); got.Topic != "the release" {
+		t.Fatalf("got topic %q", got.Topic)
+	}
+	// Clearing is what an empty topic means, not a refusal.
+	if err := s.SetChannelTopic(ch.ID, ""); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.ChannelByName("general"); got.Topic != "" {
+		t.Fatalf("topic should be cleared, got %q", got.Topic)
+	}
+	if err := s.SetChannelTopic(9999, "nope"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("a channel that does not exist should be not found, got %v", err)
+	}
+}
+
+func TestArchivedChannelTakesNoTopic(t *testing.T) {
+	s := open(t)
+	register(t, s, "a", "claude", "", "")
+	ch, _ := s.CreateChannel("gone", "channel", "public", "", "a")
+	if err := s.ArchiveChannel(ch.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetChannelTopic(ch.ID, "too late"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("an archived channel should be not found, got %v", err)
+	}
+}
+
+func TestRemoveRuleReopensTheChannel(t *testing.T) {
+	s := open(t)
+	register(t, s, "owner", "claude", "", "")
+	register(t, s, "cdx", "codex", "", "")
+	ch, _ := s.CreateChannel("sensitive", "channel", "private", "", "owner")
+	if err := s.AddRule(ch.ID, "harness", "claude"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MayJoin(ch.ID, "cdx"); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("codex matches no rule, got %v", err)
+	}
+
+	if err := s.RemoveRule(ch.ID, "harness", "claude"); err != nil {
+		t.Fatal(err)
+	}
+	if rules, _ := s.Rules(ch.ID); len(rules) != 0 {
+		t.Fatalf("rule should be gone, got %v", rules)
+	}
+	// An empty rule set is not a locked channel: MayJoin reads it as
+	// "membership is the only gate", which is what the channel was created as.
+	if err := s.MayJoin(ch.ID, "cdx"); err != nil {
+		t.Fatalf("with no rules left, membership is the only gate: %v", err)
+	}
+}
+
+func TestRemoveRuleThatIsNotThereIsNotFound(t *testing.T) {
+	s := open(t)
+	register(t, s, "owner", "claude", "", "")
+	ch, _ := s.CreateChannel("sensitive", "channel", "private", "", "owner")
+	s.AddRule(ch.ID, "harness", "claude")
+
+	if err := s.RemoveRule(ch.ID, "harness", "codex"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("removing a rule that was never added should be not found, got %v", err)
+	}
+	// And must not take the neighbouring rule with it.
+	if rules, _ := s.Rules(ch.ID); len(rules) != 1 {
+		t.Fatalf("the existing rule should survive, got %v", rules)
+	}
+}
+
+func TestUnreadCountsEveryChannelNotJustTheOpenOne(t *testing.T) {
+	s := open(t)
+	register(t, s, "human", "human", "", "")
+	register(t, s, "bot", "claude", "", "")
+	general, _ := s.CreateChannel("general", "channel", "public", "", "human")
+	backend, _ := s.CreateChannel("backend", "channel", "public", "", "human")
+	s.Join(general.ID, "bot")
+	s.Join(backend.ID, "bot")
+
+	for _, body := range []string{"one", "two"} {
+		if _, err := s.Send(Post{ChannelID: general.ID, From: "bot", Body: body}, DefaultCaps()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := s.Send(Post{ChannelID: backend.ID, From: "bot", Body: "three"}, DefaultCaps()); err != nil {
+		t.Fatal(err)
+	}
+	// Your own messages are not something you have to catch up on.
+	if _, err := s.Send(Post{ChannelID: general.ID, From: "human", Body: "mine"}, DefaultCaps()); err != nil {
+		t.Fatal(err)
+	}
+
+	counts, err := s.UnreadCounts("human")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if counts[general.ID] != 2 {
+		t.Fatalf("general should have 2 unread, got %d", counts[general.ID])
+	}
+	if counts[backend.ID] != 1 {
+		t.Fatalf("backend should have 1 unread, got %d", counts[backend.ID])
+	}
+}
+
+func TestUnreadCountsSkipChannelsYouAreNotIn(t *testing.T) {
+	s := open(t)
+	register(t, s, "human", "human", "", "")
+	register(t, s, "bot", "claude", "", "")
+	theirs, _ := s.CreateChannel("theirs", "channel", "public", "", "bot")
+	if _, err := s.Send(Post{ChannelID: theirs.ID, From: "bot", Body: "not for you"}, DefaultCaps()); err != nil {
+		t.Fatal(err)
+	}
+
+	counts, _ := s.UnreadCounts("human")
+	if n, ok := counts[theirs.ID]; ok {
+		t.Fatalf("a channel you are not a member of should be absent, got %d", n)
+	}
+}
+
+func TestMarkChannelReadClearsTheCount(t *testing.T) {
+	s := open(t)
+	register(t, s, "human", "human", "", "")
+	register(t, s, "bot", "claude", "", "")
+	ch, _ := s.CreateChannel("general", "channel", "public", "", "human")
+	s.Join(ch.ID, "bot")
+	s.Send(Post{ChannelID: ch.ID, From: "bot", Body: "one"}, DefaultCaps())
+	s.Send(Post{ChannelID: ch.ID, From: "bot", Body: "two"}, DefaultCaps())
+
+	n, err := s.MarkChannelRead(ch.ID, "human")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Fatalf("should have marked 2 messages, got %d", n)
+	}
+	if counts, _ := s.UnreadCounts("human"); counts[ch.ID] != 0 {
+		t.Fatalf("nothing should be unread, got %d", counts[ch.ID])
+	}
+
+	// Reading twice is not two reads, and the second pass has nothing to do.
+	if n, _ := s.MarkChannelRead(ch.ID, "human"); n != 0 {
+		t.Fatalf("a second pass should mark nothing, got %d", n)
+	}
+	s.Send(Post{ChannelID: ch.ID, From: "bot", Body: "three"}, DefaultCaps())
+	if counts, _ := s.UnreadCounts("human"); counts[ch.ID] != 1 {
+		t.Fatalf("a message that arrived after reading is unread, got %d", counts[ch.ID])
+	}
+}
+
+func TestMarkChannelReadRefusesAChannelYouCannotRead(t *testing.T) {
+	s := open(t)
+	register(t, s, "human", "human", "", "")
+	register(t, s, "bot", "claude", "", "")
+	ch, _ := s.CreateChannel("private", "channel", "private", "", "bot")
+	s.Send(Post{ChannelID: ch.ID, From: "bot", Body: "one"}, DefaultCaps())
+
+	if _, err := s.MarkChannelRead(ch.ID, "human"); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("should be forbidden, got %v", err)
+	}
+}
+
 func TestTurnStateRoundTrips(t *testing.T) {
 	s := open(t)
 	register(t, s, "a", "claude", "", "")
