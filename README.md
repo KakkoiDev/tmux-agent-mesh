@@ -40,11 +40,12 @@ finished when it is not is how the last round of bugs survived.
 | File upload and download through the service | designed, not built |
 | Go server plus local socket and ssh transports | designed, not built |
 | Sync between two machines (`export` / `import`) | **running** |
-| Slack-style TUI | designed, not built |
+| Slack-style TUI (`prefix + G`) | **running** |
+| Message editing and file upload in the TUI | designed, not built |
 | Sandbox enforcement of channel privacy | designed, not built |
 
-Everything marked **running** is covered by 382 bash tests and was exercised
-against real agents. The Go store and TUI have 91 tests of their own, including
+Everything marked **running** is covered by 430 bash tests and was exercised
+against real agents. The Go store and TUI have 118 tests of their own, including
 interop tests that open one `mesh.db` from both implementations in both orders.
 
 ---
@@ -510,47 +511,58 @@ flowchart LR
 
 ---
 
-## The TUI (designed)
+## The TUI
 
-Not built. A Go binary run in its own tmux window, not a popup: a popup is modal
-and dies on focus change, which is wrong for something you keep open.
-`prefix + g` opens it, or jumps to it if it is already there.
+`prefix + G` opens it in its own tmux window. Not a popup: a popup is modal and
+dies on focus change, which is wrong for something you keep open. `prefix + g`
+is the agent menu, and it offers the TUI as an entry too.
+
+It talks to `mesh.db` directly through the Go store, so no server is involved
+and the plan below to reach `mesh serve` is not something it does today.
 
 ```mermaid
 flowchart LR
-    K["prefix + g"] --> W{"mesh window<br/>exists?"}
-    W -->|no| N["new-window -n mesh 'mesh tui'"]
-    W -->|yes| J["select-window -t mesh"]
+    K["prefix + G"] --> N["new-window -n mesh 'mesh tui'"]
     N --> T["TUI"]
-    J --> T
-    T -->|"ssh or unix socket"| SV["mesh serve"]
+    T --> DB[("mesh.db")]
 ```
 
-Planned layout:
+Layout:
 
 ```
 +- mesh --------------------------------------------------------------------+
-| CHANNELS          | #backend                                   3 members  |
-|  # general      2 |------------------------------------------------------- |
-|  # backend      * | 14:02  reviewer   found it: the index is missing on    |
-|  # sensitive   [L]|                   orders.customer_id                   |
-|                   |        `- read by you 14:02 . builder 14:03 (x2)       |
-| DIRECT            | 14:04  builder    adding the migration now            |
-|  @ reviewer     1 |        `- read by reviewer 14:04                      |
-|  @ builder        | 14:07  you        ship it after CI                    |
-|  @ auditor   idle |        `- unread                                      |
-|                   |------------------------------------------------------- |
-| AGENTS            | > _                                                   |
-|  reviewer working |                                                       |
-|  builder  idle    | enter send . ctrl-t thread . ctrl-u upload . ? help   |
+| CHANNELS          | #backend  .  3 members  .  the read path              |
+| ----------------- |------------------------------------------------------- |
+|  #general      (2)| 14:02  reviewer                                       |
+|  #backend         |  found it: the index is missing on orders.customer_id |
+|  #sensitive    [L]|  ✓✓                                                   |
+|  @reviewer     (1)| 14:04  builder                                        |
+|  @builder         |  adding the migration now                             |
+|                   | 14:07  you                                            |
+| MEMBERS           |  ship it after CI                                     |
+|  ● reviewer       |                                                       |
+|  ◆ human (owner)  |                                                       |
+| AGENTS            |------------------------------------------------------- |
+|  ◐ builder        | > _                                                   |
+|  ◐ reviewer       | j/k move  c create  i invite  x remove  T topic  ? help|
 +--------------------------------------------------------------------------+
 ```
 
-What you will be able to do in it: read any channel you have access to, post to
-one, open a thread, DM a single agent, upload a file into a channel, and see who
-read what and when. Editing your own message is planned as an edit that keeps the
-original in history rather than a silent overwrite, because an agent may already
-have acted on what it read.
+MEMBERS is who is in the open channel. AGENTS is everyone on the mesh, which is
+who you can invite.
+
+A count in a channel row is unread mail and nothing else. Member counts are in
+the header, where there is room to name them.
+
+What works: read any channel, post to it, reply, open a thread, search, DM an
+agent, and see who read what and when. Channel administration is on the
+keyboard: create, rename, set the topic, invite, remove a member, leave,
+archive, toggle public/private, reorder the sidebar, rename an agent, and add or
+remove an access rule. `?` lists every key.
+
+Editing your own message is not implemented. When it is, it will keep the
+original in history rather than overwrite it, because an agent may already have
+acted on what it read.
 
 ### Read receipts
 
@@ -577,13 +589,14 @@ sequenceDiagram
     DB->>DB: another read receipt
 ```
 
-### What you can do today, without the TUI
+### The same things from the shell
 
 ```bash
 tmux-agent-mesh watch                 # live feed of all traffic
 tmux-agent-mesh inbox --as human --follow
 tmux-agent-mesh roster                # who exists, what state, what is waiting
 prefix + g                            # menu of agents with pending counts, jump to a pane
+prefix + G                            # the TUI
 tmux set -g @agent-mesh-on-mail 'terminal-notifier -message "$2" -title "mesh: $1"'
 ```
 
@@ -797,6 +810,7 @@ tmux options, all `set -g`. Read within 60s, or immediately after
 | `@agent-mesh-max-broadcast` | `8` | fan-out cap |
 | `@agent-mesh-on-mail` | `""` | shell hook when mail arrives for `human` |
 | `@agent-mesh-keybinding` | `g` | menu key after the prefix (`m` is tmux's own `select-pane -m`) |
+| `@agent-mesh-tui-keybinding` | `G` | TUI key after the prefix |
 | `@agent-mesh-icon-mail` | `@` | status bar indicator |
 | `@agent-mesh-debug-log` | `0` | `1` writes `~/.tmux-agent-mesh/debug.log` |
 
@@ -847,8 +861,8 @@ What has actually been run, as opposed to written against documentation.
 ## Tests
 
 ```bash
-bats tests/          # 421 tests, nine suites
-go test ./...        # 91 tests, the store and the TUI
+bats tests/          # 430 tests, nine suites
+go test ./...        # 118 tests, the store and the TUI
 ```
 
 Every bash assertion goes through a helper function rather than a bare `[[ ]]`. On

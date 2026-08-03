@@ -137,7 +137,7 @@ which machine did what, when. The audit trail covers the entire fleet.
 | Read receipts + delivery status | ✅ Built |
 | FTS5 full-text search | ✅ Built |
 | Quota reporting | 🔧 pi-async-rewake has quota awareness |
-| Network layer | ❌ Not started |
+| Network layer (`export` / `import` over ssh) | ✅ Built |
 | Work delegation protocol | ❌ Not started |
 | Cross-machine file transfer | ❌ Not started |
 | Agent heartbeat / liveness | ❌ Not started |

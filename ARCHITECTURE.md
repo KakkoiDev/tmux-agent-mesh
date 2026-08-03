@@ -281,6 +281,10 @@ state, mesh rows are messages, so dropping them needs the explicit `--reset`.
 | `agent-mesh.tmux` | TPM entry: DB init, CLI symlink, skill sync, Pi extension link, keybind, teardown-hook cleanup |
 | `scripts/mesh.sh` | every command, single dispatcher |
 | `scripts/helpers.sh` | tmux option access, 60s config cache, version check |
+| `scripts/mesh-tui.sh` | resolves and runs the TUI binary, or says how to build it |
+| `cmd/mesh` | the Go binary: `serve`, `serve-stdio`, `tui` |
+| `internal/store` | the Go store: the same `mesh.db`, the same schema |
+| `internal/tui` | the Bubble Tea TUI: sidebar, feed, compose, picker, prompt |
 | `pi-extension/index.ts` | resident watcher and the push channel |
 | `install.sh` / `uninstall.sh` | opt-in per-harness wiring, symlink-safe |
 | `tests/mesh.bats` | registry, addressing, cleanup |
@@ -297,7 +301,7 @@ state, mesh rows are messages, so dropping them needs the explicit `--reset`.
 bats tests/
 ```
 
-421 tests. Every assertion goes through a helper function, never a bare `[[ ]]`
+430 tests. Every assertion goes through a helper function, never a bare `[[ ]]`
 or `! cmd`: bash 3.2 is the system bash on macOS and the one this suite runs
 under, and it trips neither `set -e` nor the `ERR` trap for either of those when
 they are not the last statement of a function. About a third of the assertions
