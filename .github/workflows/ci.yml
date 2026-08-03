@@ -41,8 +41,11 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install bats
-        run: brew install bats-core
+      # tmux too: tests/tmux.bats starts a server on a private socket, and the
+      # GitHub macOS image does not ship one, so every one of those tests failed
+      # in start_test_tmux while the Linux job passed them.
+      - name: Install bats and tmux
+        run: brew install bats-core tmux
       # Pin the interpreter, do not merely print it. `bats` on macOS resolves to
       # whichever bash is first on PATH, and brew's bash 5 often is, which
       # silently stops exercising the one tier this job exists for.

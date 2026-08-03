@@ -1478,7 +1478,8 @@ cmd_history() {
         sid=$(_self_session "")
     fi
 
-    local where="(m.from_session='$(sql_esc "$sid")' OR m.to_session='$(sql_esc "$sid")')"
+    local where
+    where="(m.from_session='$(sql_esc "$sid")' OR m.to_session='$(sql_esc "$sid")')"
     [[ -n "$thread" ]] && where="$where AND m.thread_id='$(sql_esc "$thread")'"
     if [[ -n "$from" ]]; then
         local from_sid frc
@@ -1544,7 +1545,8 @@ cmd_info() {
     [[ "$rc" -eq 2 ]] && exit 2
     [[ -n "$sid" ]] || _die "info: no agent matches '$ref'"
 
-    local q="SELECT a.session_id, a.alias, a.harness, a.project_name,
+    local q
+    q="SELECT a.session_id, a.alias, a.harness, a.project_name,
                 a.tmux_pane, a.tmux_target, a.turn_state, a.model,
                 a.push_capable, a.block_streak, a.registered_at, a.last_seen,
                 (SELECT COUNT(*) FROM messages m WHERE m.to_session=a.session_id AND m.delivered_at IS NULL) AS pending
@@ -1596,7 +1598,8 @@ cmd_thread() {
     done
     [[ -n "$tid" ]] || _die "thread: usage: thread <id> [--json] [--limit <n>]"
 
-    local q="SELECT m.id,
+    local q
+    q="SELECT m.id,
                 COALESCE(a.alias, substr(m.from_session,1,8)) AS from_name,
                 COALESCE(r.alias, substr(m.to_session,1,8)) AS to_name,
                 m.hops, m.created_at, m.body,
@@ -1653,7 +1656,8 @@ cmd_ping() {
     [[ "$rc" -eq 2 ]] && exit 2
     [[ -n "$sid" ]] || _die "ping: no agent matches '$ref'"
 
-    local q="SELECT session_id, turn_state, last_seen, model,
+    local q
+    q="SELECT session_id, turn_state, last_seen, model,
                 (SELECT COUNT(*) FROM messages m WHERE m.to_session=a.session_id AND m.delivered_at IS NULL) AS pending
          FROM agents a WHERE a.session_id='$(sql_esc "$sid")'"
 
@@ -1667,8 +1671,8 @@ cmd_ping() {
     row=$(sql_sep '|' "$q;")
     [[ -n "$row" ]] || _die "ping: no data for $sid"
 
-    local s_id state last model pending
-    IFS='|' read -r s_id state last model pending <<EOF
+    local state last model pending
+    IFS='|' read -r _ state last model pending <<EOF
 $row
 EOF
 
@@ -2020,7 +2024,8 @@ cmd_search() {
     done
     [[ -n "$query" ]] || _die "search: query is required"
 
-    local where="m.body LIKE '%$(sql_esc "$query")%'"
+    local where
+    where="m.body LIKE '%$(sql_esc "$query")%'"
     [[ -n "$channel" ]] && where="$where AND c.name='$(sql_esc "$channel")'"
     if [[ -n "$from" ]]; then
         local from_sid frc
@@ -2061,8 +2066,8 @@ cmd_search() {
     fi
 
     printf 'search: %s\n' "$query"
-    local id tid fname tname ch created snippet
-    while IFS='|' read -r id tid fname tname ch created snippet; do
+    local id tid fname tname created snippet
+    while IFS='|' read -r id tid fname tname _ created snippet; do
         [[ -z "$id" ]] && continue
         printf '#%-5s %-12s → %-12s  %s  %s\n' \
             "$id" "$fname" "$tname" "$(_fmt_ago "$created")" "$snippet"
