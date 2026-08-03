@@ -565,7 +565,9 @@ cmd_init() {
     # dropped. Children first: with foreign_keys on, dropping a parent whose
     # child rows are still there is an error rather than a silent orphan.
     if [[ "$reset" -eq 1 ]]; then
-        sqlite3 "$DB" <<'SQL'
+        # Silenced: a PRAGMA prints its new setting, so --reset put "wal" and
+        # "100" on stdout ahead of the result and --json stopped parsing.
+        sqlite3 "$DB" >/dev/null <<'SQL'
 PRAGMA journal_mode=WAL;
 PRAGMA busy_timeout=100;
 DROP TABLE IF EXISTS file_access;

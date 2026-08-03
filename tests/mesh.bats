@@ -42,6 +42,15 @@ teardown() {
     assert_eq "$(get_alias human)" "human"
 }
 
+# A PRAGMA prints its new setting, so the reset block put "wal" and "100" on
+# stdout ahead of the result object.
+@test "init --reset --json is one object and nothing else" {
+    run "$MESH_BIN" init --reset --json
+    assert_ok
+    assert_eq "$(printf '%s' "$output" | jq -r '.ok')" "true"
+    assert_eq "$(printf '%s\n' "$output" | wc -l | tr -d ' ')" "1"
+}
+
 @test "init rejects unknown flags" {
     run "$MESH_BIN" init --bogus
     assert_fail
