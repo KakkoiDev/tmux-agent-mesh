@@ -5,12 +5,14 @@ dependencies, not preference.
 
 ## Where it stands
 
-Running: peer messaging, delivery into a working agent's turn for Claude, Codex
-and Gemini, idle wake for Pi, `dispatch`, the five brakes, the untrusted-peer
-envelope, the tmux menu and status bar. 318 bash tests.
+Running: peer messaging on the channel model, delivery into a working agent's
+turn for Claude, Codex and Gemini, idle wake for Pi, `dispatch`, the four brakes,
+the untrusted-peer envelope, the tmux menu and status bar, content-addressed
+message ids, and `--json` with a structured exit-code table. 382 bash tests.
 
-Built and not wired: the Go store. Channels, membership, private channels, access
-rules, per-recipient delivery, append-only read receipts. 36 Go tests.
+Wired: the Go store runs on the same schema as bash, generated from
+`internal/store/schema.sql`, with interop tests that open one `mesh.db` from both
+implementations in both orders. 91 Go tests.
 
 ## 1. Server and the two transports
 

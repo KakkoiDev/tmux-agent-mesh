@@ -66,9 +66,14 @@ Consequences of putting the seam there:
 ```sql
 BEGIN IMMEDIATE;
 CREATE TEMP TABLE _claim AS
-    SELECT id FROM messages WHERE to_session=? AND delivered_at IS NULL;
-UPDATE messages SET delivered_at=unixepoch(), delivered_via=?
-    WHERE id IN (SELECT id FROM _claim);
+    SELECT m.id FROM messages m
+      JOIN channel_members cm ON cm.channel_id=m.channel_id AND cm.session_id=?
+     WHERE m.from_session<>?
+       AND NOT EXISTS (SELECT 1 FROM deliveries d
+                        WHERE d.message_id=m.id AND d.session_id=?);
+INSERT OR IGNORE INTO deliveries (message_id, session_id, delivered_via)
+    SELECT id, ?, ? FROM _claim;
+INSERT INTO reads (message_id, reader, source) SELECT id, ?, 'drain' FROM _claim;
 SELECT ... FROM messages JOIN _claim ...;
 COMMIT;
 ```
@@ -78,10 +83,15 @@ message. `RETURNING` would be shorter but needs sqlite 3.35+, which would raise
 the floor past Debian 11 for no benefit. Covered by a test that runs two drains
 in parallel against eight messages and asserts none is duplicated or lost.
 
-Delivery is **at-most-once**. `delivered_at` is stamped at claim time, so if a
-harness discards the payload the message leaves the mailbox. Every delivery is
-appended to `delivery.log` first, so nothing is unrecoverable. An
-acknowledgement protocol would need a signal no harness provides, and a
+Pending is the **absence of a `deliveries` row**, not a column on the message.
+That is what makes one message deliverable to several recipients independently:
+the same row is pending for everyone who has not claimed it. It also leaves the
+door open to redelivery later, since nothing about the message row is mutated.
+
+Delivery is still **at-most-once** today: the claim is written before the
+payload leaves, so a harness that discards it does not get the message again.
+Every delivery is appended to `delivery.log` first, so nothing is unrecoverable.
+An acknowledgement protocol would need a signal no harness provides, and a
 redelivery loop is worse than an audit log.
 
 ## Harness matrix
@@ -144,9 +154,10 @@ harness can bypass them:
 | Consecutive auto-continuations | `@agent-mesh-max-blocks` | `3` | unattended token burn |
 | Fan-out | `@agent-mesh-max-broadcast` | `8` | waking every pane at once; also caps `send --channel` |
 
-Refusals are non-zero with a one-line reason on stderr, so the calling agent can
-read why rather than retrying. An oversized broadcast sends to **nobody** rather
-than the first N: a silent truncation reads as full coverage.
+Refusals exit **4**, with a one-line reason on stderr, so the calling agent can
+tell a cap from a malformed command without reading the message. An oversized
+broadcast sends to **nobody** rather than the first N: a silent truncation reads
+as full coverage.
 
 When the continuation budget is exhausted mesh stops forcing turns but does not
 drop the mail. It waits for the next human prompt, where `next-prompt` or
@@ -200,6 +211,15 @@ whatever Codex and Gemini report. `human` is reserved and seeded at `init`.
 A reference resolves in this order: alias, exact session id, `%pane`,
 `session:window.pane`, then an unambiguous session-id prefix. Ambiguity is an
 error (exit 2), never a guess.
+
+Exit 2 is one row of a table the CLI keeps stable so a caller can branch on the
+code rather than on the message: 0 ok, 1 usage, 2 ambiguous reference, 3 not
+found, 4 refused by a cap or the kill switch, 5 conflict. 4 is deliberately not
+1: a refusal means retrying will fail the same way, while a usage error means
+the command can be fixed. With `--json` the result is one object on stdout and
+an error is one object on stderr, split that way because several of these fire
+inside a command substitution where an error written to stdout is captured by
+the caller instead of shown.
 
 Prefix matching uses `substr`, not `LIKE`. `_` and `%` are `LIKE` wildcards, so
 `--to abc_` would otherwise also match `abcXdef`.
@@ -277,7 +297,7 @@ state, mesh rows are messages, so dropping them needs the explicit `--reset`.
 bats tests/
 ```
 
-318 tests. Every assertion goes through a helper function, never a bare `[[ ]]`
+382 tests. Every assertion goes through a helper function, never a bare `[[ ]]`
 or `! cmd`: bash 3.2 is the system bash on macOS and the one this suite runs
 under, and it trips neither `set -e` nor the `ERR` trap for either of those when
 they are not the last statement of a function. About a third of the assertions

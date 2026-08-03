@@ -1,5 +1,10 @@
 # slk → tmux-agent-mesh Integration Plan
 
+> **Superseded 2026-08-03.** The TUI is ROADMAP step 6 and is not being built
+> from a slk fork. The mesh half this plan assumed has since changed underneath
+> it: `messages` is on the channel model with append-only deliveries and reads.
+> Kept for the feature comparison, not as a work list.
+
 **Captain's directive:** Adapt slk's TUI (Bubble Tea v2 + Lipgloss v2, Tokyo Night theme, vim navigation) to use our mesh database instead of Slack's API. Keep the multi-agent + human interaction model. Complete all missing features.
 
 **Date:** 2026-07-31

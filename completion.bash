@@ -23,8 +23,10 @@ _tmux_agent_mesh_completion() {
     local cmd="${words[1]}"
 
     case "$cmd" in
-        roster|inbox|recv|history|info|ping|channel)
-            # Subcommands that take --json.
+        # history, info, ping and channel used to be listed here too, which made
+        # their own arms below unreachable: the first matching pattern wins, so
+        # `channel create <TAB>` never saw the channel arm at all.
+        roster|inbox|recv)
             case "$prev" in
                 --as|--from|--to)
                     # Complete agent names.
@@ -55,11 +57,15 @@ _tmux_agent_mesh_completion() {
                     return
                     ;;
             esac
-            COMPREPLY=($(compgen -W "--to --message --expect-reply --thread --from --remote" -- "$cur"))
+            COMPREPLY=($(compgen -W "--to --channel --message --expect-reply --thread --from --remote --json" -- "$cur"))
             return
             ;;
         reply)
-            COMPREPLY=($(compgen -W "--to-message --message --from" -- "$cur"))
+            COMPREPLY=($(compgen -W "--to-message --message --from --json" -- "$cur"))
+            return
+            ;;
+        broadcast)
+            COMPREPLY=($(compgen -W "--message --project --harness --from --json" -- "$cur"))
             return
             ;;
         drain)
@@ -67,15 +73,31 @@ _tmux_agent_mesh_completion() {
             return
             ;;
         mark-read)
-            COMPREPLY=($(compgen -W "--as --message-id" -- "$cur"))
+            COMPREPLY=($(compgen -W "--as --message-id --json" -- "$cur"))
             return
             ;;
         history)
+            case "$prev" in
+                --as|--from)
+                    local agents
+                    agents=$(sqlite3 "$HOME/.tmux-agent-mesh/mesh.db" \
+                        "SELECT COALESCE(alias, session_id) FROM agents;" 2>/dev/null || true)
+                    COMPREPLY=($(compgen -W "$agents" -- "$cur"))
+                    return
+                    ;;
+                --channel)
+                    local channels
+                    channels=$(sqlite3 "$HOME/.tmux-agent-mesh/mesh.db" \
+                        "SELECT name FROM channels WHERE archived_at IS NULL;" 2>/dev/null || true)
+                    COMPREPLY=($(compgen -W "$channels" -- "$cur"))
+                    return
+                    ;;
+            esac
             COMPREPLY=($(compgen -W "--as --channel --thread --from --since --limit --json" -- "$cur"))
             return
             ;;
         dispatch)
-            COMPREPLY=($(compgen -W "--task --harness --alias --worktree --cwd --from --env --window" -- "$cur"))
+            COMPREPLY=($(compgen -W "--task --harness --alias --worktree --cwd --from --env --window --json" -- "$cur"))
             return
             ;;
         channel)
@@ -95,21 +117,25 @@ _tmux_agent_mesh_completion() {
                             return
                             ;;
                     esac
-                    COMPREPLY=($(compgen -W "--as" -- "$cur"))
+                    COMPREPLY=($(compgen -W "--as --json" -- "$cur"))
                     ;;
                 create)
-                    COMPREPLY=($(compgen -W "--private --description" -- "$cur"))
+                    COMPREPLY=($(compgen -W "--private --description --json" -- "$cur"))
                     ;;
                 rule)
                     COMPREPLY=($(compgen -W "--harness --model --remove list" -- "$cur"))
                     ;;
-                list)
+                list|members|archive)
                     COMPREPLY=($(compgen -W "--json" -- "$cur"))
                     ;;
             esac
             return
             ;;
         dm)
+            if [[ "$cur" == -* ]]; then
+                COMPREPLY=($(compgen -W "--json" -- "$cur"))
+                return
+            fi
             local agents
             agents=$(sqlite3 "$HOME/.tmux-agent-mesh/mesh.db" \
                 "SELECT COALESCE(alias, session_id) FROM agents;" 2>/dev/null || true)

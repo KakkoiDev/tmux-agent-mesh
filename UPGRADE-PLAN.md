@@ -1,5 +1,13 @@
 # Upgrade Plan
 
+> **Superseded 2026-08-03.** The schema half of this document is done and
+> landed differently from what it proposed: `messages` is on the channel model,
+> delivery and reads are append-only rows, every message carries a content
+> address, `max-thread-msgs` is gone, and every command takes `--json` with a
+> structured exit-code table. Read ARCHITECTURE.md and ROADMAP.md for what runs;
+> this file is kept for the reasoning behind the gaps it found, not as a
+> work list.
+
 > Audit of every gap between what mesh ships today and what it takes to be a
 > first-class communication layer for humans and agents. Written from the
 > outside in: human UX first, then agent API, then internals.

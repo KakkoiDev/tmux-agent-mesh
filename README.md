@@ -32,16 +32,19 @@ finished when it is not is how the last round of bugs survived.
 | Spawning an agent for a subtask (`dispatch`) | **running**, observed live |
 | Loop brakes, untrusted-peer envelope, audit log | **running** |
 | tmux menu, status bar, live traffic view | **running** |
-| Channels, membership, private channels, access rules | store built, not wired |
-| Read receipts, per-recipient delivery | store built, not wired |
+| Channels, membership, private channels, access rules | **running** |
+| Read receipts, per-recipient delivery | **running** |
+| Content-addressed message ids | **running** |
+| `--json` and a structured exit-code table on every command | **running** |
 | Waking an idle Claude, Codex or Gemini agent | designed, not built |
 | File upload and download through the service | designed, not built |
 | Go server plus local socket and ssh transports | designed, not built |
 | Slack-style TUI | designed, not built |
 | Sandbox enforcement of channel privacy | designed, not built |
 
-Everything marked **running** is covered by 318 bash tests and was exercised
-against real agents. The Go store has 36 tests of its own.
+Everything marked **running** is covered by 382 bash tests and was exercised
+against real agents. The Go store and TUI have 91 tests of their own, including
+interop tests that open one `mesh.db` from both implementations in both orders.
 
 ---
 
@@ -338,6 +341,36 @@ session-id prefix. Ambiguity is an error, never a guess. Prefix matching uses
 `--expect-reply` marks the message so the receiver can tell whether you are
 blocked on an answer or just passing information along.
 
+### Machine-readable output
+
+`--json` on any command replaces the sentence with one object. The result goes
+to stdout, an error goes to stderr, and the exit code says which one to read, so
+a caller branches on the code without parsing the message.
+
+```bash
+$ tmux-agent-mesh send --to reviewer --message "which branch?" --json
+{"ok":true,"message_id":42,"to":"reviewer","thread":"t-1785732403-66109","channel_id":2}
+
+$ tmux-agent-mesh send --to nobody --message x --json; echo "rc=$?"
+{"ok":false,"error":"send: no agent matches 'nobody' (try: tmux-agent-mesh roster)","code":3}
+rc=3
+```
+
+| Code | Meaning |
+|---|---|
+| 0 | ok |
+| 1 | usage: a missing, unknown or malformed argument |
+| 2 | ambiguous reference: more than one agent matches |
+| 3 | not found: no such agent, channel, thread or message |
+| 4 | refused: a cap, the kill switch or channel membership stopped it |
+| 5 | conflict: the name is already taken |
+
+4 is separate from 1 because retrying is pointless and rewording will not help.
+2 is separate from 3 because the caller has to disambiguate rather than create.
+
+Accepted by every command except `watch`, `menu`, `goto`, `status-bar`,
+`doctor`, `selftest`, `completion`, `hook` and `pi-deliver`.
+
 **Local privacy is advisory.** An agent with a shell tool runs as your uid and can
 read `mesh.db` directly, so it can see any channel. Fixing that needs the
 [enforcement boundary](#enforcement-what-actually-stops-an-agent), which is not
@@ -523,12 +556,18 @@ tmux set -g @agent-mesh-on-mail 'terminal-notifier -message "$2" -title "mesh: $
 
 ---
 
-## Channels and recipients (store built, not wired)
+## Channels and recipients
 
-The Go store models one recipient mechanism rather than four. A message is posted
-to a channel and every member is a recipient, so a DM, a named group, a public
-room and "everyone" are the same object with different membership. That is what
-makes receipts, file scoping and access rules one implementation each.
+One recipient mechanism rather than four. A message is posted to a channel and
+every member is a recipient, so a DM, a named group, a public room and
+"everyone" are the same object with different membership. That is what makes
+receipts, file scoping and access rules one implementation each. A DM is a
+two-member channel named `dm:<id>:<id>`, ordered so either direction names the
+same row.
+
+Both implementations run on this schema: `internal/store/schema.sql` is the
+source and `scripts/gen-schema.sh` generates bash's copy from it, with
+`--check` in CI failing on drift.
 
 ```mermaid
 erDiagram
@@ -775,8 +814,8 @@ What has actually been run, as opposed to written against documentation.
 ## Tests
 
 ```bash
-bats tests/          # 318 tests, seven suites
-go test ./...        # 36 tests, the store
+bats tests/          # 382 tests, eight suites
+go test ./...        # 91 tests, the store and the TUI
 ```
 
 Every bash assertion goes through a helper function rather than a bare `[[ ]]`. On

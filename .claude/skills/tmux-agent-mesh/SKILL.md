@@ -26,6 +26,36 @@ unambiguous session-id prefix. An ambiguous reference is an error, never a guess
 
 Give yourself a name once so peers can address you: `tmux-agent-mesh name reviewer`.
 
+## Parsing the output
+
+Add `--json` to any command and you get one object instead of a sentence. The
+result goes to **stdout**, an error goes to **stderr**, and the exit code tells
+you which one to read:
+
+| Code | Meaning | What to do |
+|---|---|---|
+| 0 | ok | read stdout |
+| 1 | usage: a missing or malformed argument | fix the command |
+| 2 | ambiguous reference | disambiguate; do not guess |
+| 3 | not found | check `roster` or `channel list` |
+| 4 | refused by a cap, the kill switch, or membership | stop; retrying will not help |
+| 5 | conflict: the name is already taken | pick another name |
+
+```bash
+out=$(tmux-agent-mesh send --to reviewer --message "..." --json) || exit $?
+id=$(printf '%s' "$out" | jq -r .message_id)
+```
+
+Every result carries `"ok": true`; every error is `{"ok":false,"error":"...","code":N}`.
+`send` and `reply` return `message_id`, `to`, `thread` and `channel_id`;
+`broadcast` returns `recipients`; `mark-read` returns `count`; `channel create`,
+`join`, `leave` and `dm` return `channel_id` and `channel`. The read commands
+(`inbox`, `history`, `thread`, `search`, `roster`, `channel list`, `channel
+members`) return an array of rows.
+
+`--json` is accepted everywhere except `watch`, `menu`, `goto`, `status-bar`,
+`doctor`, `selftest`, `completion`, `hook` and `pi-deliver`.
+
 ## Channels and threads
 
 A direct message is a channel with two members, so `--to` and `--channel` reach
@@ -78,15 +108,15 @@ and need an answer soon, `dispatch` a fresh agent instead, or ask the human.
 
 ## Limits worth knowing
 
-Mesh stops runaway conversations on purpose. A send fails, with the reason on
-stderr, when it would exceed the hop limit (default 4), the per-thread message
-limit (default 12), or the broadcast fan-out cap (default 8, which refuses rather
-than truncating). Auto-continuations per agent are capped (default 3) so two
-agents cannot ping-pong forever without a human; mail held by that cap is
-delivered on the next human prompt rather than lost.
+Mesh stops runaway conversations on purpose. A send fails with exit 4, and the
+reason on stderr, when it would exceed the hop limit (default 4) or the fan-out
+cap (default 8, which refuses rather than truncating). Auto-continuations per
+agent are capped (default 3) so two agents cannot ping-pong forever without a
+human; mail held by that cap is delivered on the next human prompt rather than
+lost. There is no per-thread message cap: a long topic is the point.
 
-Read the failure message instead of retrying. A refusal means the conversation
-has gone on longer than the operator wants, not that the command was malformed.
+Exit 4 means the conversation has gone on longer than the operator wants, not
+that the command was malformed. Rewording it and retrying will fail the same way.
 
 ## Debugging
 
