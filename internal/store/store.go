@@ -84,7 +84,7 @@ func (s *Store) fileStore() string { return filepath.Join(s.dir, "files") }
 
 // SchemaVersion is the shape this build expects. It is stamped into
 // schema_meta at the end of a successful migration, and scripts/mesh.sh carries
-// the same number in its .schema_vN marker file.
+// the same number in the database's PRAGMA user_version.
 const SchemaVersion = 5
 
 // migrate brings any database this build can open up to SchemaVersion.

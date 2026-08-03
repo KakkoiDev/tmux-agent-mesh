@@ -597,6 +597,7 @@ SQL
 
     # Seed the general channel.
     _seed_general_channel
+    _stamp_schema_version
     _result "Initialized: $DB" db "$DB"
 }
 
@@ -657,14 +658,58 @@ EOF
     return 0
 }
 
+# The version lives in the database, in PRAGMA user_version, and not in a
+# .schema_vN file beside it. A marker file makes a claim about whatever mesh.db
+# happens to be in that directory, so restoring a backup, copying a mailbox in
+# from another machine or deleting the database while the marker stayed left the
+# old shape in place and nothing would ever migrate it again. The tell was in
+# tests/mesh.bats, where building a v1 database had to `rm` the marker before
+# the migration would run at all.
+_SCHEMA_VERSION=5
+
+_schema_version_of_db() {
+    local v
+    v=$(sql "PRAGMA user_version;" 2>/dev/null) || v=""
+    printf '%s' "${v:-0}"
+}
+
 _ensure_schema() {
     [[ -f "$DB" ]] || return 0
-    [[ -f "$MESH_DIR/.schema_v5" ]] && return 0
+    [[ "$(_schema_version_of_db)" -ge "$_SCHEMA_VERSION" ]] && return 0
     _migrate_v1_to_channels
     printf '%s\n' "$(_schema_sql)" | sqlite3 "$DB" >/dev/null 2>&1 || true
     _apply_migrations
     _backfill_v1_to_channels
-    touch "$MESH_DIR/.schema_v5" 2>/dev/null || true
+    local gaps
+    gaps=$(_schema_gaps)
+    if [[ -n "$gaps" ]]; then
+        _migration_log "cannot convert this mailbox: missing $gaps"
+        return 0
+    fi
+    _stamp_schema_version
+}
+
+_stamp_schema_version() {
+    sql "PRAGMA user_version=$_SCHEMA_VERSION;"
+    rm -f "$MESH_DIR"/.schema_v* 2>/dev/null || true
+}
+
+# Columns every read and write path assumes. A database missing one of these
+# came from an intermediate build and is not something this one can convert:
+# the shapes in between were never released, and inventing thread names for rows
+# that never carried them would be making up history. So the version is not
+# stamped, `doctor` names the gap and the remedy, and nothing pretends the
+# mailbox is current.
+_REQUIRED_COLUMNS='channels:name threads:name messages:channel_id messages:thread_id messages:uid messages:nonce'
+
+_schema_gaps() {
+    local pair table col gaps=""
+    for pair in $_REQUIRED_COLUMNS; do
+        table="${pair%%:*}"; col="${pair##*:}"
+        [[ "$(sql "SELECT COUNT(*) FROM pragma_table_info('$table') WHERE name='$col';" 2>/dev/null)" == "1" ]] \
+            || gaps="$gaps $table.$col"
+    done
+    printf '%s' "${gaps# }"
 }
 
 # ── v1 -> channel model ──────────────────────────────────────────────
@@ -3364,6 +3409,15 @@ _schema_complete() {
     [[ "${n:-0}" -eq 4 ]]
 }
 
+# Table names are not enough. A mailbox left half-converted by an intermediate
+# build has all four tables and a `threads` with no `name` column, and the first
+# symptom is "no such column: t.name" from inside a send.
+_schema_columns_ok() {
+    local gaps
+    gaps=$(_schema_gaps)
+    [[ -z "$gaps" ]] || { printf 'missing %s; back up %s and run: tmux-agent-mesh init --reset\n' "$gaps" "$DB" >&2; return 1; }
+}
+
 _db_wal()       { [[ "$(sql 'PRAGMA journal_mode;' 2>/dev/null)" == "wal" ]]; }
 _db_intact()    { [[ "$(sql 'PRAGMA integrity_check;' 2>/dev/null)" == "ok" ]]; }
 
@@ -3464,6 +3518,7 @@ cmd_doctor() {
     _probe "notify dir writable"      test -w "$NOTIFY_DIR"
     if [[ -f "$DB" ]]; then
         _probe "schema has all four tables" _schema_complete
+        _probe_why "schema has every column this build writes" _schema_columns_ok
         _probe "journal mode is wal"        _db_wal
         _probe "database passes integrity check" _db_intact
         _probe "human participant seeded"  _human_seeded

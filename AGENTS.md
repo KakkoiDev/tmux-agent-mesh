@@ -15,10 +15,13 @@ When updating this file, preserve this bar for all agents and keep entries conci
 
 The agents table (and every table) is declared in both `internal/store/schema.sql`
 (the Go store) and `scripts/mesh.sh` (`_SCHEMA_SQL`). A column change must land
-in both, plus the migration steps: `_MIGRATIONS_SQL` + bumping the `.schema_vN`
-marker file in `_ensure_schema` for bash, and the versioned `migrateAgentsV2`
-pattern (schema_meta `schema_version`) for the Go store. Existing databases get
-columns via `ALTER TABLE`, never by editing `CREATE TABLE`.
+in both, plus the migration steps: `_MIGRATIONS_SQL` + bumping `_SCHEMA_VERSION`
+(stamped into the database's `PRAGMA user_version`) for bash, and the versioned
+`migrateAgentsV2` pattern (schema_meta `schema_version`) for the Go store.
+Existing databases get columns via `ALTER TABLE`, never by editing
+`CREATE TABLE`. A column the code cannot live without also belongs in
+`_REQUIRED_COLUMNS`, which is what stops a database being stamped current when
+it is not.
 
 ## Tests
 

@@ -847,7 +847,7 @@ What has actually been run, as opposed to written against documentation.
 ## Tests
 
 ```bash
-bats tests/          # 416 tests, nine suites
+bats tests/          # 420 tests, nine suites
 go test ./...        # 91 tests, the store and the TUI
 ```
 

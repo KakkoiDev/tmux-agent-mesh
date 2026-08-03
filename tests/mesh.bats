@@ -101,7 +101,45 @@ INSERT INTO messages (thread_id, from_session, to_session, body, hops, delivered
          ('other','a1','human','three',0,NULL,NULL);
 INSERT INTO threads (thread_id, opener_session, msg_count) VALUES ('shared','a1',2),('other','a1',1);
 SQL
-    rm -f "$MESH_DIR"/.schema_v*
+}
+
+# What an intermediate build left behind: every table present, messages already
+# addressed by channel, and a `threads` that still has no name. Not v1, not
+# current, and not convertible: the thread names were never written down.
+_build_half_db() {
+    rm -f "$DB"
+    sqlite3 "$DB" <<'SQL'
+PRAGMA journal_mode=WAL;
+CREATE TABLE agents (
+    session_id TEXT PRIMARY KEY, harness TEXT NOT NULL, alias TEXT UNIQUE,
+    tmux_pane TEXT, tmux_target TEXT, cwd TEXT, project_name TEXT,
+    push_capable INTEGER NOT NULL DEFAULT 0, block_streak INTEGER NOT NULL DEFAULT 0,
+    turn_state TEXT, model TEXT, transcript_path TEXT NOT NULL DEFAULT '',
+    registered_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    last_seen INTEGER NOT NULL DEFAULT (unixepoch()));
+CREATE TABLE channels (
+    id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE,
+    kind TEXT NOT NULL DEFAULT 'channel', visibility TEXT NOT NULL DEFAULT 'public',
+    topic TEXT NOT NULL DEFAULT '', created_by TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL DEFAULT (unixepoch()), archived_at INTEGER);
+CREATE TABLE threads (
+    thread_id INTEGER PRIMARY KEY, channel_id INTEGER NOT NULL,
+    opener_session TEXT NOT NULL DEFAULT '', msg_count INTEGER NOT NULL DEFAULT 0,
+    closed_at INTEGER);
+CREATE TABLE messages (
+    id INTEGER PRIMARY KEY, channel_id INTEGER NOT NULL, thread_id INTEGER NOT NULL,
+    from_session TEXT NOT NULL, body TEXT NOT NULL, hops INTEGER NOT NULL DEFAULT 0,
+    expect_reply INTEGER NOT NULL DEFAULT 0, reply_to_id INTEGER,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch()));
+CREATE TABLE dispatches (
+    id INTEGER PRIMARY KEY, tmux_pane TEXT, harness TEXT NOT NULL, task TEXT NOT NULL,
+    alias TEXT, reply_to_session TEXT, worktree_branch TEXT,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch()), claimed_by TEXT, claimed_at INTEGER);
+INSERT INTO agents (session_id, harness, alias) VALUES ('a1','claude','alice');
+INSERT INTO channels (id, name) VALUES (1,'general');
+INSERT INTO threads (thread_id, channel_id) VALUES (1,1);
+INSERT INTO messages (channel_id, thread_id, from_session, body) VALUES (1,1,'a1','stranded');
+SQL
 }
 
 @test "a v1 database migrates to the channel model" {
@@ -182,10 +220,47 @@ SQL
     local before
     before=$(msql "SELECT (SELECT COUNT(*) FROM messages)||'/'||(SELECT COUNT(*) FROM channels)
                         ||'/'||(SELECT COUNT(*) FROM threads)||'/'||(SELECT COUNT(*) FROM deliveries);")
-    rm -f "$MESH_DIR"/.schema_v*
+    msql "PRAGMA user_version=0;"
     "$MESH_BIN" init >/dev/null
     assert_eq "$(msql "SELECT (SELECT COUNT(*) FROM messages)||'/'||(SELECT COUNT(*) FROM channels)
                             ||'/'||(SELECT COUNT(*) FROM threads)||'/'||(SELECT COUNT(*) FROM deliveries);")" "$before"
+}
+
+# The version used to live in a .schema_vN file beside the database, so it made
+# a claim about whatever mesh.db happened to be in that directory. Restore a
+# backup, copy a mailbox in from another machine, or delete the database and
+# leave the marker, and the commands that go through _ensure_schema -- hook,
+# cleanup and import -- would never migrate it again.
+@test "a stale schema marker does not stop the migration" {
+    _build_v1_db
+    touch "$MESH_DIR/.schema_v5"
+    "$MESH_BIN" cleanup --forced >/dev/null
+    assert_num_eq "$(msql "SELECT COUNT(*) FROM pragma_table_info('threads') WHERE name='name';")" 1
+    assert_num_eq "$(msql "SELECT COUNT(*) FROM messages WHERE channel_id IS NULL;")" 0
+    refute_file "$MESH_DIR/.schema_v5"
+}
+
+@test "the schema version travels in the database, not beside it" {
+    assert_num_eq "$(msql 'PRAGMA user_version;')" 5
+    assert_num_eq "$(ls -1 "$MESH_DIR" | grep -c '^.schema_v' || true)" 0
+}
+
+@test "a mailbox that cannot be converted is not stamped as current" {
+    _build_half_db
+    # cleanup itself goes on to fail against the old shape, which is the point:
+    # the version must not say "current" about a database this build cannot use.
+    run "$MESH_BIN" cleanup --forced
+    assert_num_eq "$(msql 'PRAGMA user_version;')" 0
+    assert_contains "$(cat "$MESH_DIR/migration.log")" "cannot convert"
+}
+
+@test "doctor names the columns a half-converted mailbox is missing" {
+    _build_half_db
+    run "$MESH_BIN" doctor
+    assert_fail
+    assert_contains "$output" "schema has every column this build writes"
+    assert_contains "$output" "threads.name"
+    assert_contains "$output" "init --reset"
 }
 
 @test "the generated schema in mesh.sh matches the canonical file" {
