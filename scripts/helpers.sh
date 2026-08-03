@@ -51,7 +51,7 @@ get_tmux_option() { tk_opt "$1" "${2:-}"; }
 # (A comment line must not begin with the linter's own name, or it is parsed as
 # a directive and fails with SC1072.)
 # shellcheck disable=SC2034
-declare KEYBINDING="" KEY_QUIT="" \
+declare KEYBINDING="" TUI_KEYBINDING="" KEY_QUIT="" \
         ENABLED="" DELIVERY="" PI_DELIVERY="" MAX_HOPS="" \
         MAX_BLOCKS="" MAX_BROADCAST="" ICON_MAIL="" DEBUG_LOG="" HOOK_ON_MAIL=""
 
@@ -63,8 +63,11 @@ _cq() { tk_cq "$1"; }
 
 # Not `m`: that is tmux's own select-pane -m, so the old default silently took a
 # built-in away from everyone who installed this.
+# The TUI is on G rather than g because g is the menu, which has been the
+# documented key since the first release. Both are configurable.
 _MESH_CONFIG_SPECS=(
     'KEYBINDING:@agent-mesh-keybinding:g'
+    'TUI_KEYBINDING:@agent-mesh-tui-keybinding:G'
     'KEY_QUIT:@agent-mesh-key-quit:q'
     'ENABLED:@agent-mesh-enabled:on'
     'DELIVERY:@agent-mesh-delivery:stop-block'

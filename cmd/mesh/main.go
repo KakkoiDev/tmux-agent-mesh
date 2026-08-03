@@ -43,16 +43,25 @@ func main() {
 	}
 }
 
-func runTUI() {
-	dir := os.Getenv("MESH_DATA_DIR")
-	if dir == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "mesh tui: cannot find home directory: %v\n", err)
-			os.Exit(1)
+// dataDir is the mailbox this binary works on. MESH_DIR is what scripts/mesh.sh
+// reads and what every test isolates with, so it comes first: reading only
+// MESH_DATA_DIR meant `MESH_DIR=/tmp/x mesh tui` opened the real mailbox while
+// the bash CLI beside it opened /tmp/x.
+func dataDir() string {
+	for _, name := range []string{"MESH_DIR", "MESH_DATA_DIR"} {
+		if dir := os.Getenv(name); dir != "" {
+			return dir
 		}
-		dir = filepath.Join(home, ".tmux-agent-mesh")
 	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ".tmux-agent-mesh"
+	}
+	return filepath.Join(home, ".tmux-agent-mesh")
+}
+
+func runTUI() {
+	dir := dataDir()
 
 	s, err := store.Open(dir)
 	if err != nil {
@@ -73,10 +82,10 @@ func runTUI() {
 func runServe(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	addr := fs.String("addr", "/var/run/mesh/mesh.sock", "unix socket path")
-	dataDir := fs.String("data", os.Getenv("HOME")+"/.tmux-agent-mesh", "data directory")
+	dir := fs.String("data", dataDir(), "data directory")
 	fs.Parse(args)
 
-	s, err := store.Open(*dataDir)
+	s, err := store.Open(*dir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "mesh serve: %v\n", err)
 		os.Exit(1)
@@ -101,10 +110,10 @@ func runServe(args []string) {
 
 func runServeStdio(args []string) {
 	fs := flag.NewFlagSet("serve-stdio", flag.ExitOnError)
-	dataDir := fs.String("data", os.Getenv("HOME")+"/.tmux-agent-mesh", "data directory")
+	dir := fs.String("data", dataDir(), "data directory")
 	fs.Parse(args)
 
-	s, err := store.Open(*dataDir)
+	s, err := store.Open(*dir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "mesh serve-stdio: %v\n", err)
 		os.Exit(1)

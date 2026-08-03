@@ -53,8 +53,12 @@ fi
 tmux set -gq @agent-mesh-status ""
 "$SCRIPTS_DIR/mesh.sh" refresh >/dev/null 2>&1 || true
 
-# prefix + m: roster with pending counts, jump to a pane.
-tmux bind-key "${KEYBINDING:-m}" run-shell "$SCRIPTS_DIR/mesh.sh menu"
+# prefix + g: roster with pending counts, jump to a pane.
+tmux bind-key "${KEYBINDING:-g}" run-shell "$SCRIPTS_DIR/mesh.sh menu"
+
+# prefix + G: the TUI, in its own window. Not a popup: display-popup needs tmux
+# 3.2 and the published floor for this plugin is 3.0.
+tmux bind-key "${TUI_KEYBINDING:-G}" new-window -n mesh "$SCRIPTS_DIR/mesh-tui.sh"
 
 # Reap agents whose pane is gone. session_shutdown does not fire when a pane is
 # killed, so for every harness this is the only cleanup path.

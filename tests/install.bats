@@ -13,15 +13,24 @@ setup() {
     FAKE_HOME="$TEST_TMPDIR/home"
     REAL_DOTFILES="$TEST_TMPDIR/dotfiles"
     mkdir -p "$FAKE_HOME/.claude" "$FAKE_HOME/.codex" "$FAKE_HOME/.gemini" "$REAL_DOTFILES"
+    if command -v go >/dev/null 2>&1; then
+        REAL_GOCACHE=$(go env GOCACHE)
+        REAL_GOMODCACHE=$(go env GOMODCACHE)
+    fi
 }
 
 teardown() {
     teardown_test_env
 }
 
+# GOCACHE and GOMODCACHE are read from the real HOME before it is redirected.
+# The fake HOME exists so the installer cannot touch the developer's harness
+# configs; go reading an empty cache under it means a full cgo rebuild of the
+# sqlite driver on every single test, which is minutes each.
 install_into_fake_home() {
     HOME="$FAKE_HOME" MESH_DIR="$MESH_DIR" MESH_DB="$MESH_DB" \
         MESH_NOTIFY_DIR="$NOTIFY_DIR" \
+        GOCACHE="${REAL_GOCACHE:-}" GOMODCACHE="${REAL_GOMODCACHE:-}" \
         bash "$PROJECT_ROOT/install.sh" "$@"
 }
 
@@ -179,6 +188,58 @@ hook_cmds() {
 @test "installer rejects unknown flags" {
     run install_into_fake_home --wat
     assert_fail
+}
+
+# ── the TUI binary ───────────────────────────────────────────────────
+#
+# The TUI is the only thing a human can drive, and nothing built it: it was
+# reachable only by someone who knew to run `go build ./cmd/mesh` by hand.
+
+@test "base install builds the TUI and links it" {
+    command -v go >/dev/null 2>&1 || skip "go is not installed"
+    install_into_fake_home >/dev/null
+    assert_symlink "$FAKE_HOME/.local/bin/mesh"
+    assert_eq "$(readlink "$FAKE_HOME/.local/bin/mesh")" "$PROJECT_ROOT/bin/mesh"
+    run "$PROJECT_ROOT/bin/mesh"
+    assert_contains "$output" "tui"
+}
+
+# A stale `mesh` from an older checkout is a binary built against a schema this
+# one has migrated past, and it is what a human runs when they type `mesh`.
+@test "base install replaces a mesh link that points somewhere else" {
+    command -v go >/dev/null 2>&1 || skip "go is not installed"
+    mkdir -p "$FAKE_HOME/.local/bin" "$TEST_TMPDIR/old"
+    printf '#!/bin/sh\nexit 0\n' > "$TEST_TMPDIR/old/mesh"
+    chmod +x "$TEST_TMPDIR/old/mesh"
+    ln -sf "$TEST_TMPDIR/old/mesh" "$FAKE_HOME/.local/bin/mesh"
+
+    run install_into_fake_home
+    assert_contains "$output" "replaced a link to $TEST_TMPDIR/old/mesh"
+    assert_eq "$(readlink "$FAKE_HOME/.local/bin/mesh")" "$PROJECT_ROOT/bin/mesh"
+}
+
+@test "an install without go still works and says the TUI was skipped" {
+    # A PATH with no go at all, which is what a server or a fresh box looks like.
+    mkdir -p "$TEST_TMPDIR/nogo"
+    for t in bash sh env sqlite3 jq tmux uname sed grep awk mkdir ln rm cp cat printf readlink chmod dirname basename; do
+        src=$(command -v "$t" 2>/dev/null) || continue
+        ln -sf "$src" "$TEST_TMPDIR/nogo/$t"
+    done
+    run env HOME="$FAKE_HOME" MESH_DIR="$MESH_DIR" MESH_DB="$MESH_DB" \
+        MESH_NOTIFY_DIR="$NOTIFY_DIR" PATH="$TEST_TMPDIR/nogo" \
+        bash "$PROJECT_ROOT/install.sh"
+    assert_ok
+    assert_contains "$output" "go is not installed"
+    assert_symlink "$FAKE_HOME/.local/bin/tmux-agent-mesh"
+}
+
+@test "uninstall removes the mesh link only when it points at this checkout" {
+    mkdir -p "$FAKE_HOME/.local/bin" "$TEST_TMPDIR/other"
+    printf '#!/bin/sh\nexit 0\n' > "$TEST_TMPDIR/other/mesh"
+    ln -sf "$TEST_TMPDIR/other/mesh" "$FAKE_HOME/.local/bin/mesh"
+
+    HOME="$FAKE_HOME" MESH_DIR="$MESH_DIR" bash "$PROJECT_ROOT/uninstall.sh" >/dev/null
+    assert_symlink "$FAKE_HOME/.local/bin/mesh"
 }
 
 # ── data safety ──────────────────────────────────────────────────────

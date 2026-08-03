@@ -3192,11 +3192,19 @@ $(sql_sep '|' "SELECT a.alias, a.session_id, a.harness,
    FROM agents a WHERE a.harness<>'human' ORDER BY a.alias IS NULL, a.alias;")
 EOF
 
+    # The TUI is the only way to read a channel, create one or manage members
+    # from the keyboard, so the menu is where somebody who does not know it
+    # exists will find it.
+    local tui_item=("" "" "" "open the mesh TUI" "t" "new-window -n mesh '$SCRIPTS_DIR/mesh-tui.sh'")
+
     if [[ "${#items[@]}" -eq 0 ]]; then
-        tmux display-message "agent-mesh: no agents registered"
+        tmux display-menu -T " agent-mesh " \
+            "no agents registered" "" "" "${tui_item[@]}" \
+            "" "" "" "quit" "${KEY_QUIT:-q}" ""
         return 0
     fi
     tmux display-menu -T " agent-mesh " "${items[@]}" \
+        "${tui_item[@]}" \
         "" "" "" "quit" "${KEY_QUIT:-q}" ""
 }
 

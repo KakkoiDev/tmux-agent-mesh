@@ -6,4 +6,6 @@ node_modules/
 
 # Go build artifacts
 /mesh
+/bin/mesh
+/.mesh-build.log
 /dist/

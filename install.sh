@@ -9,6 +9,8 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_SRC="$HERE/bin/tmux-agent-mesh"
 BIN_LINK="$HOME/.local/bin/tmux-agent-mesh"
+TUI_SRC="$HERE/bin/mesh"
+TUI_LINK="$HOME/.local/bin/mesh"
 
 CLAUDE_SETTINGS="$HOME/.claude/settings.json"
 CODEX_HOOKS="$HOME/.codex/hooks.json"
@@ -24,6 +26,7 @@ usage: ./install.sh [--all] [--claude] [--codex] [--gemini] [--pi]
 
 Always done:
   symlink bin/tmux-agent-mesh into ~/.local/bin
+  build the TUI (bin/mesh) and symlink it, when go is installed
   create the database
   sync the Claude skill bundle
 
@@ -128,6 +131,29 @@ case ":$PATH:" in
     *":$(dirname "$BIN_LINK"):"*) ;;
     *) warn "note: $(dirname "$BIN_LINK") is not on PATH" ;;
 esac
+
+# ── the TUI ──────────────────────────────────────────────────────────
+#
+# Go is optional: everything an agent does goes through the bash CLI, and the
+# TUI is for the human. A machine without go gets a working install and a note.
+if command -v go >/dev/null 2>&1; then
+    if (cd "$HERE" && go build -o "$TUI_SRC" ./cmd/mesh) 2>"$HERE/.mesh-build.log"; then
+        rm -f "$HERE/.mesh-build.log"
+        # -f, and deliberately: `mesh` is a name an older checkout of this
+        # project also claimed, and a link left pointing at one of those runs a
+        # binary built against a schema this one has since migrated past.
+        prev=$(readlink "$TUI_LINK" 2>/dev/null || true)
+        ln -sf "$TUI_SRC" "$TUI_LINK"
+        say "tui: $TUI_LINK"
+        if [[ -n "$prev" && "$prev" != "$TUI_SRC" ]]; then
+            say "     (replaced a link to $prev)"
+        fi
+    else
+        warn "tui: build failed; see $HERE/.mesh-build.log (the CLI is unaffected)"
+    fi
+else
+    say "tui: go is not installed, skipping (the CLI does not need it)"
+fi
 
 "$HERE/scripts/mesh.sh" init | sed 's/^/db: /'
 

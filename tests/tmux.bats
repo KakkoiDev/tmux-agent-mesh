@@ -228,6 +228,55 @@ CLEANUP_HOOKS="pane-exited after-kill-pane window-unlinked session-closed"
 
 # The shipped default was `m`, which is tmux's own select-pane -m, so installing
 # mesh silently took a built-in away from every user.
+# The TUI is the only way a human can create a channel or manage members, and
+# nothing bound it: it existed as a Go subcommand nobody was told about.
+@test "the plugin binds the TUI key" {
+    run_plugin
+    run bash -c "tmux list-keys -T prefix | grep 'mesh-tui.sh'"
+    assert_ok
+    assert_contains "$output" "new-window"
+}
+
+@test "the TUI key is configurable" {
+    tmux set -g @agent-mesh-tui-keybinding Y
+    rm -f "$MESH_DIR/config_cache"
+    run_plugin
+    run bash -c "tmux list-keys -T prefix | grep 'mesh-tui.sh'"
+    assert_contains "$output" " Y "
+}
+
+# Two bindings that both open something, on the same key, is one of them lost.
+prefix_key_for() { tmux list-keys -T prefix | grep -F "$1" | sed -n 's/.*-T prefix *\([^ ]*\) .*/\1/p'; }
+
+@test "the TUI key and the menu key are not the same key" {
+    run_plugin
+    local menu_key tui_key
+    menu_key=$(prefix_key_for 'mesh.sh menu')
+    tui_key=$(prefix_key_for 'mesh-tui.sh')
+    assert_not_empty "$menu_key"
+    assert_not_empty "$tui_key"
+    assert_ne "$tui_key" "$menu_key"
+}
+
+# The launcher runs with no terminal to report to, so a missing binary has to
+# say what to do rather than close the window on the way past. Run from a copy,
+# because the real checkout may well have bin/mesh built in it.
+@test "the TUI launcher explains itself when the binary is not built" {
+    mkdir -p "$TEST_TMPDIR/unbuilt/scripts"
+    cp "$SCRIPTS_DIR/mesh-tui.sh" "$TEST_TMPDIR/unbuilt/scripts/"
+    run env PATH="/usr/bin:/bin" \
+        bash -c "'$TEST_TMPDIR/unbuilt/scripts/mesh-tui.sh' < /dev/null"
+    assert_fail
+    assert_contains "$output" "go build"
+}
+
+@test "the menu offers the TUI" {
+    record_tmux
+    "$MESH_BIN" menu >/dev/null 2>&1 || true
+    run grep display-menu "$TEST_TMPDIR/tmux.log"
+    assert_contains "$output" "mesh-tui.sh"
+}
+
 @test "the shipped default menu key does not replace a tmux built-in" {
     rm -f "$MESH_DIR/config_cache"
     run_plugin

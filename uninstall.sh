@@ -4,7 +4,9 @@ set -euo pipefail
 # Reverses install.sh. Leaves the database alone unless --purge is given:
 # undelivered mail is data, not an install artifact.
 
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_LINK="$HOME/.local/bin/tmux-agent-mesh"
+TUI_LINK="$HOME/.local/bin/mesh"
 MESH_DIR="${MESH_DIR:-$HOME/.tmux-agent-mesh}"
 PI_EXT_DIR="$HOME/.pi/agent/extensions/tmux-agent-mesh"
 
@@ -46,6 +48,13 @@ say "tmux-agent-mesh uninstall"
 say ""
 
 if [[ -L "$BIN_LINK" ]]; then rm -f "$BIN_LINK"; say "cli: removed $BIN_LINK"; fi
+
+# Only when it points here. `mesh` is a common enough name that someone else's
+# binary could be under it, and removing that is not this script's business.
+if [[ -L "$TUI_LINK" && "$(readlink "$TUI_LINK")" == "$HERE/bin/mesh" ]]; then
+    rm -f "$TUI_LINK"
+    say "tui: removed $TUI_LINK"
+fi
 if [[ -L "$PI_EXT_DIR" || -d "$PI_EXT_DIR" ]]; then rm -rf "$PI_EXT_DIR"; say "pi: removed $PI_EXT_DIR"; fi
 
 say "hooks:"
