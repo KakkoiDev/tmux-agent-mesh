@@ -176,70 +176,67 @@ _fmt_ago() {
 
 # ── schema ───────────────────────────────────────────────────────────
 
-_SCHEMA_SQL='
+# BEGIN GENERATED SCHEMA
+# Generated from internal/store/schema.sql by scripts/gen-schema.sh.
+# Do not edit between these markers; edit the canonical file and rerun.
+_schema_sql() {
+    cat <<'MESH_SCHEMA_SQL'
+-- tmux-agent-mesh store. Canonical schema.
+--
+-- This file is the only definition of the shape of mesh.db. scripts/mesh.sh
+-- carries a generated copy in _schema_sql(); run scripts/gen-schema.sh after
+-- editing here, and a test fails if the two drift. Two hand-maintained
+-- definitions is how bash ended up declaring `messages` with to_session while
+-- Go declared it with channel_id, both against the same file, so whichever
+-- process opened it first won and the other's inserts failed.
+--
+-- One recipient mechanism, not four. A message is posted to a channel and every
+-- member of that channel is a recipient, so a direct message, a named group, a
+-- public room and "everyone" are the same object with different membership. That
+-- is what makes read receipts, file scoping and access rules one implementation
+-- each instead of one per addressing mode.
+--
+-- Delivery and reading are separate append-only facts. Delivery is per recipient
+-- because a message now has several. Reading is a log rather than a flag, so the
+-- same agent reading twice is two rows, which is what a receipt has to show.
+
+
 CREATE TABLE IF NOT EXISTS agents (
     session_id    TEXT PRIMARY KEY,
     harness       TEXT NOT NULL,
     alias         TEXT UNIQUE,
-    tmux_pane     TEXT,
-    tmux_target   TEXT,
-    cwd           TEXT,
-    project_name  TEXT,
-    push_capable  INTEGER NOT NULL DEFAULT 0,
-    block_streak  INTEGER NOT NULL DEFAULT 0,
-    turn_state    TEXT,
     model         TEXT,
-    transcript_path TEXT NOT NULL DEFAULT '"'"''"'"',
+    -- Which machine the agent runs on. A remote mailbox serves several.
+    host          TEXT NOT NULL DEFAULT '',
+    tmux_pane     TEXT NOT NULL DEFAULT '',
+    tmux_target   TEXT NOT NULL DEFAULT '',
+    cwd           TEXT NOT NULL DEFAULT '',
+    project_name  TEXT NOT NULL DEFAULT '',
+    -- Can the harness be reached while it is idle, without keystrokes.
+    push_capable  INTEGER NOT NULL DEFAULT 0,
+    -- Consecutive mesh-forced turns, the unattended-token-burn brake.
+    block_streak  INTEGER NOT NULL DEFAULT 0,
+    -- From this plugin's own turn hooks, not from scraping the pane.
+    turn_state    TEXT NOT NULL DEFAULT 'idle'
+        CHECK (turn_state IN ('idle', 'working')),
+    -- Full path to the agent's conversation transcript, so another agent or
+    -- the human can open an old conversation. Empty until the agent reports it.
+    transcript_path TEXT NOT NULL DEFAULT '',
     registered_at INTEGER NOT NULL DEFAULT (unixepoch()),
     last_seen     INTEGER NOT NULL DEFAULT (unixepoch())
 );
 
-CREATE TABLE IF NOT EXISTS messages (
-    id            INTEGER PRIMARY KEY,
-    thread_id     TEXT NOT NULL,
-    from_session  TEXT NOT NULL,
-    to_session    TEXT NOT NULL,
-    body          TEXT NOT NULL,
-    hops          INTEGER NOT NULL DEFAULT 0,
-    expect_reply  INTEGER NOT NULL DEFAULT 0,
-    reply_to_id   INTEGER,
-    created_at    INTEGER NOT NULL DEFAULT (unixepoch()),
-    delivered_at  INTEGER,
-    delivered_via TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_pending ON messages(to_session, delivered_at);
-CREATE INDEX IF NOT EXISTS idx_thread ON messages(thread_id);
-
-CREATE TABLE IF NOT EXISTS threads (
-    thread_id      TEXT PRIMARY KEY,
-    opener_session TEXT,
-    msg_count      INTEGER NOT NULL DEFAULT 0,
-    closed_at      INTEGER
-);
-
-CREATE TABLE IF NOT EXISTS dispatches (
-    id               INTEGER PRIMARY KEY,
-    tmux_pane        TEXT,
-    harness          TEXT NOT NULL,
-    task             TEXT NOT NULL,
-    alias            TEXT,
-    reply_to_session TEXT,
-    worktree_branch  TEXT,
-    created_at       INTEGER NOT NULL DEFAULT (unixepoch()),
-    claimed_by       TEXT,
-    claimed_at       INTEGER
-);
-
--- Channel tables: match the Go store schema so bash and Go coexist.
+-- kind is what the client shows, not a permission: 'dm' is a channel whose
+-- membership happens to be two. visibility is the permission.
 CREATE TABLE IF NOT EXISTS channels (
     id          INTEGER PRIMARY KEY,
     name        TEXT NOT NULL UNIQUE,
-    kind        TEXT NOT NULL DEFAULT '"'"'channel'"'"'
-        CHECK (kind IN ('"'"'channel'"'"', '"'"'dm'"'"')),
-    visibility  TEXT NOT NULL DEFAULT '"'"'public'"'"'
-        CHECK (visibility IN ('"'"'public'"'"', '"'"'private'"'"')),
-    topic       TEXT NOT NULL DEFAULT '"'"''"'"',
-    created_by  TEXT NOT NULL DEFAULT '"'"''"'"',
+    kind        TEXT NOT NULL DEFAULT 'channel'
+        CHECK (kind IN ('channel', 'dm', 'broadcast')),
+    visibility  TEXT NOT NULL DEFAULT 'public'
+        CHECK (visibility IN ('public', 'private')),
+    topic       TEXT NOT NULL DEFAULT '',
+    created_by  TEXT NOT NULL DEFAULT '',
     created_at  INTEGER NOT NULL DEFAULT (unixepoch()),
     archived_at INTEGER,
     sort_order  INTEGER NOT NULL DEFAULT 0
@@ -249,28 +246,133 @@ CREATE INDEX IF NOT EXISTS idx_channels_sort ON channels(sort_order, id);
 CREATE TABLE IF NOT EXISTS channel_members (
     channel_id INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
     session_id TEXT NOT NULL,
-    role       TEXT NOT NULL DEFAULT '"'"'member'"'"'
-        CHECK (role IN ('"'"'member'"'"', '"'"'owner'"'"')),
+    role       TEXT NOT NULL DEFAULT 'member'
+        CHECK (role IN ('member', 'owner')),
     joined_at  INTEGER NOT NULL DEFAULT (unixepoch()),
     PRIMARY KEY (channel_id, session_id)
 );
+CREATE INDEX IF NOT EXISTS idx_members_session ON channel_members(session_id);
 
+-- Who is allowed to join a private channel at all, by harness or by model.
+-- Empty means membership is the only gate. Any row makes it an allow-list, so a
+-- rule that matches nothing locks the channel rather than opening it: sensitive
+-- work must fail closed.
 CREATE TABLE IF NOT EXISTS channel_rules (
     channel_id INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
-    subject    TEXT NOT NULL CHECK (subject IN ('"'"'harness'"'"', '"'"'model'"'"')),
+    subject    TEXT NOT NULL CHECK (subject IN ('harness', 'model')),
     value      TEXT NOT NULL,
     PRIMARY KEY (channel_id, subject, value)
 );
 
+-- A thread is a row scoped to one channel, with a name an agent may choose
+-- before the thread exists. That is the affordance a bare text tag had and a
+-- root-message id does not: "put your findings in thread audit-2026-08" is
+-- something you can hand out in a prompt.
+--
+-- Scoping it to a channel is what a bare tag could not do. A tag spanning a
+-- private and a public channel meant "show me thread X" crossed the membership
+-- boundary, and two agents independently picking 'review' merged silently.
+-- UNIQUE (channel_id, name) makes collisions per channel and membership the
+-- only permission check any read path needs.
+CREATE TABLE IF NOT EXISTS threads (
+    id             INTEGER PRIMARY KEY,
+    channel_id     INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+    name           TEXT NOT NULL,
+    opener_session TEXT NOT NULL DEFAULT '',
+    created_at     INTEGER NOT NULL DEFAULT (unixepoch()),
+    closed_at      INTEGER,
+    UNIQUE (channel_id, name)
+);
+
+CREATE TABLE IF NOT EXISTS messages (
+    id           INTEGER PRIMARY KEY,
+    channel_id   INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+    thread_id    INTEGER NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+    from_session TEXT NOT NULL,
+    body         TEXT NOT NULL,
+    hops         INTEGER NOT NULL DEFAULT 0,
+    expect_reply INTEGER NOT NULL DEFAULT 0,
+    reply_to_id  INTEGER REFERENCES messages(id) ON DELETE SET NULL,
+    created_at   INTEGER NOT NULL DEFAULT (unixepoch())
+);
+CREATE INDEX IF NOT EXISTS idx_messages_channel ON messages(channel_id, id);
+CREATE INDEX IF NOT EXISTS idx_messages_thread  ON messages(thread_id, id);
+
+-- Per recipient, because a message has several now. Delivery is at-most-once and
+-- stamped at claim time; the row existing is the claim. The primary key is what
+-- makes a double claim impossible, so atomicity no longer rests on the
+-- transaction shape alone.
+CREATE TABLE IF NOT EXISTS deliveries (
+    message_id    INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    session_id    TEXT NOT NULL,
+    delivered_at  INTEGER NOT NULL DEFAULT (unixepoch()),
+    delivered_via TEXT NOT NULL,
+    PRIMARY KEY (message_id, session_id)
+);
+CREATE INDEX IF NOT EXISTS idx_deliveries_session ON deliveries(session_id, message_id);
+
+-- Append-only. A second read by the same reader is a second row, because "read
+-- three times" is a thing a receipt has to be able to say.
+--
+-- For an agent, read is exactly the drain: the moment the text entered its
+-- context. For a human it is the moment the client displayed it. Both are
+-- recorded the same way and distinguished by source.
 CREATE TABLE IF NOT EXISTS reads (
     id            INTEGER PRIMARY KEY,
     message_id    INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
     reader        TEXT NOT NULL,
     read_at       INTEGER NOT NULL DEFAULT (unixepoch()),
-    source        TEXT NOT NULL CHECK (source IN ('"'"'drain'"'"', '"'"'client'"'"'))
+    source        TEXT NOT NULL CHECK (source IN ('drain', 'client'))
 );
 CREATE INDEX IF NOT EXISTS idx_reads_message ON reads(message_id, read_at);
-'
+
+-- The row is the handle; the bytes live outside the database under a directory
+-- only the server can read. An agent cannot open the path, so `file get` through
+-- the service is the only way in, and that is where membership is checked.
+CREATE TABLE IF NOT EXISTS files (
+    id          INTEGER PRIMARY KEY,
+    channel_id  INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+    message_id  INTEGER REFERENCES messages(id) ON DELETE SET NULL,
+    uploaded_by TEXT NOT NULL,
+    name        TEXT NOT NULL,
+    size        INTEGER NOT NULL,
+    sha256      TEXT NOT NULL,
+    -- Relative to the server's private store. Never sent to a client.
+    stored_path TEXT NOT NULL,
+    created_at  INTEGER NOT NULL DEFAULT (unixepoch())
+);
+CREATE INDEX IF NOT EXISTS idx_files_channel ON files(channel_id, id);
+
+-- Every read of a file body, for the same reason reads exists.
+CREATE TABLE IF NOT EXISTS file_access (
+    id       INTEGER PRIMARY KEY,
+    file_id  INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+    reader   TEXT NOT NULL,
+    at       INTEGER NOT NULL DEFAULT (unixepoch()),
+    allowed  INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS dispatches (
+    id               INTEGER PRIMARY KEY,
+    host             TEXT NOT NULL DEFAULT '',
+    tmux_pane        TEXT NOT NULL DEFAULT '',
+    harness          TEXT NOT NULL,
+    task             TEXT NOT NULL,
+    alias            TEXT,
+    reply_to_session TEXT NOT NULL DEFAULT '',
+    worktree_branch  TEXT,
+    created_at       INTEGER NOT NULL DEFAULT (unixepoch()),
+    claimed_by       TEXT,
+    claimed_at       INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS schema_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+MESH_SCHEMA_SQL
+}
+# END GENERATED SCHEMA
 
 # ── init ─────────────────────────────────────────────────────────────
 
@@ -288,27 +390,35 @@ cmd_init() {
 
     mkdir -p "$MESH_DIR" "$NOTIFY_DIR"
 
-    # Every table _SCHEMA_SQL creates, or --reset leaves rows referencing ones it
+    # Every table _schema_sql creates, or --reset leaves rows referencing ones it
     # dropped. Children first: with foreign_keys on, dropping a parent whose
     # child rows are still there is an error rather than a silent orphan.
     if [[ "$reset" -eq 1 ]]; then
         sqlite3 "$DB" <<'SQL'
 PRAGMA journal_mode=WAL;
 PRAGMA busy_timeout=100;
+DROP TABLE IF EXISTS file_access;
+DROP TABLE IF EXISTS files;
 DROP TABLE IF EXISTS reads;
+DROP TABLE IF EXISTS deliveries;
 DROP TABLE IF EXISTS channel_rules;
 DROP TABLE IF EXISTS channel_members;
-DROP TABLE IF EXISTS channels;
 DROP TABLE IF EXISTS messages;
 DROP TABLE IF EXISTS threads;
+DROP TABLE IF EXISTS channels;
 DROP TABLE IF EXISTS dispatches;
 DROP TABLE IF EXISTS agents;
 SQL
     fi
 
-    printf 'PRAGMA journal_mode=WAL;\nPRAGMA busy_timeout=100;\n%s\n' "$_SCHEMA_SQL" \
+    # Before the schema, not after: the v1 tables have to be renamed out of the
+    # way while CREATE TABLE IF NOT EXISTS would otherwise see them and do
+    # nothing, leaving the old shape in place.
+    _migrate_v1_to_channels
+    printf 'PRAGMA journal_mode=WAL;\nPRAGMA busy_timeout=100;\n%s\n' "$(_schema_sql)" \
         | sqlite3 "$DB" >/dev/null
     _apply_migrations
+    _backfill_v1_to_channels
 
     # The human is a first-class participant, seeded once.
     sql "INSERT OR IGNORE INTO agents (session_id, harness, alias, push_capable)
@@ -337,7 +447,7 @@ EOF
 }
 
 # CREATE TABLE IF NOT EXISTS cannot add a column to a table that already exists,
-# so a new column needs its own ALTER, and _SCHEMA_SQL stays the only place a
+# so a new column needs its own ALTER, and _schema_sql stays the only place a
 # table is defined. Both are idempotent: the ALTER fails harmlessly once the
 # column is there, and the marker file skips the whole thing on every later
 # invocation.
@@ -346,7 +456,7 @@ EOF
 # statement spanning lines arrives as fragments and every fragment is a parse
 # error. Four CREATE TABLE blocks lived here under that rule and had never
 # executed once; they were also second, disagreeing definitions of tables
-# _SCHEMA_SQL already declares.
+# _schema_sql already declares.
 _MIGRATIONS_SQL='
 ALTER TABLE agents ADD COLUMN turn_state TEXT;
 ALTER TABLE agents ADD COLUMN model TEXT;
@@ -378,10 +488,118 @@ EOF
 
 _ensure_schema() {
     [[ -f "$DB" ]] || return 0
-    [[ -f "$MESH_DIR/.schema_v4" ]] && return 0
-    printf '%s\n' "$_SCHEMA_SQL" | sqlite3 "$DB" >/dev/null 2>&1 || true
+    [[ -f "$MESH_DIR/.schema_v5" ]] && return 0
+    _migrate_v1_to_channels
+    printf '%s\n' "$(_schema_sql)" | sqlite3 "$DB" >/dev/null 2>&1 || true
     _apply_migrations
-    touch "$MESH_DIR/.schema_v4" 2>/dev/null || true
+    _backfill_v1_to_channels
+    touch "$MESH_DIR/.schema_v5" 2>/dev/null || true
+}
+
+# ── v1 -> channel model ──────────────────────────────────────────────
+#
+# v1 addressed a message with messages.to_session and stamped delivery onto the
+# row. v2 posts to a channel and records delivery per recipient, so a direct
+# message is a two-member channel rather than a special case. Threads move from
+# a bare text tag to a row scoped to a channel.
+#
+# Two halves because CREATE TABLE IF NOT EXISTS would see the v1 tables and do
+# nothing: rename first, let the schema create the new shape, then copy across.
+
+_has_v1_messages() {
+    [[ -f "$DB" ]] || return 1
+    local n
+    n=$(sql "SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name='to_session';" 2>/dev/null) || return 1
+    [[ "${n:-0}" -gt 0 ]]
+}
+
+_migrate_v1_to_channels() {
+    _has_v1_messages || return 0
+    sqlite3 "$DB" <<'SQL' >/dev/null 2>&1 || true
+PRAGMA foreign_keys=OFF;
+ALTER TABLE messages RENAME TO messages_v1;
+ALTER TABLE threads  RENAME TO threads_v1;
+SQL
+    return 0
+}
+
+_backfill_v1_to_channels() {
+    local n
+    n=$(sql "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='messages_v1';" 2>/dev/null) || return 0
+    [[ "${n:-0}" -gt 0 ]] || return 0
+
+    # foreign_keys off for the rebuild: reply_to_id points inside the same
+    # INSERT..SELECT, and a row referencing one not yet written would fail even
+    # though the finished table is consistent. PRAGMA foreign_key_check below is
+    # what proves it, rather than trusting the insert order.
+    local err
+    err=$(sqlite3 "$DB" <<'SQL' 2>&1 >/dev/null
+PRAGMA foreign_keys=OFF;
+BEGIN;
+
+-- A DM channel per ordered pair, so either direction resolves to one row.
+INSERT OR IGNORE INTO channels (name, kind, visibility, created_by)
+SELECT DISTINCT
+       'dm:' || MIN(from_session, to_session) || ':' || MAX(from_session, to_session),
+       'dm', 'private', from_session
+  FROM messages_v1;
+
+INSERT OR IGNORE INTO channel_members (channel_id, session_id)
+SELECT c.id, m.from_session
+  FROM messages_v1 m
+  JOIN channels c
+    ON c.name = 'dm:' || MIN(m.from_session, m.to_session) || ':' || MAX(m.from_session, m.to_session);
+
+INSERT OR IGNORE INTO channel_members (channel_id, session_id)
+SELECT c.id, m.to_session
+  FROM messages_v1 m
+  JOIN channels c
+    ON c.name = 'dm:' || MIN(m.from_session, m.to_session) || ':' || MAX(m.from_session, m.to_session);
+
+-- One thread row per (channel, old tag). A tag that spanned several pairs was
+-- one thread only by accident of having no channel; it becomes one per channel,
+-- which is the boundary it should always have had.
+INSERT OR IGNORE INTO threads (channel_id, name, opener_session, created_at)
+SELECT c.id, m.thread_id, MIN(m.from_session), MIN(m.created_at)
+  FROM messages_v1 m
+  JOIN channels c
+    ON c.name = 'dm:' || MIN(m.from_session, m.to_session) || ':' || MAX(m.from_session, m.to_session)
+ GROUP BY c.id, m.thread_id;
+
+INSERT OR IGNORE INTO messages
+       (id, channel_id, thread_id, from_session, body, hops, expect_reply, reply_to_id, created_at)
+SELECT m.id, c.id, t.id, m.from_session, m.body, m.hops, m.expect_reply, m.reply_to_id, m.created_at
+  FROM messages_v1 m
+  JOIN channels c
+    ON c.name = 'dm:' || MIN(m.from_session, m.to_session) || ':' || MAX(m.from_session, m.to_session)
+  JOIN threads t ON t.channel_id = c.id AND t.name = m.thread_id
+ ORDER BY m.id;
+
+-- Delivery was a column on the row and is now a fact about one recipient.
+INSERT OR IGNORE INTO deliveries (message_id, session_id, delivered_at, delivered_via)
+SELECT id, to_session, delivered_at, COALESCE(delivered_via, 'v1')
+  FROM messages_v1
+ WHERE delivered_at IS NOT NULL;
+
+DROP TABLE messages_v1;
+DROP TABLE IF EXISTS threads_v1;
+COMMIT;
+PRAGMA foreign_keys=ON;
+SQL
+) || true
+    if [[ -n "$err" ]]; then
+        mkdir -p "$MESH_DIR" 2>/dev/null || true
+        printf '%s v1->channels: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$err" \
+            >> "$MESH_DIR/migration.log" 2>/dev/null || true
+    fi
+    local bad
+    bad=$(sql "PRAGMA foreign_key_check;" 2>/dev/null) || bad=""
+    if [[ -n "$bad" ]]; then
+        printf '%s v1->channels left dangling references: %s\n' \
+            "$(date '+%Y-%m-%d %H:%M:%S')" "$bad" \
+            >> "$MESH_DIR/migration.log" 2>/dev/null || true
+    fi
+    return 0
 }
 
 # ── register / deregister / alias ────────────────────────────────────

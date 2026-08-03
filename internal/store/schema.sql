@@ -1,4 +1,11 @@
--- tmux-agent-mesh store.
+-- tmux-agent-mesh store. Canonical schema.
+--
+-- This file is the only definition of the shape of mesh.db. scripts/mesh.sh
+-- carries a generated copy in _schema_sql(); run scripts/gen-schema.sh after
+-- editing here, and a test fails if the two drift. Two hand-maintained
+-- definitions is how bash ended up declaring `messages` with to_session while
+-- Go declared it with channel_id, both against the same file, so whichever
+-- process opened it first won and the other's inserts failed.
 --
 -- One recipient mechanism, not four. A message is posted to a channel and every
 -- member of that channel is a recipient, so a direct message, a named group, a
@@ -45,7 +52,7 @@ CREATE TABLE IF NOT EXISTS channels (
     id          INTEGER PRIMARY KEY,
     name        TEXT NOT NULL UNIQUE,
     kind        TEXT NOT NULL DEFAULT 'channel'
-        CHECK (kind IN ('channel', 'dm')),
+        CHECK (kind IN ('channel', 'dm', 'broadcast')),
     visibility  TEXT NOT NULL DEFAULT 'public'
         CHECK (visibility IN ('public', 'private')),
     topic       TEXT NOT NULL DEFAULT '',
@@ -54,6 +61,7 @@ CREATE TABLE IF NOT EXISTS channels (
     archived_at INTEGER,
     sort_order  INTEGER NOT NULL DEFAULT 0
 );
+CREATE INDEX IF NOT EXISTS idx_channels_sort ON channels(sort_order, id);
 
 CREATE TABLE IF NOT EXISTS channel_members (
     channel_id INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
@@ -63,6 +71,7 @@ CREATE TABLE IF NOT EXISTS channel_members (
     joined_at  INTEGER NOT NULL DEFAULT (unixepoch()),
     PRIMARY KEY (channel_id, session_id)
 );
+CREATE INDEX IF NOT EXISTS idx_members_session ON channel_members(session_id);
 
 -- Who is allowed to join a private channel at all, by harness or by model.
 -- Empty means membership is the only gate. Any row makes it an allow-list, so a
@@ -75,11 +84,30 @@ CREATE TABLE IF NOT EXISTS channel_rules (
     PRIMARY KEY (channel_id, subject, value)
 );
 
+-- A thread is a row scoped to one channel, with a name an agent may choose
+-- before the thread exists. That is the affordance a bare text tag had and a
+-- root-message id does not: "put your findings in thread audit-2026-08" is
+-- something you can hand out in a prompt.
+--
+-- Scoping it to a channel is what a bare tag could not do. A tag spanning a
+-- private and a public channel meant "show me thread X" crossed the membership
+-- boundary, and two agents independently picking 'review' merged silently.
+-- UNIQUE (channel_id, name) makes collisions per channel and membership the
+-- only permission check any read path needs.
+CREATE TABLE IF NOT EXISTS threads (
+    id             INTEGER PRIMARY KEY,
+    channel_id     INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+    name           TEXT NOT NULL,
+    opener_session TEXT NOT NULL DEFAULT '',
+    created_at     INTEGER NOT NULL DEFAULT (unixepoch()),
+    closed_at      INTEGER,
+    UNIQUE (channel_id, name)
+);
+
 CREATE TABLE IF NOT EXISTS messages (
     id           INTEGER PRIMARY KEY,
     channel_id   INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
-    -- Slack-style threading inside a channel. A top-level post threads on itself.
-    thread_id    INTEGER,
+    thread_id    INTEGER NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
     from_session TEXT NOT NULL,
     body         TEXT NOT NULL,
     hops         INTEGER NOT NULL DEFAULT 0,
@@ -88,10 +116,12 @@ CREATE TABLE IF NOT EXISTS messages (
     created_at   INTEGER NOT NULL DEFAULT (unixepoch())
 );
 CREATE INDEX IF NOT EXISTS idx_messages_channel ON messages(channel_id, id);
-CREATE INDEX IF NOT EXISTS idx_messages_thread  ON messages(thread_id);
+CREATE INDEX IF NOT EXISTS idx_messages_thread  ON messages(thread_id, id);
 
 -- Per recipient, because a message has several now. Delivery is at-most-once and
--- stamped at claim time; the row existing is the claim.
+-- stamped at claim time; the row existing is the claim. The primary key is what
+-- makes a double claim impossible, so atomicity no longer rests on the
+-- transaction shape alone.
 CREATE TABLE IF NOT EXISTS deliveries (
     message_id    INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
     session_id    TEXT NOT NULL,
@@ -99,6 +129,7 @@ CREATE TABLE IF NOT EXISTS deliveries (
     delivered_via TEXT NOT NULL,
     PRIMARY KEY (message_id, session_id)
 );
+CREATE INDEX IF NOT EXISTS idx_deliveries_session ON deliveries(session_id, message_id);
 
 -- Append-only. A second read by the same reader is a second row, because "read
 -- three times" is a thing a receipt has to be able to say.
@@ -139,15 +170,6 @@ CREATE TABLE IF NOT EXISTS file_access (
     reader   TEXT NOT NULL,
     at       INTEGER NOT NULL DEFAULT (unixepoch()),
     allowed  INTEGER NOT NULL
-);
-
--- Conversation counters for the per-thread message cap.
-CREATE TABLE IF NOT EXISTS threads (
-    thread_id      INTEGER PRIMARY KEY,
-    channel_id     INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
-    opener_session TEXT NOT NULL DEFAULT '',
-    msg_count      INTEGER NOT NULL DEFAULT 0,
-    closed_at      INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS dispatches (
