@@ -65,6 +65,107 @@ teardown() {
     assert_num_eq "$(msql "SELECT COUNT(*) FROM channel_members WHERE session_id='a1';")" 0
 }
 
+# ── v1 -> channel model ──────────────────────────────────────────────
+
+# The v1 shape, verbatim, as a fixture rather than read out of git history: this
+# has to keep testing the schema people actually have on disk even after that
+# commit is far behind.
+_build_v1_db() {
+    rm -f "$DB"
+    sqlite3 "$DB" <<'SQL'
+PRAGMA journal_mode=WAL;
+CREATE TABLE agents (
+    session_id TEXT PRIMARY KEY, harness TEXT NOT NULL, alias TEXT UNIQUE,
+    tmux_pane TEXT, tmux_target TEXT, cwd TEXT, project_name TEXT,
+    push_capable INTEGER NOT NULL DEFAULT 0, block_streak INTEGER NOT NULL DEFAULT 0,
+    turn_state TEXT, model TEXT, transcript_path TEXT NOT NULL DEFAULT '',
+    registered_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    last_seen INTEGER NOT NULL DEFAULT (unixepoch()));
+CREATE TABLE messages (
+    id INTEGER PRIMARY KEY, thread_id TEXT NOT NULL, from_session TEXT NOT NULL,
+    to_session TEXT NOT NULL, body TEXT NOT NULL, hops INTEGER NOT NULL DEFAULT 0,
+    expect_reply INTEGER NOT NULL DEFAULT 0, reply_to_id INTEGER,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    delivered_at INTEGER, delivered_via TEXT);
+CREATE TABLE threads (
+    thread_id TEXT PRIMARY KEY, opener_session TEXT,
+    msg_count INTEGER NOT NULL DEFAULT 0, closed_at INTEGER);
+CREATE TABLE dispatches (
+    id INTEGER PRIMARY KEY, tmux_pane TEXT, harness TEXT NOT NULL, task TEXT NOT NULL,
+    alias TEXT, reply_to_session TEXT, worktree_branch TEXT,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch()), claimed_by TEXT, claimed_at INTEGER);
+INSERT INTO agents (session_id, harness, alias) VALUES ('a1','claude','alice'),('b2','codex','bob');
+INSERT INTO messages (thread_id, from_session, to_session, body, hops, delivered_at, delivered_via)
+  VALUES ('shared','a1','b2','one',0,NULL,NULL),
+         ('shared','b2','a1','two',1,1700000000,'stop-block'),
+         ('other','a1','human','three',0,NULL,NULL);
+INSERT INTO threads (thread_id, opener_session, msg_count) VALUES ('shared','a1',2),('other','a1',1);
+SQL
+    rm -f "$MESH_DIR"/.schema_v*
+}
+
+@test "a v1 database migrates to the channel model" {
+    _build_v1_db
+    "$MESH_BIN" init >/dev/null
+
+    # Every message survives, addressed by channel instead of to_session.
+    assert_num_eq "$(msql "SELECT COUNT(*) FROM messages;")" 3
+    assert_num_eq "$(msql "SELECT COUNT(*) FROM messages WHERE channel_id IS NULL;")" 0
+    # One DM channel per ordered pair, either direction resolving to the same row.
+    assert_num_eq "$(msql "SELECT COUNT(*) FROM channels WHERE kind='dm';")" 2
+    assert_not_empty "$(msql "SELECT id FROM channels WHERE name='dm:a1:b2';")"
+    # The v1 tables are gone, not left shadowing the new ones.
+    assert_num_eq "$(msql "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE '%_v1';")" 0
+}
+
+@test "v1 delivery columns become delivery rows" {
+    _build_v1_db
+    "$MESH_BIN" init >/dev/null
+
+    # Exactly the one message that carried delivered_at, attributed to the agent
+    # it was addressed to.
+    assert_num_eq "$(msql "SELECT COUNT(*) FROM deliveries;")" 1
+    assert_eq "$(msql "SELECT session_id FROM deliveries;")" "a1"
+    assert_eq "$(msql "SELECT delivered_via FROM deliveries;")" "stop-block"
+}
+
+@test "a v1 thread tag becomes one thread row per channel it spanned" {
+    _build_v1_db
+    "$MESH_BIN" init >/dev/null
+
+    assert_num_eq "$(msql "SELECT COUNT(*) FROM threads;")" 2
+    # Scoped, which is what a bare tag could not be: the tag lives in the channel
+    # its messages landed in.
+    assert_eq "$(msql "SELECT c.name FROM threads t JOIN channels c ON c.id=t.channel_id
+                       WHERE t.name='shared';")" "dm:a1:b2"
+    assert_num_eq "$(msql "SELECT COUNT(*) FROM messages m JOIN threads t ON t.id=m.thread_id
+                           WHERE t.name='shared';")" 2
+}
+
+@test "the migration leaves no dangling references" {
+    _build_v1_db
+    "$MESH_BIN" init >/dev/null
+    assert_empty "$(msql "PRAGMA foreign_key_check;")"
+    refute_file "$MESH_DIR/migration.log"
+}
+
+@test "migrating twice changes nothing" {
+    _build_v1_db
+    "$MESH_BIN" init >/dev/null
+    local before
+    before=$(msql "SELECT (SELECT COUNT(*) FROM messages)||'/'||(SELECT COUNT(*) FROM channels)
+                        ||'/'||(SELECT COUNT(*) FROM threads)||'/'||(SELECT COUNT(*) FROM deliveries);")
+    rm -f "$MESH_DIR"/.schema_v*
+    "$MESH_BIN" init >/dev/null
+    assert_eq "$(msql "SELECT (SELECT COUNT(*) FROM messages)||'/'||(SELECT COUNT(*) FROM channels)
+                            ||'/'||(SELECT COUNT(*) FROM threads)||'/'||(SELECT COUNT(*) FROM deliveries);")" "$before"
+}
+
+@test "the generated schema in mesh.sh matches the canonical file" {
+    run "$SCRIPTS_DIR/gen-schema.sh" --check
+    assert_ok
+}
+
 # ── migrations ───────────────────────────────────────────────────────
 
 @test "every migration statement is one line" {

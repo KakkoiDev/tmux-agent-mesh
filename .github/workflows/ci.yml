@@ -31,6 +31,12 @@ jobs:
             exit 1
           fi
           echo "lib/ matches tmux-toolkit $(cat lib/VERSION)"
+      # The bash copy of the schema is generated, not written. A hand edit to
+      # either side is how mesh.db ended up with two incompatible definitions of
+      # `messages` pointed at one file.
+      - name: mesh.sh schema matches internal/store/schema.sql
+        run: scripts/gen-schema.sh --check
+
       - name: bats
         run: bats tests/
 
