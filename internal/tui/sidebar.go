@@ -20,8 +20,12 @@ type AgentView struct {
 
 // ChannelView is the display representation of a channel.
 type ChannelView struct {
-	ID          int64
+	ID int64
+	// Name is the row in the channels table. Label is what the row shows: for a
+	// channel the two are the same, for a DM the label is who is on the other
+	// end, which the sidebar cannot work out from "dm:<session>:<session>".
 	Name        string
+	Label       string
 	Kind        string
 	Visibility  string
 	Unread      int
@@ -43,7 +47,6 @@ type SidebarModel struct {
 	height         int
 	focused        bool
 	showAgents     bool
-	showMembers    bool
 }
 
 func NewSidebar() SidebarModel {
@@ -108,9 +111,10 @@ func (m *SidebarModel) View() string {
 	// Channels header with separator
 	b.WriteString(SidebarTitleStyle.Render("CHANNELS"))
 	b.WriteString("\n")
-	// contentW is the usable width inside borders+padding: the Width()
-	// set on SidebarStyle minus the lipgloss chrome (2 borders + 2 padding).
-	contentW := max(0, m.width-sidebarChrome-2)
+	// contentW is the usable width inside borders+padding. It subtracted two
+	// more than the chrome costs, so the rule under CHANNELS stopped two
+	// columns short of the rows beneath it.
+	contentW := max(0, m.width-sidebarChrome)
 	sep := strings.Repeat("─", contentW)
 	b.WriteString(SidebarSeparatorStyle.Render(sep))
 	b.WriteString("\n")
@@ -118,12 +122,12 @@ func (m *SidebarModel) View() string {
 	// Channel rows — clamp to available height
 	avail := m.height - 1 // minus the header + separator line already rendered
 	membersSection := 0
-	if m.showMembers && len(m.channelMembers) > 0 {
-		membersSection = 1 + len(m.channelMembers) // channel members rows
+	if len(m.channelMembers) > 0 {
+		membersSection = 2 + len(m.channelMembers) // blank line + MEMBERS header + rows
 	}
 	agentSection := 0
 	if m.showAgents {
-		agentSection = 2 + len(m.agents) // blank line + MEMBERS header + agent rows
+		agentSection = 2 + len(m.agents) // blank line + AGENTS header + agent rows
 	}
 	maxCh := avail - 1 - membersSection - agentSection // -1 spare for header
 	if maxCh < 0 {
@@ -141,7 +145,12 @@ func (m *SidebarModel) View() string {
 		b.WriteString("\n")
 	}
 
-	if m.showMembers && len(m.channelMembers) > 0 {
+	// The members of the open channel. This block used to be unlabelled and sat
+	// above a roster titled MEMBERS, so the two lists read as one list with the
+	// wrong heading on it.
+	if len(m.channelMembers) > 0 {
+		b.WriteString("\n")
+		b.WriteString(SidebarTitleStyle.Render("MEMBERS"))
 		b.WriteString("\n")
 		for _, mem := range m.channelMembers {
 			b.WriteString(m.renderMember(mem))
@@ -149,9 +158,10 @@ func (m *SidebarModel) View() string {
 		}
 	}
 
+	// Everyone registered on the mesh, in or out of this channel.
 	if m.showAgents {
 		b.WriteString("\n")
-		b.WriteString(SidebarTitleStyle.Render("MEMBERS"))
+		b.WriteString(SidebarTitleStyle.Render("AGENTS"))
 		b.WriteString("\n")
 
 		for _, a := range m.agents {
@@ -172,7 +182,10 @@ func (m *SidebarModel) View() string {
 		lines = lines[:m.height]
 	}
 
-	style := SidebarStyle
+	// Width without the two border columns lipgloss draws outside it. Without
+	// it the block was as wide as its widest row, so a sidebar of short channel
+	// names pulled its right border in and the feed started wherever that left off.
+	style := SidebarStyle.Width(max(0, m.width-2))
 	if m.focused {
 		style = style.Background(focusBg)
 	}
@@ -185,24 +198,29 @@ func (m *SidebarModel) renderChannel(ch ChannelView, cursor, active bool) string
 		prefix = "> "
 	}
 
-	name := ch.Name
+	// A DM's row name is "dm:<session>:<session>". Slicing the prefix off it
+	// printed both raw session ids into a 22-column column; the label the model
+	// resolved is who is on the other end.
+	name := ch.Label
+	if name == "" {
+		name = ch.Name
+	}
 	if ch.Kind == "dm" {
-		name = "@" + name[3:] // strip "dm-" prefix for display
+		name = "@" + name
 	} else {
 		name = "#" + name
 	}
 
-	// Build the trailing markers: priority order is lock > unread > member count.
-	// Drop lowest-priority items when they don't all fit.
+	// Trailing markers: the lock, then the unread count. The member count used
+	// to render in the same parentheses as the unread count, so "#general (4)"
+	// had two readings and no way to tell them apart. It is in the feed header
+	// now, where there is room to name it.
 	var suffix []string
-	if ch.Visibility == "private" {
+	if ch.Visibility == "private" && ch.Kind != "dm" {
 		suffix = append(suffix, "[L]")
 	}
 	if ch.Unread > 0 {
 		suffix = append(suffix, fmt.Sprintf("(%d)", ch.Unread))
-	}
-	if ch.MemberCount > 0 && ch.Kind != "dm" {
-		suffix = append(suffix, fmt.Sprintf("(%d)", ch.MemberCount))
 	}
 
 	// Content width: sidebar width minus borders and horizontal padding.
@@ -254,33 +272,21 @@ func (m *SidebarModel) renderAgent(a AgentView) string {
 }
 
 func (m *SidebarModel) renderMember(mem store.MemberInfo) string {
-	dot := "●" // default green working
-	switch mem.TurnState {
-	case "idle":
+	// Single-width glyphs only: the name budget below leaves room for one column
+	// of status glyph. The human's used to be an emoji, which is two, so a member
+	// with a full-width name wrapped onto a second row.
+	dot := "●"
+	if mem.TurnState == "idle" {
 		dot = "○"
-	case "working":
-		dot = "●"
 	}
 	if mem.Harness == "human" {
-		dot = "👤"
+		dot = "◆"
 	}
-	roleSuffix := ""
+	name := mem.Name
 	if mem.Role == "owner" {
-		roleSuffix = " (owner)"
+		name += " (owner)"
 	}
-	contentW := m.width - sidebarChrome
-	name := Truncate(mem.Name+roleSuffix, max(1, contentW-3))
-	line := fmt.Sprintf(" %s %s%s", dot, name, "")
-	// full line with suffix if room
-	if lipgloss.Width(line) < contentW-2 {
-		full := fmt.Sprintf(" %s %s", dot, mem.Name)
-		if mem.Role == "owner" {
-			full += " (owner)"
-		}
-		if lipgloss.Width(full) <= contentW {
-			line = full
-		}
-	}
+	line := fmt.Sprintf(" %s %s", dot, Truncate(name, max(1, m.width-sidebarChrome-3)))
 	return ChannelItemStyle.Render(line)
 }
 

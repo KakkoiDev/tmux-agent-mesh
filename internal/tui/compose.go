@@ -142,6 +142,14 @@ func (m *ComposeModel) View() string {
 	if hints == "" {
 		hints = "enter: send  tab: switch  ctrl+t: thread  ctrl+n: dm  ctrl+k: channel  ?: help  ctrl+c: quit"
 	}
+	// Truncated, not wrapped: lipgloss wraps content wider than the style, and a
+	// two-row hint bar makes the whole layout one row too tall, which pushes the
+	// top row of both panels off the terminal.
+	// Width(m.width-3) counts StatusBarStyle's own single-column padding on each
+	// side, so the text itself gets five columns less than the terminal.
+	if w := m.width - 5; w > 0 {
+		hints = Truncate(hints, w)
+	}
 	rendered += "\n" + StatusBarStyle.Width(m.width-3).Render(hints)
 	rendered = style.Render(rendered)
 
@@ -156,31 +164,42 @@ Keybindings
 Navigation
   j / ↓          Move down
   k / ↑          Move up
-  gg             Scroll to top
-  G              Scroll to bottom
+  gg / G         Top / bottom
+  Ctrl+D/Ctrl+U  Page down / up
   Tab            Next panel
   Shift+Tab      Previous panel
-
-Actions
-  Enter          Send message
-  r              Reply to selected
-  e              Edit your message
-  d              Delete your message
-  J / K          Reorder channel (sidebar)
-  Ctrl+T         Thread view
-  Ctrl+N         New direct message
-  Ctrl+K         Create/join channel
-  Ctrl+U         Upload file
-  i              Toggle detail bar
-  s              Toggle sidebar
+  Ctrl+N         Open a direct message
+  Ctrl+K         Jump to a channel
   /              Search
+
+Messages
+  Enter          Send, or open the thread
+  r              Reply to the selected message
+  e              Edit your message
+  t / Ctrl+T     Thread view
+  i              Detail bar (delivery receipts)
+  s              Show or hide the agent roster
+
+Channels        (sidebar cursor, or the open channel)
+  c              Create a channel
+  r              Rename            (sidebar)
+  T              Set the topic
+  p              Public / private  (sidebar)
+  A / d          Archive
+  L              Leave
+  i / I          Invite an agent
+  x              Remove a member
+  Ctrl+R         Access rules (harness / model)
+  J / K          Reorder the sidebar
+  R              Rename an agent   (sidebar)
+
   ?              Help (this)
   q / Ctrl+C     Quit
 
 Status
-  ● working  ◐ idle+pending  ○ idle  ✕ dead
+  ● working  ◐ idle+pending  ○ idle  ✕ dead  ◆ you
   ✓ sent  ✓✓ read  ◔ pending
-  * unread  [L] private channel`
+  (3) unread  [L] private channel`
 
 	box := HelpStyle.Width(width - 4).Height(height - 4)
 	rendered := box.Render(HelpTitleStyle.Render("Help") + "\n" + help)

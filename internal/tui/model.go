@@ -31,6 +31,11 @@ const (
 	ActionToggleVisibility
 	ActionInviteMember
 	ActionRenameAgent
+	ActionRemoveMember
+	ActionLeaveChannel
+	ActionSetTopic
+	ActionAddRule
+	ActionRemoveRule
 )
 
 // Model is the top-level Bubble Tea model for the mesh TUI.
@@ -66,6 +71,7 @@ type Model struct {
 	showPrompt        bool
 	promptAction      PromptAction
 	promptCtxID       int64  // channel ID or agent index
+	promptCtxKey      string // session id or "subject=value" rule the action targets
 	promptChannelName string // temp storage for channel name during creation
 	waitingForGG      bool   // second 'g' for gg binding
 
@@ -133,6 +139,10 @@ type channelMembersMsg struct {
 	channelID int64
 	members   []store.MemberInfo
 }
+type readMsg struct {
+	channelID int64
+	marked    int
+}
 type searchResultsMsg struct{ results []SearchResult }
 type threadRepliesMsg struct {
 	threadID int64
@@ -150,6 +160,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.resize()
+		// The hint bar is written by updateFocus, which only ran on a focus
+		// change, so until the first Tab the bar advertised a different key set
+		// from the panel that had focus.
+		m.updateFocus()
 		return m, nil
 
 	case tea.KeyMsg:
@@ -169,7 +183,15 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.currentChID == 0 && len(msg.channels) > 0 {
 			m.currentChID = msg.channels[0].ID
 			m.currentCh = msg.channels[0].Name
-			return m, m.loadHistory(m.currentChID)
+			m.updateFeed()
+			return m, tea.Batch(m.loadHistory(m.currentChID), m.loadChannelMembers(m.currentChID))
+		}
+		// The header carries the topic and the member count, and the member
+		// list is drawn from a separate query, so both are stale the moment a
+		// membership or a topic changes.
+		m.updateFeed()
+		if m.currentChID != 0 {
+			return m, m.loadChannelMembers(m.currentChID)
 		}
 		return m, nil
 
@@ -182,6 +204,15 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.allMessages[msg.channelID] = msg.messages
 		if msg.channelID == m.currentChID {
 			m.updateFeed()
+			// Showing a person a message is that person reading it, so the badge
+			// on the channel they are looking at has to clear itself.
+			return m, m.markRead(msg.channelID)
+		}
+		return m, nil
+
+	case readMsg:
+		if msg.marked > 0 {
+			m.updateSidebar()
 		}
 		return m, nil
 
@@ -233,14 +264,16 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	key := msg.String()
 
-	// Global quit. ctrl+c always quits; 'q' quits everywhere except while
-	// composing, where it is a letter to be typed.
-	if key == "ctrl+c" || (key == "q" && m.focusedPanel != PanelCompose) {
+	// Whether an overlay owns a text input right now. Letters are letters then:
+	// naming a channel "quarantine" used to close the prompt on the first
+	// keystroke, and "why?" opened the help over the picker.
+	typing := (m.showPrompt && m.prompt.mode == PromptText) || m.showPicker || m.showSearch
+
+	// Global quit. ctrl+c always quits; 'q' quits everywhere except while text
+	// is being entered, where it is a letter.
+	if key == "ctrl+c" || (key == "q" && m.focusedPanel != PanelCompose && !typing) {
 		if m.showPrompt {
-			m.prompt.Deactivate()
-			m.showPrompt = false
-			m.promptAction = ActionNone
-			m.promptChannelName = ""
+			m.cancelPrompt()
 			return m, nil
 		}
 		if m.showPicker {
@@ -269,9 +302,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// Global escape
 	if key == "esc" {
 		if m.showPrompt {
-			m.prompt.Deactivate()
-			m.showPrompt = false
-			m.promptAction = ActionNone
+			m.cancelPrompt()
 			return m, nil
 		}
 		if m.showHelp {
@@ -304,7 +335,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	// Global toggles
-	if key == "?" && m.focusedPanel != PanelCompose {
+	if key == "?" && m.focusedPanel != PanelCompose && !typing {
 		m.showHelp = !m.showHelp
 		return m, nil
 	}
@@ -373,8 +404,9 @@ func (m *Model) handleComposeKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "enter":
 		return m.handleEnter()
-	case "ctrl+n", "ctrl+k":
-		// Global shortcuts stay available while typing.
+	case "ctrl+n", "ctrl+k", "ctrl+r":
+		// Global shortcuts stay available while typing. Only ctrl chords: a
+		// letter here would be a letter the compose bar could never type.
 		return m.handleNormalKey(msg)
 	default:
 		var cmd tea.Cmd
@@ -502,11 +534,13 @@ func (m *Model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "d":
 		if m.focusedPanel == PanelSidebar {
-			// Delete channel
+			// Archive, which is what the store does. The prompt used to say
+			// "Delete", and the channel it hid was still there with all of its
+			// messages in it.
 			if ch := m.sidebar.CursorChannel(); ch != nil {
 				m.promptAction = ActionDeleteChannel
 				m.promptCtxID = ch.ID
-				m.prompt.ActivateConfirm("Delete channel #" + ch.Name + "?")
+				m.prompt.ActivateConfirm("Archive " + m.displayOf(ch.ID, ch.Name) + "?")
 				m.showPrompt = true
 			}
 			return m, nil
@@ -532,16 +566,85 @@ func (m *Model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			// Rename agent: show agent picker
 			m.promptAction = ActionRenameAgent
 			m.showPicker = true
-			var items []PickerItem
-			for _, a := range m.agents {
-				if a.SessionID != ViewerSession {
-					items = append(items, PickerItem{
-						Name:   a.Name(),
-						Detail: a.Harness,
-					})
-				}
+			m.picker.Activate(PickerAgent, m.agentItems())
+		}
+		return m, nil
+
+	case "x":
+		// Remove a member from the channel.
+		if ch, ok := m.adminChannel(); ok {
+			members, err := m.store.ChannelMembers(ch.ID)
+			if err != nil {
+				return m, func() tea.Msg { return errMsg{err} }
 			}
-			m.picker.Activate(PickerAgent, items)
+			var items []PickerItem
+			for _, mem := range members {
+				if mem.SessionID == ViewerSession {
+					continue
+				}
+				items = append(items, PickerItem{
+					Key: mem.SessionID, Name: mem.Name, Detail: mem.Role,
+				})
+			}
+			if len(items) == 0 {
+				return m, nil
+			}
+			m.promptAction = ActionRemoveMember
+			m.promptCtxID = ch.ID
+			m.showPicker = true
+			m.picker.Activate(PickerMember, items)
+		}
+		return m, nil
+
+	case "L":
+		if ch, ok := m.adminChannel(); ok {
+			m.promptAction = ActionLeaveChannel
+			m.promptCtxID = ch.ID
+			m.prompt.ActivateConfirm("Leave " + ch.Display + "?")
+			m.showPrompt = true
+		}
+		return m, nil
+
+	case "A":
+		if ch, ok := m.adminChannel(); ok {
+			m.promptAction = ActionDeleteChannel
+			m.promptCtxID = ch.ID
+			m.prompt.ActivateConfirm("Archive " + ch.Display + "?")
+			m.showPrompt = true
+		}
+		return m, nil
+
+	case "T":
+		if ch, ok := m.adminChannel(); ok {
+			m.promptAction = ActionSetTopic
+			m.promptCtxID = ch.ID
+			m.prompt.ActivateText("Topic for "+ch.Display, "Empty clears it...")
+			m.showPrompt = true
+		}
+		return m, nil
+
+	case "ctrl+r":
+		if ch, ok := m.adminChannel(); ok {
+			rules, err := m.store.Rules(ch.ID)
+			if err != nil {
+				return m, func() tea.Msg { return errMsg{err} }
+			}
+			// The add entry is an item rather than a separate key: the list is
+			// where you look to find out what the rules are, so it is also
+			// where adding one belongs.
+			items := []PickerItem{{
+				Key: addRuleKey, Name: "+ add rule", Detail: "harness:claude, model:claude-opus",
+			}}
+			for _, r := range rules {
+				items = append(items, PickerItem{
+					Key:    r.Subject + ":" + r.Value,
+					Name:   r.Subject + ":" + r.Value,
+					Detail: "select to remove",
+				})
+			}
+			m.promptCtxID = ch.ID
+			m.showPicker = true
+			m.picker.Activate(PickerRule, items)
 		}
 		return m, nil
 
@@ -560,21 +663,16 @@ func (m *Model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
-	case "i":
-		if m.focusedPanel == PanelSidebar {
-			// Invite opens the agent picker
-			m.promptAction = ActionInviteMember
-			m.showPicker = true
-			var items []PickerItem
-			for _, a := range m.agents {
-				if a.SessionID != ViewerSession {
-					items = append(items, PickerItem{
-						Name:   a.Name(),
-						Detail: a.Harness,
-					})
-				}
+	case "i", "I":
+		// Invite opens the agent picker. 'i' is the detail toggle everywhere
+		// but the sidebar, so 'I' is the way to invite from the feed.
+		if m.focusedPanel == PanelSidebar || key == "I" {
+			if ch, ok := m.adminChannel(); ok {
+				m.promptAction = ActionInviteMember
+				m.promptCtxID = ch.ID
+				m.showPicker = true
+				m.picker.Activate(PickerAgent, m.agentItems())
 			}
-			m.picker.Activate(PickerAgent, items)
 		}
 		return m, nil
 
@@ -587,17 +685,12 @@ func (m *Model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case "ctrl+n":
+		// PickerAgent is shared with invite and rename, which key off
+		// promptAction, and an abandoned picker leaves it set. Without this,
+		// cancelling an invite and then opening a DM invited the agent instead.
+		m.promptAction = ActionNone
 		m.showPicker = true
-		var items []PickerItem
-		for _, a := range m.agents {
-			if a.SessionID != ViewerSession {
-				items = append(items, PickerItem{
-					Name:   a.Name(),
-					Detail: a.Harness,
-				})
-			}
-		}
-		m.picker.Activate(PickerAgent, items)
+		m.picker.Activate(PickerAgent, m.agentItems())
 		return m, nil
 
 	case "ctrl+k":
@@ -627,6 +720,51 @@ func (m *Model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, nil
+}
+
+// addRuleKey is the picker entry that opens the add-a-rule prompt. A rule is
+// always "subject:value", so no real rule can collide with it.
+const addRuleKey = "+"
+
+// adminTarget is the channel a channel-admin key acts on.
+type adminTarget struct {
+	ID      int64
+	Name    string
+	Display string
+}
+
+// adminChannel is the channel the admin keys act on: whatever the sidebar
+// cursor is on when the sidebar has focus, and the open channel otherwise, so
+// x/L/A/T/ctrl+r do not need the sidebar focused to be reachable.
+func (m *Model) adminChannel() (adminTarget, bool) {
+	if m.focusedPanel == PanelSidebar {
+		if ch := m.sidebar.CursorChannel(); ch != nil {
+			return adminTarget{ID: ch.ID, Name: ch.Name, Display: m.displayOf(ch.ID, ch.Name)}, true
+		}
+	}
+	if m.currentChID != 0 {
+		return adminTarget{ID: m.currentChID, Name: m.currentCh,
+			Display: m.displayOf(m.currentChID, m.currentCh)}, true
+	}
+	return adminTarget{}, false
+}
+
+func (m *Model) displayOf(channelID int64, fallback string) string {
+	if ch, ok := m.channelIdx[channelID]; ok {
+		return m.channelDisplay(ch)
+	}
+	return fallback
+}
+
+func (m *Model) agentItems() []PickerItem {
+	var items []PickerItem
+	for _, a := range m.agents {
+		if a.SessionID == ViewerSession {
+			continue
+		}
+		items = append(items, PickerItem{Key: a.SessionID, Name: a.Name(), Detail: a.Harness})
+	}
+	return items
 }
 
 func (m *Model) handleEnter() (tea.Model, tea.Cmd) {
@@ -663,7 +801,6 @@ func (m *Model) handleEnter() (tea.Model, tea.Cmd) {
 		if ch := m.sidebar.CursorChannel(); ch != nil {
 			m.currentChID = ch.ID
 			m.currentCh = ch.Name
-			m.sidebar.showMembers = true
 			m.updateSidebar()
 			return m, tea.Batch(m.loadHistory(ch.ID), m.loadChannelMembers(ch.ID))
 		}
@@ -724,71 +861,53 @@ func (m *Model) handlePickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 		switch m.picker.mode {
 		case PickerAgent:
-			if m.promptAction == ActionRenameAgent {
-				// Find agent by name and prompt for rename
-				for _, a := range m.agents {
-					if a.Name() == sel.Name && a.SessionID != ViewerSession {
-						m.promptCtxID = 0
-						// Store session ID in a way we can retrieve — use agents index
-						for idx, ag := range m.agents {
-							if ag.SessionID == a.SessionID {
-								m.promptCtxID = int64(idx)
-								break
-							}
-						}
-						m.prompt.ActivateText("Rename agent "+a.Name(), "New name...")
-						m.showPrompt = true
-						return m, nil
-					}
-				}
+			switch m.promptAction {
+			case ActionRenameAgent:
+				m.promptCtxKey = sel.Key
+				m.prompt.ActivateText("Rename agent "+sel.Name, "New name...")
+				m.showPrompt = true
+				return m, nil
+			case ActionInviteMember:
+				channelID := m.promptCtxID
 				m.promptAction = ActionNone
+				return m, m.inviteMember(channelID, sel.Key)
+			}
+			// Default: open a DM with whoever was picked.
+			ch, err := m.store.DMChannel(ViewerSession, sel.Key)
+			if err != nil {
+				return m, func() tea.Msg { return errMsg{err} }
+			}
+			m.currentChID = ch.ID
+			m.currentCh = ch.Name
+			return m, tea.Batch(m.reloadChannels(), m.loadHistory(ch.ID))
+
+		case PickerMember:
+			m.promptCtxKey = sel.Key
+			m.promptAction = ActionRemoveMember
+			m.prompt.ActivateConfirm("Remove " + sel.Name + " from this channel?")
+			m.showPrompt = true
+			return m, nil
+
+		case PickerRule:
+			if sel.Key == addRuleKey {
+				m.promptAction = ActionAddRule
+				m.prompt.ActivateText("Add access rule", "harness:claude or model:claude-opus")
+				m.showPrompt = true
 				return m, nil
 			}
-			if m.promptAction == ActionInviteMember {
-				// Invite to current channel
-				if ch := m.sidebar.CursorChannel(); ch != nil {
-					for _, a := range m.agents {
-						if a.Name() == sel.Name && a.SessionID != ViewerSession {
-							err := m.store.Join(ch.ID, a.SessionID)
-							if err == nil {
-								// Reload channels
-								return m, tea.Batch(
-									func() tea.Msg {
-										channels, _ := m.store.Channels()
-										return channelsMsg{channels}
-									},
-								)
-							}
-						}
-					}
-				}
-				m.promptAction = ActionNone
-				return m, nil
-			}
-			// Default: DM
-			for _, a := range m.agents {
-				if a.Name() == sel.Name && a.SessionID != ViewerSession {
-					ch, err := m.store.DMChannel(ViewerSession, a.SessionID)
-					if err == nil {
-						m.currentChID = ch.ID
-						m.currentCh = ch.Name
-						// Reload channels and switch
-						return m, tea.Batch(
-							func() tea.Msg {
-								channels, _ := m.store.Channels()
-								return channelsMsg{channels}
-							},
-							m.loadHistory(ch.ID),
-						)
-					}
-				}
-			}
+			m.promptCtxKey = sel.Key
+			m.promptAction = ActionRemoveRule
+			m.prompt.ActivateConfirm("Remove rule " + sel.Key + "?")
+			m.showPrompt = true
+			return m, nil
+
 		case PickerChannel:
 			if sel.ID != 0 {
 				m.currentChID = sel.ID
 				m.currentCh = sel.Name
 				m.updateSidebar()
-				return m, m.loadHistory(sel.ID)
+				m.updateFeed()
+				return m, tea.Batch(m.loadHistory(sel.ID), m.loadChannelMembers(sel.ID))
 			}
 		}
 		return m, nil
@@ -904,10 +1023,7 @@ func (m *Model) handlePromptKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	switch key {
 	case "esc", "ctrl+c":
-		m.prompt.Deactivate()
-		m.showPrompt = false
-		m.promptAction = ActionNone
-		m.promptChannelName = ""
+		m.cancelPrompt()
 		return m, nil
 
 	case "enter":
@@ -915,7 +1031,13 @@ func (m *Model) handlePromptKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.showPrompt = false
 		action := m.promptAction
 		m.promptAction = ActionNone
-		return m, m.executePromptAction(action, m.prompt.input.Value(), m.prompt.confirmVal)
+		cmd := m.executePromptAction(action, m.prompt.input.Value(), m.prompt.confirmVal)
+		// Cleared after the action ran, not before: it is the action's argument.
+		// A stale key here is what makes the next confirm act on the last target.
+		if !m.showPrompt {
+			m.promptCtxKey = ""
+		}
+		return m, cmd
 
 	case "y":
 		if m.prompt.mode == PromptConfirm {
@@ -933,6 +1055,14 @@ func (m *Model) handlePromptKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	m.prompt, cmd = m.prompt.Update(msg)
 	return m, cmd
+}
+
+func (m *Model) cancelPrompt() {
+	m.prompt.Deactivate()
+	m.showPrompt = false
+	m.promptAction = ActionNone
+	m.promptChannelName = ""
+	m.promptCtxKey = ""
 }
 
 func (m *Model) handleThreadReplies(msg threadRepliesMsg) {
@@ -1000,16 +1130,60 @@ func (m *Model) executePromptAction(action PromptAction, text string, confirmed 
 		return nil
 
 	case ActionRenameAgent:
-		if text == "" {
+		if text == "" || m.promptCtxKey == "" {
 			return nil
 		}
-		agentIdx := int(m.promptCtxID)
-		if agentIdx >= 0 && agentIdx < len(m.agents) {
-			return m.renameAgent(m.agents[agentIdx].SessionID, text)
+		return m.renameAgent(m.promptCtxKey, text)
+
+	case ActionRemoveMember:
+		if !confirmed || m.promptCtxKey == "" {
+			return nil
 		}
-		return nil
+		return m.removeMember(m.promptCtxID, m.promptCtxKey)
+
+	case ActionLeaveChannel:
+		if !confirmed {
+			return nil
+		}
+		return m.removeMember(m.promptCtxID, ViewerSession)
+
+	case ActionSetTopic:
+		return m.setTopic(m.promptCtxID, text)
+
+	case ActionAddRule:
+		subject, value, ok := parseRule(text)
+		if !ok {
+			return func() tea.Msg {
+				return errMsg{fmt.Errorf("a rule is harness:<name> or model:<prefix>, got %q", text)}
+			}
+		}
+		return m.addRule(m.promptCtxID, subject, value)
+
+	case ActionRemoveRule:
+		if !confirmed {
+			return nil
+		}
+		subject, value, ok := parseRule(m.promptCtxKey)
+		if !ok {
+			return nil
+		}
+		return m.removeRule(m.promptCtxID, subject, value)
 	}
 	return nil
+}
+
+// parseRule reads the "subject:value" a rule is written as. The value may hold
+// colons, so only the first one separates.
+func parseRule(text string) (string, string, bool) {
+	subject, value, found := strings.Cut(strings.TrimSpace(text), ":")
+	if !found {
+		return "", "", false
+	}
+	subject, value = strings.TrimSpace(subject), strings.TrimSpace(value)
+	if subject == "" || value == "" {
+		return "", "", false
+	}
+	return subject, value, true
 }
 
 func (m Model) createChannel(name, visibility string) tea.Cmd {
@@ -1060,6 +1234,63 @@ func (m Model) toggleVisibility(channelID int64) tea.Cmd {
 			return errMsg{err}
 		}
 		channels, _ := m.store.Channels()
+		return channelsMsg{channels}
+	}
+}
+
+func (m Model) inviteMember(channelID int64, sessionID string) tea.Cmd {
+	return func() tea.Msg {
+		if err := m.store.Join(channelID, sessionID); err != nil {
+			return errMsg{err}
+		}
+		return m.reloadChannels()()
+	}
+}
+
+// removeMember is both "remove them" and "leave", which are the same row in
+// channel_members seen from either end.
+func (m Model) removeMember(channelID int64, sessionID string) tea.Cmd {
+	return func() tea.Msg {
+		if err := m.store.Leave(channelID, sessionID); err != nil {
+			return errMsg{err}
+		}
+		return m.reloadChannels()()
+	}
+}
+
+func (m Model) setTopic(channelID int64, topic string) tea.Cmd {
+	return func() tea.Msg {
+		if err := m.store.SetChannelTopic(channelID, strings.TrimSpace(topic)); err != nil {
+			return errMsg{err}
+		}
+		return m.reloadChannels()()
+	}
+}
+
+func (m Model) addRule(channelID int64, subject, value string) tea.Cmd {
+	return func() tea.Msg {
+		if err := m.store.AddRule(channelID, subject, value); err != nil {
+			return errMsg{err}
+		}
+		return m.reloadChannels()()
+	}
+}
+
+func (m Model) removeRule(channelID int64, subject, value string) tea.Cmd {
+	return func() tea.Msg {
+		if err := m.store.RemoveRule(channelID, subject, value); err != nil {
+			return errMsg{err}
+		}
+		return m.reloadChannels()()
+	}
+}
+
+func (m Model) reloadChannels() tea.Cmd {
+	return func() tea.Msg {
+		channels, err := m.store.Channels()
+		if err != nil {
+			return errMsg{err}
+		}
 		return channelsMsg{channels}
 	}
 }
@@ -1129,28 +1360,28 @@ func (m *Model) updateFocus() {
 		m.compose.SetHint("enter: send  shift+enter: newline  esc: feed  tab: sidebar")
 	} else if m.focusedPanel == PanelSidebar {
 		m.compose.Blur()
-		m.compose.SetHint("j/k: navigate  J/K: reorder  d: delete  c: create  r: rename  R: rename agent  p: toggle private  i: invite  tab: feed")
+		// Short enough to fit a 110-column terminal on one row. The keys it
+		// leaves out (J/K reorder, p) are in the help overlay.
+		m.compose.SetHint("j/k: move  c: create  r: rename  T: topic  i/x: invite/remove  L: leave  A: archive  ^r: rules  ?: help")
 	} else if m.focusedPanel == PanelFeed {
 		m.compose.Blur()
-		m.compose.SetHint("j/k: scroll  enter/t: thread  r: reply  i: detail  /: search  tab: sidebar")
+		m.compose.SetHint("j/k: scroll  enter/t: thread  r: reply  i: detail  I: invite  T: topic  ^r: rules  /: search  ?: help")
 	}
 }
 
 func (m *Model) updateSidebar() {
+	// Asked of the store rather than counted from m.allMessages, which only
+	// holds channels whose history has been opened: every channel you had not
+	// visited, the only ones whose badge you need, read as zero unread.
+	unreadByChannel, _ := m.store.UnreadCounts(ViewerSession)
+
 	var chViews []ChannelView
 	for _, ch := range m.channels {
-		unread := 0
-		if msgs, ok := m.allMessages[ch.ID]; ok {
-			for _, msg := range msgs {
-				receipts, _ := m.store.Receipts(msg.ID, ViewerSession)
-				if len(receipts) == 0 {
-					unread++
-				}
-			}
-		}
+		unread := unreadByChannel[ch.ID]
 		chViews = append(chViews, ChannelView{
 			ID:          ch.ID,
 			Name:        ch.Name,
+			Label:       m.channelLabel(ch),
 			Kind:        ch.Kind,
 			Visibility:  ch.Visibility,
 			Unread:      unread,
@@ -1173,7 +1404,46 @@ func (m *Model) updateSidebar() {
 	m.sidebar.SetAgents(agentViews)
 }
 
+// channelLabel is what the sidebar shows for a channel. A DM is named after the
+// two sessions in it, which is an address rather than something to read, so it
+// is labelled with whoever is on the other end.
+func (m *Model) channelLabel(ch store.Channel) string {
+	if ch.Kind != "dm" {
+		return ch.Name
+	}
+	names := make([]string, 0, len(ch.Members))
+	for _, sid := range ch.Members {
+		if sid == ViewerSession {
+			continue
+		}
+		names = append(names, m.agentName(sid))
+	}
+	if len(names) == 0 {
+		return ch.Name
+	}
+	return strings.Join(names, ", ")
+}
+
+func (m *Model) agentName(sessionID string) string {
+	for _, a := range m.agents {
+		if a.SessionID == sessionID {
+			return a.Name()
+		}
+	}
+	if len(sessionID) > 8 {
+		return sessionID[:8]
+	}
+	return sessionID
+}
+
 func (m *Model) updateFeed() {
+	ch, known := m.channelIdx[m.currentChID]
+	if known {
+		m.feed.SetChannel(m.channelDisplay(ch), ch.Topic, len(ch.Members))
+	} else {
+		m.feed.SetChannel(m.currentCh, "", 0)
+	}
+
 	msgs, ok := m.allMessages[m.currentChID]
 	if !ok {
 		m.feed.SetMessages(nil)
@@ -1185,7 +1455,15 @@ func (m *Model) updateFeed() {
 		views = append(views, m.msgToView(msg))
 	}
 	m.feed.SetMessages(views)
-	m.feed.channelName = m.currentCh
+}
+
+// channelDisplay is the label with the sigil the sidebar puts on it, so the
+// feed header and the sidebar row name the same channel the same way.
+func (m *Model) channelDisplay(ch store.Channel) string {
+	if ch.Kind == "dm" {
+		return "@" + m.channelLabel(ch)
+	}
+	return "#" + ch.Name
 }
 
 func (m *Model) msgToView(msg store.Message) MsgView {
@@ -1213,6 +1491,16 @@ func (m Model) loadHistory(channelID int64) tea.Cmd {
 			return errMsg{err}
 		}
 		return historyMsg{channelID: channelID, messages: msgs}
+	}
+}
+
+func (m Model) markRead(channelID int64) tea.Cmd {
+	return func() tea.Msg {
+		n, err := m.store.MarkChannelRead(channelID, ViewerSession)
+		if err != nil {
+			return errMsg{err}
+		}
+		return readMsg{channelID: channelID, marked: n}
 	}
 }
 

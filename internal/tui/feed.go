@@ -30,15 +30,17 @@ type MsgView struct {
 
 // FeedModel is the scrollable message area.
 type FeedModel struct {
-	messages    []MsgView
-	viewport    viewport.Model
-	width       int
-	height      int
-	focused     bool
-	cursor      int // index into messages
-	channelName string
-	showThread  bool
-	threadMsgs  []MsgView
+	messages     []MsgView
+	viewport     viewport.Model
+	width        int
+	height       int
+	focused      bool
+	cursor       int // index into messages
+	channelName  string
+	channelTopic string
+	memberCount  int
+	showThread   bool
+	threadMsgs   []MsgView
 }
 
 func NewFeed() FeedModel {
@@ -51,16 +53,34 @@ func NewFeed() FeedModel {
 func (m *FeedModel) SetSize(width, height int) {
 	m.width = width
 	m.height = height
-	// FeedStyle chrome: 1 left border + 2 horizontal padding.
-	m.viewport.Width = max(0, width-3)
+	// FeedStyle chrome is two columns of horizontal padding and no border. It
+	// used to subtract three, which left the feed one column short of its
+	// share of the terminal and the row's last cell showing through.
+	m.viewport.Width = max(0, width-2)
 	m.viewport.Height = height
 }
 
 func (m *FeedModel) SetMessages(msgs []MsgView) {
+	// Stick to the bottom while the cursor is already there, which is where a
+	// chat is read from. Once the reader has scrolled up, new traffic must not
+	// yank them back down.
+	atBottom := len(m.messages) == 0 || m.cursor >= len(m.messages)-1
 	m.messages = msgs
+	if atBottom {
+		m.cursor = max(0, len(msgs)-1)
+	}
 	if m.cursor >= len(msgs) {
 		m.cursor = max(0, len(msgs)-1)
 	}
+}
+
+// SetChannel records what the header shows: the name, its topic and how many
+// members it has. The member count lives here rather than in the sidebar row,
+// where it was indistinguishable from the unread count.
+func (m *FeedModel) SetChannel(name, topic string, members int) {
+	m.channelName = name
+	m.channelTopic = topic
+	m.memberCount = members
 }
 
 func (m *FeedModel) SelectedMessage() *MsgView {
@@ -70,17 +90,20 @@ func (m *FeedModel) SelectedMessage() *MsgView {
 	return nil
 }
 
+// The cursor is an index into the messages; the viewport offset is a line
+// count. They used to be set from each other, so a feed of three-line messages
+// scrolled at a third of the speed the cursor moved and the selected message
+// left the screen. View does the conversion now, because that is where the
+// rendered line each message starts on is known.
 func (m *FeedModel) MoveUp() {
 	if m.cursor > 0 {
 		m.cursor--
-		m.viewport.SetYOffset(m.cursor)
 	}
 }
 
 func (m *FeedModel) MoveDown() {
 	if m.cursor < len(m.messages)-1 {
 		m.cursor++
-		m.viewport.SetYOffset(max(0, m.cursor-m.viewport.Height+3))
 	}
 }
 
@@ -119,36 +142,82 @@ func (m *FeedModel) Update(msg tea.Msg) (FeedModel, tea.Cmd) {
 }
 
 func (m *FeedModel) View() string {
-	var b strings.Builder
-
-	// Channel name header
-	if m.channelName != "" {
-		b.WriteString(MessageHeaderStyle.Render(m.channelName))
-		b.WriteString("\n")
-	}
-
-	// Messages
 	msgs := m.messages
 	if m.showThread {
 		msgs = m.threadMsgs
 	}
 
-	for i, msg := range msgs {
-		line := m.renderMessage(msg, i == m.cursor && m.focused)
-		b.WriteString(line)
-		b.WriteString("\n")
+	// The header names the channel, so it stays on the first row whatever the
+	// messages do. Only the messages are bottom-anchored.
+	var header []string
+	if m.channelName != "" {
+		header = append(header, m.headerLine())
 	}
 
-	content := b.String()
-	m.viewport.SetContent(content)
+	var lines []string
+
+	// Where the selected message sits, in rendered lines rather than in
+	// messages, so the viewport can be scrolled to keep it whole.
+	top, bottom := 0, 0
+	for i, msg := range msgs {
+		rendered := strings.Split(
+			strings.TrimRight(m.renderMessage(msg, i == m.cursor && m.focused), "\n"), "\n")
+		if i == m.cursor {
+			top = len(lines)
+			bottom = len(lines) + len(rendered) - 1
+		}
+		lines = append(lines, rendered...)
+		lines = append(lines, "")
+	}
+
+	// A chat is read from the bottom: with less to show than there is room
+	// for, the blank rows belong above the first message, not below the last.
+	if pad := m.viewport.Height - len(header) - len(lines); pad > 0 {
+		lines = append(make([]string, pad), lines...)
+		top += pad
+		bottom += pad
+	}
+
+	lines = append(header, lines...)
+	top += len(header)
+	bottom += len(header)
+
+	m.viewport.SetContent(strings.Join(lines, "\n"))
+
+	offset := m.viewport.YOffset
+	if bottom >= offset+m.viewport.Height {
+		offset = bottom - m.viewport.Height + 1
+	}
+	if top < offset {
+		offset = top
+	}
+	m.viewport.SetYOffset(offset)
 
 	style := FeedStyle.Height(m.height)
 	if m.focused {
 		style = style.BorderForeground(accent)
 	}
-	// No .Width(): the viewport pads rows to the content width, so the block
-	// sizes naturally to border(1)+padding(2)+content (=m.width).
+	// No .Width(): the viewport pads every row to its own width, so the block
+	// sizes to padding(2)+viewport (=m.width).
 	return style.Render(m.viewport.View())
+}
+
+// headerLine names the channel, how many members it has and its topic. The
+// member count is here because the sidebar row has no room to say which of two
+// numbers it is showing.
+func (m *FeedModel) headerLine() string {
+	head := MessageHeaderStyle.Render(m.channelName)
+	var tail []string
+	if m.memberCount > 0 {
+		tail = append(tail, fmt.Sprintf("%d members", m.memberCount))
+	}
+	if m.channelTopic != "" {
+		tail = append(tail, m.channelTopic)
+	}
+	if len(tail) == 0 {
+		return head
+	}
+	return head + MessageTimestampStyle.Render("  ·  "+strings.Join(tail, "  ·  "))
 }
 
 func (m *FeedModel) renderMessage(msg MsgView, selected bool) string {
@@ -186,10 +255,15 @@ func (m *FeedModel) renderMessage(msg MsgView, selected bool) string {
 	}
 	b.WriteString("\n")
 
-	// Body (indented)
-	bodyLines := strings.Split(msg.Body, "\n")
-	for _, line := range bodyLines {
-		b.WriteString(MessageBodyStyle.Render(line))
+	// Body, indented and wrapped here rather than left to the viewport: the
+	// caller counts the lines a message renders to, so a body that grew an
+	// extra row on the way to the screen would put the cursor on the wrong one.
+	body := MessageBodyStyle
+	if w := m.viewport.Width; w > 2 {
+		body = body.Width(w)
+	}
+	for _, line := range strings.Split(msg.Body, "\n") {
+		b.WriteString(body.Render(line))
 		b.WriteString("\n")
 	}
 

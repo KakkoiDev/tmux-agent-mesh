@@ -15,11 +15,16 @@ const (
 	PickerNone PickerMode = iota
 	PickerChannel
 	PickerAgent
+	PickerMember
+	PickerRule
 )
 
 // PickerItem is one selectable item in the picker.
 type PickerItem struct {
-	ID     int64
+	ID int64
+	// Key is what the caller acts on: a session id, a rule, an empty string
+	// for a channel. The name is for reading, and two agents may share one.
+	Key    string
 	Name   string
 	Detail string // extra info like member count or harness
 }
@@ -65,6 +70,10 @@ func (m *PickerModel) Activate(mode PickerMode, items []PickerItem) {
 		m.input.Placeholder = "Channel name..."
 	case PickerAgent:
 		m.input.Placeholder = "Agent name..."
+	case PickerMember:
+		m.input.Placeholder = "Member name..."
+	case PickerRule:
+		m.input.Placeholder = "Rule..."
 	}
 }
 
@@ -137,8 +146,13 @@ func (m *PickerModel) View() string {
 	var b strings.Builder
 
 	modeLabel := "Select Channel"
-	if m.mode == PickerAgent {
+	switch m.mode {
+	case PickerAgent:
 		modeLabel = "Select Agent"
+	case PickerMember:
+		modeLabel = "Remove Member"
+	case PickerRule:
+		modeLabel = "Access Rules"
 	}
 	b.WriteString(MessageHeaderStyle.Render(modeLabel))
 	b.WriteString("\n\n")
