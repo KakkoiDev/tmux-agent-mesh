@@ -339,6 +339,9 @@ session-id prefix. Ambiguity is an error, never a guess. Prefix matching uses
 `substr` rather than SQL `LIKE`, so `_` and `%` are literal characters and
 `--to abc_` cannot quietly match `abcXdef`.
 
+`--from` names the sender the same way, and an unregistered one is refused with
+exit 3 rather than invented.
+
 `--expect-reply` marks the message so the receiver can tell whether you are
 blocked on an answer or just passing information along.
 
@@ -844,7 +847,7 @@ What has actually been run, as opposed to written against documentation.
 ## Tests
 
 ```bash
-bats tests/          # 410 tests, nine suites
+bats tests/          # 416 tests, nine suites
 go test ./...        # 91 tests, the store and the TUI
 ```
 

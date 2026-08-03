@@ -23,6 +23,7 @@ tmux-agent-mesh inbox                                     # peek without consumi
 
 `--to` accepts an alias, a `%pane` id, a `session:window.pane` target, or an
 unambiguous session-id prefix. An ambiguous reference is an error, never a guess.
+`--from` names the sender the same way, and an unregistered one is refused.
 
 Give yourself a name once so peers can address you: `tmux-agent-mesh name reviewer`.
 

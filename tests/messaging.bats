@@ -18,6 +18,41 @@ teardown() {
 }
 
 
+# ── who a command acts as ────────────────────────────────────────────
+#
+# --from was taken as a session id verbatim while --to resolved a ref, so
+# `--from bravo` posted as a session called "bravo" and a typo invented a sender
+# outright, along with the phantom half of a DM channel nothing would retire.
+
+@test "--from resolves an alias the way --to does" {
+    cmd_send --from bravo --to alpha --message "by alias"
+    assert_eq "$(msql "SELECT from_session FROM messages WHERE id=1;")" "B"
+}
+
+@test "--from refuses a sender that is not registered" {
+    run cmd_send --from ghost --to alpha --message "boo"
+    assert_status 3
+    assert_eq "$(count_messages)" "0"
+}
+
+@test "a refused --from invents no channel" {
+    run cmd_send --from ghost --to alpha --message "boo"
+    assert_status 3
+    assert_eq "$(msql "SELECT COUNT(*) FROM channels WHERE name LIKE '%ghost%';")" "0"
+}
+
+@test "reply --from resolves an alias" {
+    cmd_send --from A --to bravo --message "question"
+    cmd_reply --from bravo --to-message 1 --message "answer"
+    assert_eq "$(msql "SELECT from_session FROM messages WHERE id=2;")" "B"
+}
+
+@test "broadcast --from refuses a sender that is not registered" {
+    run cmd_broadcast --from ghost --message "x"
+    assert_status 3
+    assert_eq "$(count_messages)" "0"
+}
+
 # ── send ─────────────────────────────────────────────────────────────
 
 @test "send queues a message for the target" {

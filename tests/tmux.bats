@@ -341,8 +341,18 @@ mesh_in_fake_home() { HOME="$FAKE_HOME" "$MESH_BIN" "$@"; }
 
 @test "dispatch records who asked for the work" {
     fake_harness claude
+    # By alias, and stored as the session id it resolves to. --from used to be
+    # kept verbatim, so this recorded a requester that was never an agent.
+    mesh_in_fake_home register --session R --harness claude --alias requester >/dev/null
     mesh_in_fake_home dispatch --task "audit it" --harness claude --from requester >/dev/null
-    assert_eq "$(msql 'SELECT reply_to_session FROM dispatches;')" "requester"
+    assert_eq "$(msql 'SELECT reply_to_session FROM dispatches;')" "R"
+}
+
+@test "dispatch refuses a requester that is not registered" {
+    fake_harness claude
+    run mesh_in_fake_home dispatch --task "audit it" --harness claude --from nobody
+    assert_status 3
+    assert_eq "$(msql 'SELECT COUNT(*) FROM dispatches;')" "0"
 }
 
 @test "dispatch refuses a harness that is not on PATH" {

@@ -210,6 +210,23 @@ _self_session() {
     printf '%s' "$HUMAN_ID"
 }
 
+# Who a command acts as. --from names an agent the way --to does, so an alias, a
+# %pane, a target or a session-id prefix all work. It used to be taken as a
+# session id verbatim: `--from bravo` posted as a session called "bravo" that
+# does not exist, and a typo invented a sender and, with --to, the phantom half
+# of a DM channel that no cleanup would ever retire.
+#
+# Called inside a command substitution, so a _fail here ends the subshell rather
+# than the command. Callers read the code with `set +e` and exit on it.
+_sender_ref() {
+    local ref="${1:-}" out rc
+    [[ -n "$ref" ]] || { _self_session ""; return 0; }
+    set +e; out=$(_resolve_ref "$ref"); rc=$?; set -e
+    [[ "$rc" -eq 2 ]] && exit 2
+    [[ -n "$out" ]] || _fail 3 "--from: no agent matches '$ref' (try: tmux-agent-mesh roster)"
+    printf '%s' "$out"
+}
+
 _push_capable_for() {
     case "$1" in
         pi) printf '1' ;;
@@ -1230,7 +1247,8 @@ cmd_send() {
     fi
 
     local sender rc target="" cid="" label=""
-    sender=$(_self_session "$from")
+    set +e; sender=$(_sender_ref "$from"); rc=$?; set -e
+    [[ "$rc" -eq 0 ]] || exit "$rc"
     if [[ -n "$channel" ]]; then
         cid=$(sql "SELECT id FROM channels
                     WHERE name='$(sql_esc "$channel")' AND archived_at IS NULL;")
@@ -1283,8 +1301,9 @@ cmd_broadcast() {
     [[ -n "$body" ]] || _die "broadcast: --message is required"
     _mesh_enabled || _fail 4 "broadcast: mesh is disabled (@agent-mesh-enabled off)"
 
-    local sender
-    sender=$(_self_session "$from")
+    local sender rc
+    set +e; sender=$(_sender_ref "$from"); rc=$?; set -e
+    [[ "$rc" -eq 0 ]] || exit "$rc"
 
     local where
     where="harness<>'human' AND session_id<>'$(sql_esc "$sender")'"
@@ -1347,8 +1366,9 @@ cmd_reply() {
 $row
 EOF
 
-    local sender member
-    sender=$(_self_session "$from")
+    local sender member rc
+    set +e; sender=$(_sender_ref "$from"); rc=$?; set -e
+    [[ "$rc" -eq 0 ]] || exit "$rc"
     # Replying into a channel you are not in would forge a conversation. This is
     # the membership check that used to be "was it addressed to you": a message
     # now has several recipients and any of them may answer.
@@ -3077,8 +3097,9 @@ cmd_dispatch() {
         dir="$wt"
     fi
 
-    local sender
-    sender=$(_self_session "$from")
+    local sender rc
+    set +e; sender=$(_sender_ref "$from"); rc=$?; set -e
+    [[ "$rc" -eq 0 ]] || exit "$rc"
 
     # tmux runs the command as the pane's own process, so nothing is typed in.
     # A dispatched pane inherits the tmux *server's* environment, not your

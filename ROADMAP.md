@@ -9,7 +9,7 @@ Running: peer messaging on the channel model, delivery into a working agent's
 turn for Claude, Codex and Gemini, idle wake for Pi, `dispatch`, the four brakes,
 the untrusted-peer envelope, the tmux menu and status bar, content-addressed
 message ids, `--json` with a structured exit-code table, and `export`/`import`
-sync between machines. 410 bash tests.
+sync between machines. 416 bash tests.
 
 Wired: the Go store runs on the same schema as bash, generated from
 `internal/store/schema.sql`, with interop tests that open one `mesh.db` from both
