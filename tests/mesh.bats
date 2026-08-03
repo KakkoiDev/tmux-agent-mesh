@@ -47,6 +47,63 @@ teardown() {
     assert_fail
 }
 
+@test "init --reset drops channel and read state, not just messages" {
+    local cid
+    cid=$(msql "SELECT id FROM channels WHERE name='general';")
+    insert_agent a1 claude
+    msql "INSERT INTO channel_members (channel_id, session_id) VALUES ($cid, 'a1');"
+    insert_message human a1 "gone"
+    msql "INSERT INTO reads (message_id, reader, source)
+          VALUES ((SELECT id FROM messages), 'a1', 'drain');"
+
+    "$MESH_BIN" init --reset >/dev/null
+
+    # Dropping only messages/agents left these pointing at rows that no longer
+    # exist, and bash never enabled foreign_keys, so they became orphans rather
+    # than errors.
+    assert_num_eq "$(msql "SELECT COUNT(*) FROM reads;")" 0
+    assert_num_eq "$(msql "SELECT COUNT(*) FROM channel_members WHERE session_id='a1';")" 0
+}
+
+# ── migrations ───────────────────────────────────────────────────────
+
+@test "every migration statement is one line" {
+    # _apply_migrations feeds sqlite3 one line at a time, so a statement spanning
+    # lines is delivered as fragments and every fragment is a parse error. Four
+    # CREATE TABLE blocks sat here and had never executed once.
+    local open_parens
+    open_parens=$(printf '%s\n' "$_MIGRATIONS_SQL" | grep -c '([[:space:]]*$') || true
+    assert_num_eq "${open_parens:-0}" 0
+}
+
+@test "a failed migration is recorded" {
+    _MIGRATIONS_SQL='ALTER TABLE nosuchtable ADD COLUMN x TEXT;'
+    _apply_migrations
+    assert_file "$MESH_DIR/migration.log"
+    assert_contains "$(cat "$MESH_DIR/migration.log")" "no such table"
+}
+
+@test "an already-applied migration is not recorded as a failure" {
+    # Every ALTER in the real list is a duplicate column on a database init just
+    # built, which is the steady state on every later invocation.
+    _apply_migrations
+    refute_file "$MESH_DIR/migration.log"
+}
+
+@test "foreign keys are enforced" {
+    # Per connection, and sql() opens a new one per call, so the pragma has to
+    # ride in the helper rather than being set once at init.
+    assert_eq "$(sql 'PRAGMA foreign_keys;')" "1"
+}
+
+@test "deleting a message takes its read receipts with it" {
+    insert_message human a1 "gone"
+    msql "INSERT INTO reads (message_id, reader, source)
+          VALUES ((SELECT id FROM messages), 'a1', 'drain');"
+    sql "DELETE FROM messages;"
+    assert_num_eq "$(msql "SELECT COUNT(*) FROM reads;")" 0
+}
+
 # ── register ─────────────────────────────────────────────────────────
 
 @test "register creates an agent row" {

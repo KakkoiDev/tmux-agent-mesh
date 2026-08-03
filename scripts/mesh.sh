@@ -24,11 +24,18 @@ HUMAN_ID="human"
 
 # ── sql helpers ──────────────────────────────────────────────────────
 
-sql() { printf '.timeout 100\n%s\n' "$*" | sqlite3 "$DB"; }
-sql_sep() { local s="$1"; shift; printf '.timeout 100\n%s\n' "$*" | sqlite3 -separator "$s" "$DB"; }
+# foreign_keys is off by default and is per connection, and every call here opens
+# a new one, so it rides in the preamble rather than being set once at init.
+# Without it the ON DELETE CASCADE clauses in the schema are decoration: reaping
+# a message left its read receipts behind as rows pointing at nothing.
+_SQL_PREAMBLE='.timeout 100
+PRAGMA foreign_keys=ON;'
+
+sql() { printf '%s\n%s\n' "$_SQL_PREAMBLE" "$*" | sqlite3 "$DB"; }
+sql_sep() { local s="$1"; shift; printf '%s\n%s\n' "$_SQL_PREAMBLE" "$*" | sqlite3 -separator "$s" "$DB"; }
 sql_json() {
     local out
-    out=$(printf '.timeout 100\n.mode json\n%s\n' "$*" | sqlite3 "$DB")
+    out=$(printf '%s\n.mode json\n%s\n' "$_SQL_PREAMBLE" "$*" | sqlite3 "$DB")
     printf '%s' "${out:-[]}"
 }
 sql_esc() { local q="'"; printf '%s' "${1//$q/$q$q}"; }
@@ -281,10 +288,17 @@ cmd_init() {
 
     mkdir -p "$MESH_DIR" "$NOTIFY_DIR"
 
+    # Every table _SCHEMA_SQL creates, or --reset leaves rows referencing ones it
+    # dropped. Children first: with foreign_keys on, dropping a parent whose
+    # child rows are still there is an error rather than a silent orphan.
     if [[ "$reset" -eq 1 ]]; then
         sqlite3 "$DB" <<'SQL'
 PRAGMA journal_mode=WAL;
 PRAGMA busy_timeout=100;
+DROP TABLE IF EXISTS reads;
+DROP TABLE IF EXISTS channel_rules;
+DROP TABLE IF EXISTS channel_members;
+DROP TABLE IF EXISTS channels;
 DROP TABLE IF EXISTS messages;
 DROP TABLE IF EXISTS threads;
 DROP TABLE IF EXISTS dispatches;
@@ -323,52 +337,39 @@ EOF
 }
 
 # CREATE TABLE IF NOT EXISTS cannot add a column to a table that already exists,
-# so a new column needs its own ALTER. Both are idempotent: the ALTER fails
-# harmlessly once the column is there, and the marker file skips the whole thing
-# on every later invocation.
+# so a new column needs its own ALTER, and _SCHEMA_SQL stays the only place a
+# table is defined. Both are idempotent: the ALTER fails harmlessly once the
+# column is there, and the marker file skips the whole thing on every later
+# invocation.
+#
+# One statement per line. _apply_migrations feeds sqlite3 a line at a time, so a
+# statement spanning lines arrives as fragments and every fragment is a parse
+# error. Four CREATE TABLE blocks lived here under that rule and had never
+# executed once; they were also second, disagreeing definitions of tables
+# _SCHEMA_SQL already declares.
 _MIGRATIONS_SQL='
 ALTER TABLE agents ADD COLUMN turn_state TEXT;
 ALTER TABLE agents ADD COLUMN model TEXT;
 ALTER TABLE agents ADD COLUMN transcript_path TEXT NOT NULL DEFAULT '"'"''"'"' ;
 ALTER TABLE channels ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0;
-
-CREATE TABLE IF NOT EXISTS channels (
-    id          INTEGER PRIMARY KEY,
-    name        TEXT NOT NULL UNIQUE,
-    kind        TEXT NOT NULL DEFAULT '"'"'channel'"'"',
-    visibility  TEXT NOT NULL DEFAULT '"'"'public'"'"',
-    topic       TEXT NOT NULL DEFAULT '"'"''"'"',
-    created_by  TEXT NOT NULL DEFAULT '"'"''"'"',
-    created_at  INTEGER NOT NULL DEFAULT (unixepoch()),
-    archived_at INTEGER
-);
-CREATE TABLE IF NOT EXISTS channel_members (
-    channel_id INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
-    session_id TEXT NOT NULL,
-    role       TEXT NOT NULL DEFAULT '"'"'member'"'"',
-    joined_at  INTEGER NOT NULL DEFAULT (unixepoch()),
-    PRIMARY KEY (channel_id, session_id)
-);
-CREATE TABLE IF NOT EXISTS channel_rules (
-    channel_id INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
-    subject    TEXT NOT NULL CHECK (subject IN ('"'"'harness'"'"', '"'"'model'"'"')),
-    value      TEXT NOT NULL,
-    PRIMARY KEY (channel_id, subject, value)
-);
-CREATE TABLE IF NOT EXISTS reads (
-    id            INTEGER PRIMARY KEY,
-    message_id    INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
-    reader        TEXT NOT NULL,
-    read_at       INTEGER NOT NULL DEFAULT (unixepoch()),
-    source        TEXT NOT NULL CHECK (source IN ('"'"'drain'"'"', '"'"'client'"'"'))
-);
 '
 
+# A migration that has already run reports "duplicate column name", which is the
+# steady state on every invocation after the first and not a failure. Anything
+# else is real and goes to migration.log, unconditionally: discarding all stderr
+# made a migration that broke and one that completed look identical, which is
+# how the dead CREATE TABLE blocks above survived.
 _apply_migrations() {
-    local stmt
+    local stmt err
     while IFS= read -r stmt; do
         [[ -z "$stmt" ]] && continue
-        printf '%s\n' "$stmt" | sqlite3 "$DB" >/dev/null 2>&1 || true
+        err=$(printf '%s\n' "$stmt" | sqlite3 "$DB" 2>&1 >/dev/null) || true
+        [[ -z "$err" ]] && continue
+        case "$err" in
+            *"duplicate column name"*) ;;
+            *) printf '%s %s: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$stmt" "$err" \
+                   >> "$MESH_DIR/migration.log" 2>/dev/null || true ;;
+        esac
     done <<EOF
 $_MIGRATIONS_SQL
 EOF
