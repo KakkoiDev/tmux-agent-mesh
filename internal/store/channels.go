@@ -369,13 +369,24 @@ func (s *Store) MayRead(channelID int64, sessionID string) error {
 	return fmt.Errorf("%w: %s is not a member of this private channel", ErrForbidden, sessionID)
 }
 
-// DMChannel finds or creates the direct-message channel between two sessions.
-// The name is derived from the sorted pair so either direction lands on the same
-// channel rather than creating two half-conversations.
-func (s *Store) DMChannel(a, b string) (Channel, error) {
+// DMChannelName is the channel a pair of sessions talk in. Sorted, so either
+// direction lands on the same row rather than creating two half-conversations,
+// and full session ids rather than the eight-character prefix a client shows:
+// the name is an identity, and two sessions sharing a prefix would share a
+// mailbox. scripts/mesh.sh builds the same name in _dm_channel_name.
+func DMChannelName(a, b string) string {
 	pair := []string{a, b}
 	sort.Strings(pair)
-	name := "dm-" + shortID(pair[0]) + "-" + shortID(pair[1])
+	return "dm:" + pair[0] + ":" + pair[1]
+}
+
+// DMChannel finds or creates the direct-message channel between two sessions.
+//
+// It does not go through CreateChannel, whose name rule rejects the colons that
+// make this name unambiguous. That rule is for names a person types; this one is
+// derived, and both halves of the project derive it the same way.
+func (s *Store) DMChannel(a, b string) (Channel, error) {
+	name := DMChannelName(a, b)
 
 	if ch, err := s.ChannelByName(name); err == nil {
 		return ch, nil
@@ -383,17 +394,32 @@ func (s *Store) DMChannel(a, b string) (Channel, error) {
 		return Channel{}, err
 	}
 
-	ch, err := s.CreateChannel(name, "dm", "private", "", a)
+	var ch Channel
+	err := s.tx(func(tx *sql.Tx) error {
+		if _, err := tx.Exec(
+			`INSERT OR IGNORE INTO channels (name, kind, visibility, created_by)
+			 VALUES (?, 'dm', 'private', ?)`, name, a); err != nil {
+			return err
+		}
+		if err := tx.QueryRow(`SELECT id FROM channels WHERE name = ?`, name).
+			Scan(&ch.ID); err != nil {
+			return err
+		}
+		// Straight insert, not Join: a DM's membership is its definition, so it
+		// is not subject to the access rules that gate joining a channel.
+		for _, m := range []string{a, b} {
+			if _, err := tx.Exec(
+				`INSERT INTO channel_members (channel_id, session_id) VALUES (?, ?)
+				 ON CONFLICT DO NOTHING`, ch.ID, m); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 	if err != nil {
 		return Channel{}, err
 	}
-	// Straight insert, not Join: a DM's membership is its definition, so it is
-	// not subject to the access rules that gate joining a channel.
-	if _, err := s.db.Exec(
-		`INSERT INTO channel_members (channel_id, session_id) VALUES (?, ?)
-		 ON CONFLICT DO NOTHING`, ch.ID, b); err != nil {
-		return Channel{}, err
-	}
+	ch.Name, ch.Kind, ch.Visibility, ch.CreatedBy = name, "dm", "private", a
 	ch.Members, err = s.Members(ch.ID)
 	return ch, err
 }

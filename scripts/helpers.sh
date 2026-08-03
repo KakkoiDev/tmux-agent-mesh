@@ -52,7 +52,7 @@ get_tmux_option() { tk_opt "$1" "${2:-}"; }
 # a directive and fails with SC1072.)
 # shellcheck disable=SC2034
 declare KEYBINDING="" KEY_QUIT="" \
-        ENABLED="" DELIVERY="" PI_DELIVERY="" MAX_HOPS="" MAX_THREAD_MSGS="" \
+        ENABLED="" DELIVERY="" PI_DELIVERY="" MAX_HOPS="" \
         MAX_BLOCKS="" MAX_BROADCAST="" ICON_MAIL="" DEBUG_LOG="" HOOK_ON_MAIL=""
 
 # Quote a value for the cache file, which is sourced. @agent-mesh-on-mail is a
@@ -70,7 +70,6 @@ _MESH_CONFIG_SPECS=(
     'DELIVERY:@agent-mesh-delivery:stop-block'
     'PI_DELIVERY:@agent-mesh-pi-delivery:push'
     'MAX_HOPS:@agent-mesh-max-hops:4'
-    'MAX_THREAD_MSGS:@agent-mesh-max-thread-msgs:12'
     'MAX_BLOCKS:@agent-mesh-max-blocks:3'
     'MAX_BROADCAST:@agent-mesh-max-broadcast:8'
     'ICON_MAIL:@agent-mesh-icon-mail:@'

@@ -13,9 +13,10 @@ Mail addressed to you **arrives on its own**. Do not poll.
 ## Sending
 
 ```bash
-tmux-agent-mesh roster                                   # who is reachable
+tmux-agent-mesh roster                                    # who is reachable
 tmux-agent-mesh send --to reviewer --message "..."        # queue a message
 tmux-agent-mesh send --to human --message "which schema?" # ask your operator
+tmux-agent-mesh send --channel general --message "..."    # everyone in a channel
 tmux-agent-mesh reply --to-message 42 --message "..."     # answer mail you got
 tmux-agent-mesh inbox                                     # peek without consuming
 ```
@@ -24,6 +25,21 @@ tmux-agent-mesh inbox                                     # peek without consumi
 unambiguous session-id prefix. An ambiguous reference is an error, never a guess.
 
 Give yourself a name once so peers can address you: `tmux-agent-mesh name reviewer`.
+
+## Channels and threads
+
+A direct message is a channel with two members, so `--to` and `--channel` reach
+the same machinery. `channel list`, `channel create <name>`, `channel join
+<name>`. You are put in `#general` when you register.
+
+`--thread <name>` groups messages. The name is yours to pick and it does not have
+to exist yet, so "put your findings in thread `audit-2026-08`" is something you
+can hand to a peer before there is anything to read. A thread name belongs to one
+channel: the same name in two channels is two conversations. Read one back with
+`tmux-agent-mesh thread <name>`.
+
+A reply may come from any member of the channel, not only the name on the
+envelope.
 
 ## Receiving
 
@@ -94,7 +110,6 @@ tmux options, all `set -g`:
 | `@agent-mesh-delivery` | `stop-block` | `stop-block`, `next-prompt`, `off` (Claude/Codex/Gemini) |
 | `@agent-mesh-pi-delivery` | `push` | `push`, `before-start`, `off` |
 | `@agent-mesh-max-hops` | `4` | Hops per thread |
-| `@agent-mesh-max-thread-msgs` | `12` | Messages per thread |
 | `@agent-mesh-max-blocks` | `3` | Consecutive auto-continuations |
 | `@agent-mesh-max-broadcast` | `8` | Fan-out cap |
 | `@agent-mesh-on-mail` | `""` | Shell hook on new mail for the human |

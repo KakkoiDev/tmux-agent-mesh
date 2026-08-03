@@ -29,7 +29,7 @@ teardown() {
 @test "pi-deliver push stamps the pi-push mode" {
     cmd_send --from A --to pusher --message "x"
     cmd_pi_deliver --session P --mode push >/dev/null
-    assert_eq "$(msql "SELECT delivered_via FROM messages WHERE id=1;")" "pi:push"
+    assert_eq "$(msql "SELECT delivered_via FROM deliveries WHERE message_id=1;")" "pi:push"
 }
 
 @test "pi-deliver push emits nothing with an empty mailbox" {
@@ -88,7 +88,7 @@ teardown() {
 @test "pi-deliver before-start stamps its own mode" {
     cmd_send --from A --to pusher --message "x"
     cmd_pi_deliver --session P --mode before-start >/dev/null
-    assert_eq "$(msql "SELECT delivered_via FROM messages WHERE id=1;")" "pi:before-start"
+    assert_eq "$(msql "SELECT delivered_via FROM deliveries WHERE message_id=1;")" "pi:before-start"
 }
 
 # Regression: before_agent_start also fires for the turns mesh itself triggers

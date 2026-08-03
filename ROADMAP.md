@@ -30,10 +30,11 @@ mesh <command>        the client the hooks and the TUI both call
 ssh with `ControlMaster` for the remote transport: no port, no tokens, credentials
 already exist, and a hook costs roughly 20ms rather than a full handshake.
 
-Fix before writing the server, since the schema is what the server is written
-against: `max-thread-msgs` is the wrong brake (see ARCHITECTURE.md). A topic that
-accumulates decisions is the most valuable thing in the mailbox and this cap
-destroys it at 12 messages.
+2026-08-03: the schema fix this step was gated on has landed. `messages` is on
+the channel model, delivery and reads are append-only rows, every message carries
+a content address, and `max-thread-msgs` is gone (see ARCHITECTURE.md). The
+server itself is deferred: `mesh export` / `mesh import` over ssh reaches two
+machines without a resident process.
 
 ## 2. Client, hook rewiring, budget ledger
 

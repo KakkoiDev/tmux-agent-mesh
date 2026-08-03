@@ -1240,7 +1240,7 @@ func (m Model) sendMessage(body string) tea.Cmd {
 			for _, msgs := range m.allMessages {
 				for _, storeMsg := range msgs {
 					if storeMsg.ID == replyToID {
-						post.ThreadID = storeMsg.ThreadID
+						post.Thread = storeMsg.ThreadName
 						post.ReplyToID = replyToID
 						break
 					}

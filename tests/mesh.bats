@@ -142,6 +142,33 @@ SQL
                            WHERE t.name='shared';")" 2
 }
 
+@test "the migration gives every carried-over message a content address" {
+    _build_v1_db
+    "$MESH_BIN" init >/dev/null
+    assert_num_eq "$(msql "SELECT COUNT(*) FROM messages WHERE uid IS NULL;")" 0
+    assert_num_eq "$(msql "SELECT COUNT(DISTINCT uid) FROM messages;")" 3
+    assert_num_eq "$(msql "SELECT length(uid) FROM messages WHERE id=1;")" 64
+}
+
+# A reply's uid has to fold in its parent's, or a reference stops meaning
+# anything once either row leaves this machine. The backfill runs in id order for
+# exactly this reason.
+@test "a migrated reply hashes its parent's uid" {
+    _build_v1_db
+    msql "INSERT INTO messages (thread_id, from_session, to_session, body, reply_to_id)
+               VALUES ('shared','b2','a1','a reply',1);"
+    "$MESH_BIN" init >/dev/null
+
+    local parent child nonce created
+    parent=$(msql "SELECT uid FROM messages WHERE id=1;")
+    child=$(msql "SELECT uid FROM messages WHERE body='a reply';")
+    nonce=$(msql "SELECT nonce FROM messages WHERE body='a reply';")
+    created=$(msql "SELECT created_at FROM messages WHERE body='a reply';")
+    assert_not_empty "$parent"
+    assert_eq "$child" \
+        "$(_msg_uid "$nonce" "dm:a1:b2" "shared" "b2" "a reply" "$created" "$parent")"
+}
+
 @test "the migration leaves no dangling references" {
     _build_v1_db
     "$MESH_BIN" init >/dev/null
@@ -401,9 +428,10 @@ _mock_tmux_pane() {
 
 @test "deregister closes threads opened by that session" {
     cmd_register --session s1 --harness claude
-    msql "INSERT INTO threads (thread_id, opener_session) VALUES ('t1','s1');"
+    cmd_register --session s2 --harness claude
+    cmd_send --from s1 --to s2 --message hi --thread t1
     cmd_deregister --session s1
-    assert_eq "$(msql "SELECT closed_at IS NOT NULL FROM threads WHERE thread_id='t1';")" "1"
+    assert_eq "$(msql "SELECT closed_at IS NOT NULL FROM threads WHERE name='t1';")" "1"
 }
 
 # ── name / alias ─────────────────────────────────────────────────────
@@ -607,7 +635,8 @@ _mock_tmux_pane() {
 @test "roster does not count delivered messages as pending" {
     insert_agent s1 claude reviewer
     insert_message human s1 "hi"
-    msql "UPDATE messages SET delivered_at=unixepoch(), delivered_via='stop-block';"
+    msql "INSERT INTO deliveries (message_id, session_id, delivered_via)
+               SELECT id, 's1', 'stop-block' FROM messages;"
     run cmd_roster --json
     assert_ok
     echo "$output" | jq -e '.[] | select(.alias=="reviewer") | .pending == 0'
@@ -662,7 +691,9 @@ _mock_tmux_pane() {
 @test "cleanup drops delivered mail older than 24h" {
     insert_agent s1 claude reviewer %1
     insert_message human s1 "old"
-    msql "UPDATE messages SET delivered_at=unixepoch()-90000, delivered_via='stop-block';"
+    msql "UPDATE messages SET created_at=unixepoch()-90000;
+          INSERT INTO deliveries (message_id, session_id, delivered_at, delivered_via)
+               SELECT id, 's1', unixepoch()-90000, 'stop-block' FROM messages;"
     tmux() { case "$1" in list-panes) printf '%%1\n' ;; *) return 1 ;; esac; }
     cmd_cleanup
     assert_eq "$(count_messages)" "0"
@@ -735,7 +766,27 @@ _mock_tmux_pane() {
     insert_message human s2 "for s2"
     cmd_deregister --session s1
     assert_eq "$(count_messages)" "1"
-    assert_eq "$(msql "SELECT to_session FROM messages;")" "s2"
+    assert_eq "$(msql "SELECT body FROM messages;")" "for s2"
+}
+
+# A message with more than one recipient is not the departing agent's to take
+# away. Only the mail nobody else could read goes.
+@test "deregister keeps mail another member has not read yet" {
+    insert_agent s1 claude reviewer %1
+    insert_agent s2 claude builder %2
+    cmd_register --session s3 --harness claude --pane %3 >/dev/null
+    msql "INSERT INTO channels (name, kind, visibility, created_by)
+               VALUES ('team', 'channel', 'public', 's3');
+          INSERT INTO channel_members (channel_id, session_id)
+               SELECT id, 's1' FROM channels WHERE name='team';
+          INSERT INTO channel_members (channel_id, session_id)
+               SELECT id, 's2' FROM channels WHERE name='team';
+          INSERT INTO channel_members (channel_id, session_id)
+               SELECT id, 's3' FROM channels WHERE name='team';"
+    cmd_send --from s3 --channel team --message "for the team"
+    cmd_deregister --session s1
+    assert_eq "$(count_messages)" "1"
+    assert_eq "$(pending_for s2)" "1"
 }
 
 # ── turn state ───────────────────────────────────────────────────────

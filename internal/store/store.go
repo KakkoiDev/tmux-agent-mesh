@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	_ "modernc.org/sqlite"
@@ -19,6 +20,12 @@ import (
 
 //go:embed schema.sql
 var schemaSQL string
+
+//go:embed migrate_v1_pre.sql
+var migrateV1PreSQL string
+
+//go:embed migrate_v1_post.sql
+var migrateV1PostSQL string
 
 // HumanID is the reserved session for the person. Seeded once and never removed:
 // an agent addressing the human is a better primitive than an agent ending its
@@ -75,15 +82,45 @@ func (s *Store) Dir() string { return s.dir }
 
 func (s *Store) fileStore() string { return filepath.Join(s.dir, "files") }
 
+// SchemaVersion is the shape this build expects. It is stamped into
+// schema_meta at the end of a successful migration, and scripts/mesh.sh carries
+// the same number in its .schema_vN marker file.
+const SchemaVersion = 5
+
+// migrate brings any database this build can open up to SchemaVersion.
+//
+// Order matters, and not in the obvious way. The column adds run *before*
+// schema.sql, because schema.sql builds an index over channels(sort_order) and a
+// pre-v3 database has the table but not the column: creating the index first
+// fails with "no such column". Renaming the v1 tables runs earlier still, for
+// the mirror-image reason: CREATE TABLE IF NOT EXISTS would find them and leave
+// the old shape in place.
 func (s *Store) migrate() error {
+	v1, err := s.renameV1Tables()
+	if err != nil {
+		return err
+	}
+	for _, c := range []struct{ table, ddl string }{
+		{"agents", `transcript_path TEXT NOT NULL DEFAULT ''`},
+		{"channels", `sort_order INTEGER NOT NULL DEFAULT 0`},
+	} {
+		if err := s.addColumn(c.table, c.ddl); err != nil {
+			return err
+		}
+	}
 	if _, err := s.db.Exec(schemaSQL); err != nil {
 		return fmt.Errorf("schema: %w", err)
 	}
-	if err := s.migrateAgentsV2(); err != nil {
-		return err
+	if v1 {
+		if err := s.backfillV1(); err != nil {
+			return err
+		}
 	}
-	if err := s.migrateChannelsV3(); err != nil {
-		return err
+	if _, err := s.db.Exec(
+		`INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?)
+		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+		strconv.Itoa(SchemaVersion)); err != nil {
+		return fmt.Errorf("stamp schema version: %w", err)
 	}
 	if _, err := s.db.Exec(
 		`INSERT INTO agents (session_id, harness, alias, turn_state)
@@ -94,70 +131,134 @@ func (s *Store) migrate() error {
 	return nil
 }
 
-// schemaVersion reads the version stamped in schema_meta, 0 if none is.
-func (s *Store) schemaVersion() (int, error) {
-	var v int
+func (s *Store) tableExists(name string) (bool, error) {
+	var n int
 	err := s.db.QueryRow(
-		`SELECT value FROM schema_meta WHERE key = 'schema_version'`).Scan(&v)
-	if errors.Is(err, sql.ErrNoRows) {
-		return 0, nil
-	}
-	return v, err
+		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?`,
+		name).Scan(&n)
+	return n > 0, err
 }
 
-// migrateAgentsV2 adds the transcript_path column to databases created before
-// it existed. CREATE TABLE IF NOT EXISTS cannot add a column to an existing
-// table, so the ALTER is its own step, guarded by the schema_meta version.
-// A fresh database already has the column from schema.sql, in which case the
-// ALTER fails with "duplicate column name" and is safe to skip.
-// migrateChannelsV3 adds the sort_order column to databases created before it
-// existed, and stamps schema_version 3.
-func (s *Store) migrateChannelsV3() error {
-	v, err := s.schemaVersion()
-	if err != nil {
-		return fmt.Errorf("schema version: %w", err)
+// addColumn is the only way this package adds a column to an existing table.
+// CREATE TABLE IF NOT EXISTS cannot do it, so the ALTER is its own step. Two
+// outcomes are not failures: the table is not there yet (fresh database, schema
+// .sql is about to create it with the column), and the column is already there.
+func (s *Store) addColumn(table, ddl string) error {
+	ok, err := s.tableExists(table)
+	if err != nil || !ok {
+		return err
 	}
-	if v >= 3 {
-		return nil
-	}
-	if _, err := s.db.Exec(
-		`ALTER TABLE channels ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0`); err != nil {
+	if _, err := s.db.Exec("ALTER TABLE " + table + " ADD COLUMN " + ddl); err != nil {
 		if !strings.Contains(err.Error(), "duplicate column name") {
-			return fmt.Errorf("migrate channels v3: %w", err)
+			return fmt.Errorf("add %s.%s: %w", table, ddl, err)
 		}
-	}
-	if _, err := s.db.Exec(
-		`CREATE INDEX IF NOT EXISTS idx_channels_sort ON channels(sort_order, id)`); err != nil {
-		return fmt.Errorf("migrate channels v3 index: %w", err)
-	}
-	if _, err := s.db.Exec(
-		`INSERT INTO schema_meta (key, value) VALUES ('schema_version', '3')
-		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`); err != nil {
-		return fmt.Errorf("stamp schema version: %w", err)
 	}
 	return nil
 }
 
-func (s *Store) migrateAgentsV2() error {
-	v, err := s.schemaVersion()
+// renameV1Tables moves a pre-channel messages table out of the way, reporting
+// whether it found one. v1 addressed a message with messages.to_session and
+// stamped delivery onto the row; a database still shaped that way is detected by
+// that column rather than by a version marker, because bash wrote those
+// databases and never stamped one.
+func (s *Store) renameV1Tables() (bool, error) {
+	ok, err := s.tableExists("messages")
+	if err != nil || !ok {
+		return false, err
+	}
+	var n int
+	if err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name = 'to_session'`).
+		Scan(&n); err != nil {
+		return false, fmt.Errorf("inspect messages: %w", err)
+	}
+	if n == 0 {
+		return false, nil
+	}
+	if _, err := s.db.Exec(migrateV1PreSQL); err != nil {
+		return false, fmt.Errorf("migrate v1 (rename): %w", err)
+	}
+	return true, nil
+}
+
+// backfillV1 copies the renamed v1 rows into the channel model and drops them.
+// The uid pass is separate because sqlite3 has no sha256: the SQL leaves uid
+// NULL and it is computed here, row by row, from the same fields Send hashes.
+func (s *Store) backfillV1() error {
+	if _, err := s.db.Exec(migrateV1PostSQL); err != nil {
+		return fmt.Errorf("migrate v1 (backfill): %w", err)
+	}
+	if err := s.backfillUIDs(); err != nil {
+		return err
+	}
+	// The backfill runs with foreign_keys off so that reply_to_id may point at a
+	// row later in the same INSERT..SELECT. This proves the result rather than
+	// trusting the insert order.
+	rows, err := s.db.Query(`PRAGMA foreign_key_check`)
 	if err != nil {
-		return fmt.Errorf("schema version: %w", err)
+		return fmt.Errorf("migrate v1 (check): %w", err)
 	}
-	if v >= 2 {
-		return nil
+	defer rows.Close()
+	if rows.Next() {
+		return errors.New("migrate v1: the backfill left dangling references")
 	}
-	if _, err := s.db.Exec(
-		`ALTER TABLE agents ADD COLUMN transcript_path TEXT NOT NULL DEFAULT ''`); err != nil {
-		if !strings.Contains(err.Error(), "duplicate column name") {
-			return fmt.Errorf("migrate agents v2: %w", err)
+	return rows.Err()
+}
+
+// backfillUIDs gives every message without one a content address. A migrated
+// message keeps an empty nonce: it predates the column, and inventing one would
+// make the same message hash differently on the two machines that both migrated
+// it, which is exactly what the uid exists to prevent.
+//
+// Ascending id order is what lets a reply hash its parent's uid: the parent is
+// an earlier row, so it already has one by the time the reply is reached.
+func (s *Store) backfillUIDs() error {
+	return s.tx(func(tx *sql.Tx) error {
+		rows, err := tx.Query(`
+			SELECT m.id, m.nonce, c.name, t.name, m.from_session, m.body, m.created_at,
+			       COALESCE(m.reply_to_id, 0)
+			  FROM messages m
+			  JOIN channels c ON c.id = m.channel_id
+			  JOIN threads  t ON t.id = m.thread_id
+			 WHERE m.uid IS NULL
+			 ORDER BY m.id`)
+		if err != nil {
+			return err
 		}
-	}
-	if _, err := s.db.Exec(
-		`INSERT INTO schema_meta (key, value) VALUES ('schema_version', '2')
-		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`); err != nil {
-		return fmt.Errorf("stamp schema version: %w", err)
-	}
-	return nil
+		type row struct {
+			id                                 int64
+			nonce, channel, thread, from, body string
+			createdAt, replyTo                 int64
+		}
+		var todo []row
+		for rows.Next() {
+			var r row
+			if err := rows.Scan(&r.id, &r.nonce, &r.channel, &r.thread, &r.from,
+				&r.body, &r.createdAt, &r.replyTo); err != nil {
+				rows.Close()
+				return err
+			}
+			todo = append(todo, r)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+
+		uids := make(map[int64]string, len(todo))
+		for _, r := range todo {
+			var parent string
+			if r.replyTo != 0 {
+				parent = uids[r.replyTo]
+			}
+			uid := MessageUID(r.nonce, r.channel, r.thread, r.from, r.body, r.createdAt, parent)
+			if _, err := tx.Exec(`UPDATE messages SET uid = ? WHERE id = ?`, uid, r.id); err != nil {
+				return fmt.Errorf("backfill uid for message %d: %w", r.id, err)
+			}
+			uids[r.id] = uid
+		}
+		return nil
+	})
 }
 
 // tx runs fn in a transaction, rolling back on any error. Every write that spans

@@ -177,10 +177,10 @@ _fmt_ago() {
 # ── schema ───────────────────────────────────────────────────────────
 
 # BEGIN GENERATED SCHEMA
-# Generated from internal/store/schema.sql by scripts/gen-schema.sh.
+# Generated from internal/store/*.sql by scripts/gen-schema.sh.
 # Do not edit between these markers; edit the canonical file and rerun.
 _schema_sql() {
-    cat <<'MESH_SCHEMA_SQL'
+    cat <<'MESH_SQL_EOF'
 -- tmux-agent-mesh store. Canonical schema.
 --
 -- This file is the only definition of the shape of mesh.db. scripts/mesh.sh
@@ -200,6 +200,7 @@ _schema_sql() {
 -- because a message now has several. Reading is a log rather than a flag, so the
 -- same agent reading twice is two rows, which is what a receipt has to show.
 
+PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS agents (
     session_id    TEXT PRIMARY KEY,
@@ -286,6 +287,20 @@ CREATE TABLE IF NOT EXISTS threads (
 
 CREATE TABLE IF NOT EXISTS messages (
     id           INTEGER PRIMARY KEY,
+    -- Content address: sha256 over nonce, channel name, thread name, sender,
+    -- body, created_at and the parent's uid. Names rather than ids because ids
+    -- are local to one database, so this is the identity that survives leaving
+    -- the machine. `import` is INSERT OR IGNORE on it, which is what makes
+    -- syncing the same row twice a no-op and sync itself order-independent.
+    --
+    -- Nullable in the DDL only so the v1 backfill can run: sqlite3 has no
+    -- sha256, so uids for existing rows are computed row by row afterwards.
+    -- Every insert path writes one.
+    uid          TEXT UNIQUE,
+    -- Random per message. Two identical bodies posted in the same second by the
+    -- same agent into the same thread are two messages; without this they would
+    -- hash alike and the second would be dropped by that same INSERT OR IGNORE.
+    nonce        TEXT NOT NULL DEFAULT '',
     channel_id   INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
     thread_id    INTEGER NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
     from_session TEXT NOT NULL,
@@ -370,7 +385,84 @@ CREATE TABLE IF NOT EXISTS schema_meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
-MESH_SCHEMA_SQL
+MESH_SQL_EOF
+}
+_migrate_v1_pre_sql() {
+    cat <<'MESH_SQL_EOF'
+-- v1 -> channel model, first half. Runs before the schema is created.
+--
+-- CREATE TABLE IF NOT EXISTS would see the v1 tables and do nothing, leaving the
+-- old shape in place, so they are renamed out of the way first. Guarded by the
+-- caller: this only runs when messages still has a to_session column.
+PRAGMA foreign_keys=OFF;
+ALTER TABLE messages RENAME TO messages_v1;
+ALTER TABLE threads  RENAME TO threads_v1;
+MESH_SQL_EOF
+}
+_migrate_v1_post_sql() {
+    cat <<'MESH_SQL_EOF'
+-- v1 -> channel model, second half. Runs after the schema has been created.
+--
+-- foreign_keys off for the rebuild: reply_to_id points inside the same
+-- INSERT..SELECT, and a row referencing one not yet written would fail even
+-- though the finished table is consistent. The caller runs PRAGMA
+-- foreign_key_check afterwards, which proves it rather than trusting insert
+-- order.
+--
+-- uid is left NULL here because sqlite3 has no sha256; the caller backfills it
+-- row by row.
+PRAGMA foreign_keys=OFF;
+BEGIN;
+
+-- A DM channel per ordered pair, so either direction resolves to one row.
+INSERT OR IGNORE INTO channels (name, kind, visibility, created_by)
+SELECT DISTINCT
+       'dm:' || MIN(from_session, to_session) || ':' || MAX(from_session, to_session),
+       'dm', 'private', from_session
+  FROM messages_v1;
+
+INSERT OR IGNORE INTO channel_members (channel_id, session_id)
+SELECT c.id, m.from_session
+  FROM messages_v1 m
+  JOIN channels c
+    ON c.name = 'dm:' || MIN(m.from_session, m.to_session) || ':' || MAX(m.from_session, m.to_session);
+
+INSERT OR IGNORE INTO channel_members (channel_id, session_id)
+SELECT c.id, m.to_session
+  FROM messages_v1 m
+  JOIN channels c
+    ON c.name = 'dm:' || MIN(m.from_session, m.to_session) || ':' || MAX(m.from_session, m.to_session);
+
+-- One thread row per (channel, old tag). A tag that spanned several pairs was
+-- one thread only by accident of having no channel; it becomes one per channel,
+-- which is the boundary it should always have had.
+INSERT OR IGNORE INTO threads (channel_id, name, opener_session, created_at)
+SELECT c.id, m.thread_id, MIN(m.from_session), MIN(m.created_at)
+  FROM messages_v1 m
+  JOIN channels c
+    ON c.name = 'dm:' || MIN(m.from_session, m.to_session) || ':' || MAX(m.from_session, m.to_session)
+ GROUP BY c.id, m.thread_id;
+
+INSERT OR IGNORE INTO messages
+       (id, channel_id, thread_id, from_session, body, hops, expect_reply, reply_to_id, created_at)
+SELECT m.id, c.id, t.id, m.from_session, m.body, m.hops, m.expect_reply, m.reply_to_id, m.created_at
+  FROM messages_v1 m
+  JOIN channels c
+    ON c.name = 'dm:' || MIN(m.from_session, m.to_session) || ':' || MAX(m.from_session, m.to_session)
+  JOIN threads t ON t.channel_id = c.id AND t.name = m.thread_id
+ ORDER BY m.id;
+
+-- Delivery was a column on the row and is now a fact about one recipient.
+INSERT OR IGNORE INTO deliveries (message_id, session_id, delivered_at, delivered_via)
+SELECT id, to_session, delivered_at, COALESCE(delivered_via, 'v1')
+  FROM messages_v1
+ WHERE delivered_at IS NOT NULL;
+
+DROP TABLE messages_v1;
+DROP TABLE IF EXISTS threads_v1;
+COMMIT;
+PRAGMA foreign_keys=ON;
+MESH_SQL_EOF
 }
 # END GENERATED SCHEMA
 
@@ -513,13 +605,17 @@ _has_v1_messages() {
     [[ "${n:-0}" -gt 0 ]]
 }
 
+_migration_log() {
+    mkdir -p "$MESH_DIR" 2>/dev/null || true
+    printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" \
+        >> "$MESH_DIR/migration.log" 2>/dev/null || true
+}
+
 _migrate_v1_to_channels() {
     _has_v1_messages || return 0
-    sqlite3 "$DB" <<'SQL' >/dev/null 2>&1 || true
-PRAGMA foreign_keys=OFF;
-ALTER TABLE messages RENAME TO messages_v1;
-ALTER TABLE threads  RENAME TO threads_v1;
-SQL
+    local err
+    err=$(_migrate_v1_pre_sql | sqlite3 "$DB" 2>&1 >/dev/null) || true
+    [[ -n "$err" ]] && _migration_log "v1->channels (rename): $err"
     return 0
 }
 
@@ -528,77 +624,55 @@ _backfill_v1_to_channels() {
     n=$(sql "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='messages_v1';" 2>/dev/null) || return 0
     [[ "${n:-0}" -gt 0 ]] || return 0
 
-    # foreign_keys off for the rebuild: reply_to_id points inside the same
-    # INSERT..SELECT, and a row referencing one not yet written would fail even
-    # though the finished table is consistent. PRAGMA foreign_key_check below is
-    # what proves it, rather than trusting the insert order.
     local err
-    err=$(sqlite3 "$DB" <<'SQL' 2>&1 >/dev/null
-PRAGMA foreign_keys=OFF;
-BEGIN;
+    err=$(_migrate_v1_post_sql | sqlite3 "$DB" 2>&1 >/dev/null) || true
+    [[ -n "$err" ]] && _migration_log "v1->channels: $err"
 
--- A DM channel per ordered pair, so either direction resolves to one row.
-INSERT OR IGNORE INTO channels (name, kind, visibility, created_by)
-SELECT DISTINCT
-       'dm:' || MIN(from_session, to_session) || ':' || MAX(from_session, to_session),
-       'dm', 'private', from_session
-  FROM messages_v1;
+    _backfill_uids
 
-INSERT OR IGNORE INTO channel_members (channel_id, session_id)
-SELECT c.id, m.from_session
-  FROM messages_v1 m
-  JOIN channels c
-    ON c.name = 'dm:' || MIN(m.from_session, m.to_session) || ':' || MAX(m.from_session, m.to_session);
-
-INSERT OR IGNORE INTO channel_members (channel_id, session_id)
-SELECT c.id, m.to_session
-  FROM messages_v1 m
-  JOIN channels c
-    ON c.name = 'dm:' || MIN(m.from_session, m.to_session) || ':' || MAX(m.from_session, m.to_session);
-
--- One thread row per (channel, old tag). A tag that spanned several pairs was
--- one thread only by accident of having no channel; it becomes one per channel,
--- which is the boundary it should always have had.
-INSERT OR IGNORE INTO threads (channel_id, name, opener_session, created_at)
-SELECT c.id, m.thread_id, MIN(m.from_session), MIN(m.created_at)
-  FROM messages_v1 m
-  JOIN channels c
-    ON c.name = 'dm:' || MIN(m.from_session, m.to_session) || ':' || MAX(m.from_session, m.to_session)
- GROUP BY c.id, m.thread_id;
-
-INSERT OR IGNORE INTO messages
-       (id, channel_id, thread_id, from_session, body, hops, expect_reply, reply_to_id, created_at)
-SELECT m.id, c.id, t.id, m.from_session, m.body, m.hops, m.expect_reply, m.reply_to_id, m.created_at
-  FROM messages_v1 m
-  JOIN channels c
-    ON c.name = 'dm:' || MIN(m.from_session, m.to_session) || ':' || MAX(m.from_session, m.to_session)
-  JOIN threads t ON t.channel_id = c.id AND t.name = m.thread_id
- ORDER BY m.id;
-
--- Delivery was a column on the row and is now a fact about one recipient.
-INSERT OR IGNORE INTO deliveries (message_id, session_id, delivered_at, delivered_via)
-SELECT id, to_session, delivered_at, COALESCE(delivered_via, 'v1')
-  FROM messages_v1
- WHERE delivered_at IS NOT NULL;
-
-DROP TABLE messages_v1;
-DROP TABLE IF EXISTS threads_v1;
-COMMIT;
-PRAGMA foreign_keys=ON;
-SQL
-) || true
-    if [[ -n "$err" ]]; then
-        mkdir -p "$MESH_DIR" 2>/dev/null || true
-        printf '%s v1->channels: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$err" \
-            >> "$MESH_DIR/migration.log" 2>/dev/null || true
-    fi
+    # The backfill runs with foreign_keys off so that reply_to_id may point at a
+    # row later in the same INSERT..SELECT. This proves the result rather than
+    # trusting the insert order.
     local bad
     bad=$(sql "PRAGMA foreign_key_check;" 2>/dev/null) || bad=""
-    if [[ -n "$bad" ]]; then
-        printf '%s v1->channels left dangling references: %s\n' \
-            "$(date '+%Y-%m-%d %H:%M:%S')" "$bad" \
-            >> "$MESH_DIR/migration.log" 2>/dev/null || true
-    fi
+    [[ -n "$bad" ]] && _migration_log "v1->channels left dangling references: $bad"
+    return 0
+}
+
+# sqlite3 has no sha256, so the migration leaves uid NULL and it is computed here
+# from the same fields _post_message hashes. Ascending id order is what lets a
+# reply hash its parent's uid: the parent is an earlier row, so it already has
+# one by the time the reply is reached.
+#
+# A migrated message keeps an empty nonce. It predates the column, and inventing
+# one would give the same message two identities on two machines that both
+# migrated it, which is what the uid exists to prevent.
+_backfill_uids() {
+    local rows id nonce chan thread from created parent body uid
+    rows=$(sql_sep $'\037' "SELECT m.id, m.nonce, c.name, t.name, m.from_session,
+                                  m.created_at, COALESCE(m.reply_to_id, 0)
+                             FROM messages m
+                             JOIN channels c ON c.id=m.channel_id
+                             JOIN threads  t ON t.id=m.thread_id
+                            WHERE m.uid IS NULL
+                            ORDER BY m.id;")
+    [[ -n "$rows" ]] || return 0
+    while IFS=$'\037' read -r id nonce chan thread from created parent; do
+        [[ -z "$id" ]] && continue
+        # One row at a time rather than in the projection above: a body can span
+        # lines, and a multi-line field would break the record-per-line read.
+        # The sentinel byte is what preserves a trailing newline, which command
+        # substitution would otherwise eat and change the hash.
+        body=$(sql "SELECT body || char(1) FROM messages WHERE id=$id;")
+        body="${body%$'\001'}"
+        local parent_uid=""
+        [[ "${parent:-0}" != "0" ]] && \
+            parent_uid=$(sql "SELECT COALESCE(uid,'') FROM messages WHERE id=$parent;")
+        uid=$(_msg_uid "$nonce" "$chan" "$thread" "$from" "$body" "$created" "$parent_uid")
+        sql "UPDATE messages SET uid='$uid' WHERE id=$id;"
+    done <<EOF
+$rows
+EOF
     return 0
 }
 
@@ -675,6 +749,12 @@ cmd_register() {
             sql "UPDATE agents SET alias='$(sql_esc "$cand")' WHERE session_id='$esid';"
         fi
     fi
+    # #general is the one channel that exists without anybody creating it, so an
+    # agent that has just registered can be reached by name. init only seeded the
+    # agents that already existed, which left every later arrival out of it.
+    sql "INSERT OR IGNORE INTO channel_members (channel_id, session_id)
+              SELECT id, '$esid' FROM channels WHERE name='general';"
+
     _debug_log "register sid=$sid harness=$harness pane=$pane alias=$alias"
     return 0
 }
@@ -698,17 +778,42 @@ cmd_deregister() {
          WHERE closed_at IS NULL AND opener_session='$esid';"
 
     # This agent's mail can never be delivered now, and _update_status counts
-    # every undelivered row, so leaving it behind keeps a mail badge on the
+    # every undelivered pair, so leaving it behind keeps a mail badge on the
     # status bar forever. Log it before dropping it: the audit log is this
     # project's answer to mail that did not arrive.
+    #
+    # Dropping the membership is what drops the mail, because pending is scoped
+    # by membership. The message rows stay: the other members of a channel are
+    # still entitled to their copy and to the history.
     local orphans
-    orphans=$(sql_json "SELECT id, thread_id, from_session, hops FROM messages
-                        WHERE to_session='$esid' AND delivered_at IS NULL;")
+    orphans=$(sql_json "SELECT m.id, t.name AS thread_id, m.from_session, m.hops
+                          FROM messages m
+                          JOIN threads t ON t.id=m.thread_id
+                          JOIN channel_members cm ON cm.channel_id=m.channel_id
+                                                 AND cm.session_id='$esid'
+                         WHERE m.from_session<>'$esid'
+                           AND NOT EXISTS (SELECT 1 FROM deliveries d
+                                            WHERE d.message_id=m.id AND d.session_id='$esid');")
     if [[ "$orphans" != "[]" ]]; then
         _log_delivery "$sid" "undeliverable" "$orphans"
-        sql "DELETE FROM messages WHERE to_session='$esid' AND delivered_at IS NULL;"
     fi
 
+    # Only the mail nobody else could have read. In a channel with other members
+    # the row is still theirs, and delivered mail is history either way; what has
+    # to go is the message whose sole recipient just left, or the badge counts it
+    # forever. Before the membership is dropped, because that is what finds it.
+    sql "DELETE FROM messages WHERE id IN (
+             SELECT m.id FROM messages m
+               JOIN channel_members cm ON cm.channel_id=m.channel_id AND cm.session_id='$esid'
+              WHERE m.from_session<>'$esid'
+                AND NOT EXISTS (SELECT 1 FROM deliveries d
+                                 WHERE d.message_id=m.id AND d.session_id='$esid')
+                AND NOT EXISTS (SELECT 1 FROM channel_members cm2
+                                 WHERE cm2.channel_id=m.channel_id
+                                   AND cm2.session_id<>m.from_session
+                                   AND cm2.session_id<>'$esid'));"
+
+    sql "DELETE FROM channel_members WHERE session_id='$esid';"
     sql "DELETE FROM agents WHERE session_id='$esid';"
     rm -f "$(_notify_flag "$sid")" 2>/dev/null || true
     _update_status
@@ -807,61 +912,182 @@ cmd_transcript() {
 
 _mesh_enabled() { [[ "${ENABLED:-on}" != "off" ]]; }
 
-_thread_count() {
-    local t
-    t=$(sql "SELECT COALESCE(msg_count,0) FROM threads WHERE thread_id='$(sql_esc "$1")';")
-    printf '%s' "${t:-0}"
-}
-
 _new_thread_id() { printf 't-%s-%s' "$(date +%s)" "$$"; }
 
-# ── send / broadcast / reply ─────────────────────────────────────────
-
-_queue_message() {
-    local from="$1" to="$2" body="$3" thread="$4" hops="$5" expect="$6" reply_to="$7"
-
-    local efrom eto ebody ethread
-    efrom=$(sql_esc "$from"); eto=$(sql_esc "$to")
-    ebody=$(sql_esc "$body"); ethread=$(sql_esc "$thread")
-
-    # last_insert_rowid() is per-connection and every sql() call opens a new
-    # one, so the SELECT has to ride along in the same invocation.
-    local mid
-    mid=$(sql "INSERT OR IGNORE INTO threads (thread_id, opener_session) VALUES ('$ethread', '$efrom');
-         UPDATE threads SET msg_count=msg_count+1 WHERE thread_id='$ethread';
-         INSERT INTO messages (thread_id, from_session, to_session, body, hops, expect_reply, reply_to_id)
-         VALUES ('$ethread', '$efrom', '$eto', '$ebody', $hops, $expect,
-                 $( [[ -n "$reply_to" ]] && printf '%s' "$reply_to" || printf 'NULL' ));
-         SELECT last_insert_rowid();")
-
-    mkdir -p "$NOTIFY_DIR" 2>/dev/null || true
-    : > "$(_notify_flag "$to")" 2>/dev/null || true
-
-    _update_status
-    [[ "$to" == "$HUMAN_ID" ]] && _fire_mail_hook "$from" "$body"
-
-    _debug_log "queued id=$mid from=$from to=$to thread=$thread hops=$hops"
-    printf '%s' "$mid"
-}
-
+# There is deliberately no per-thread message cap. It counted human posts as
+# well as automated ones, so it punished exactly the long-lived topic whose
+# accumulated decisions are the most valuable thing the mailbox holds. The hop
+# cap bounds a reply chain and the continuation budget bounds forced turns; both
+# count automated exchanges, which is the thing that actually runs away.
 _check_caps() {
     local thread="$1" hops="$2"
     _mesh_enabled || _die "send: mesh is disabled (@agent-mesh-enabled off)"
     if [[ "$hops" -gt "${MAX_HOPS:-4}" ]]; then
         _die "send: hop limit reached (${MAX_HOPS:-4}); thread $thread stopped"
     fi
-    local n
-    n=$(_thread_count "$thread")
-    if [[ "$n" -ge "${MAX_THREAD_MSGS:-12}" ]]; then
-        _die "send: thread $thread is at its message limit (${MAX_THREAD_MSGS:-12})"
+}
+
+# ── content addressing ───────────────────────────────────────────────
+#
+# A row id is local: this machine's message 7 and another machine's message 7
+# are different messages, so an id cannot be what an import deduplicates on.
+# Hashing the content gives an identifier both machines compute the same way,
+# which is what makes syncing a set union rather than a merge.
+#
+# internal/store/uid.go hashes the same fields in the same order. A change here
+# has to land there too, or the same message gets two identities.
+
+_sha256() {
+    if [[ -z "${_SHA256_CMD:-}" ]]; then
+        if command -v sha256sum >/dev/null 2>&1; then
+            _SHA256_CMD="sha256sum"
+        elif command -v shasum >/dev/null 2>&1; then
+            _SHA256_CMD="shasum -a 256"
+        else
+            _die "no sha256 tool on PATH (need sha256sum or shasum)"
+        fi
     fi
+    $_SHA256_CMD | cut -d' ' -f1
+}
+
+# Random per message. Two identical bodies posted in the same second by the same
+# agent into the same thread are two messages; without this they hash alike and
+# the second is dropped as a duplicate the first time the mailbox is synced.
+_new_nonce() { od -An -tx1 -N16 /dev/urandom | tr -d ' \n'; }
+
+# Fields joined with a unit separator, which cannot occur in any of them, so no
+# field can be crafted to look like a different set of fields. Channel and thread
+# go in by name rather than by id, because ids are local.
+_msg_uid() {
+    local us=$'\037'
+    printf '%s' "$1$us$2$us$3$us$4$us$5$us$6$us$7" | _sha256
+}
+
+# ── channels are the one recipient mechanism ─────────────────────────
+#
+# A message is posted to a channel and every other member is a recipient, so a
+# direct message is a two-member channel rather than a second addressing mode.
+# `send --to X` keeps its surface and resolves the pair's channel underneath.
+
+# Ordered, so either direction names the same row. Full session ids, not the
+# eight-character prefix a client shows: the name is an identity, and two
+# sessions sharing a prefix would share a mailbox.
+_dm_channel_name() {
+    if [[ "$1" < "$2" ]]; then printf 'dm:%s:%s' "$1" "$2"
+    else printf 'dm:%s:%s' "$2" "$1"; fi
+}
+
+_ensure_dm_channel() {
+    local a="$1" b="$2" name ename ea eb cid
+    name=$(_dm_channel_name "$a" "$b")
+    ename=$(sql_esc "$name"); ea=$(sql_esc "$a"); eb=$(sql_esc "$b")
+    cid=$(sql "INSERT OR IGNORE INTO channels (name, kind, visibility, created_by)
+                    VALUES ('$ename', 'dm', 'private', '$ea');
+               INSERT OR IGNORE INTO channel_members (channel_id, session_id)
+                    SELECT id, '$ea' FROM channels WHERE name='$ename';
+               INSERT OR IGNORE INTO channel_members (channel_id, session_id)
+                    SELECT id, '$eb' FROM channels WHERE name='$ename';
+               SELECT id FROM channels WHERE name='$ename';")
+    [[ -n "$cid" ]] || _die "send: could not open a channel between $a and $b"
+    printf '%s' "$cid"
+}
+
+# A thread is a row scoped to one channel, so the same name in two channels is
+# two conversations. The name can be chosen before the thread exists, which is
+# what lets one agent tell another where to put its findings.
+_ensure_thread() {
+    local cid="$1" ename eopener
+    ename=$(sql_esc "$2"); eopener=$(sql_esc "$3")
+    sql "INSERT OR IGNORE INTO threads (channel_id, name, opener_session)
+              VALUES ($cid, '$ename', '$eopener');
+         SELECT id FROM threads WHERE channel_id=$cid AND name='$ename';"
+}
+
+# Pending mail for the agent row aliased `a` in the enclosing query. Pending is
+# the absence of a delivery row rather than a column, so the shape is a constant
+# instead of five hand-copied subqueries, for the same reason the schema is
+# generated instead of maintained twice.
+_PENDING_FOR_AGENT="(SELECT COUNT(*) FROM messages m
+        JOIN channel_members cm ON cm.channel_id=m.channel_id AND cm.session_id=a.session_id
+       WHERE m.from_session<>a.session_id
+         AND NOT EXISTS (SELECT 1 FROM deliveries d
+                          WHERE d.message_id=m.id AND d.session_id=a.session_id))"
+
+# What a message was addressed to, for display. A DM channel renders as the
+# other member, so `send --to alice` still reads as "-> alice" and not as the
+# pair's channel name. Requires the enclosing query to alias messages `m` and
+# channels `c`.
+_TO_NAME_SQL="CASE WHEN c.kind='dm' THEN (
+            SELECT COALESCE(a2.alias, substr(cm2.session_id,1,8))
+              FROM channel_members cm2
+              LEFT JOIN agents a2 ON a2.session_id=cm2.session_id
+             WHERE cm2.channel_id=c.id AND cm2.session_id<>m.from_session LIMIT 1)
+        ELSE '#' || c.name END"
+
+_pending_count() {
+    local esid
+    esid=$(sql_esc "$1")
+    sql "SELECT COUNT(*) FROM messages m
+           JOIN channel_members cm ON cm.channel_id=m.channel_id AND cm.session_id='$esid'
+          WHERE m.from_session<>'$esid'
+            AND NOT EXISTS (SELECT 1 FROM deliveries d
+                             WHERE d.message_id=m.id AND d.session_id='$esid');"
+}
+
+# ── send / broadcast / reply ─────────────────────────────────────────
+
+_post_message() {
+    local from="$1" cid="$2" thread="$3" body="$4" hops="$5" expect="$6" reply_to="$7"
+
+    local tid cname parent_uid nonce created uid mid efrom
+    efrom=$(sql_esc "$from")
+    tid=$(_ensure_thread "$cid" "$thread" "$from")
+    [[ -n "$tid" ]] || _die "send: could not open thread '$thread'"
+    cname=$(sql "SELECT name FROM channels WHERE id=$cid;")
+
+    # The parent's uid, not its row id: a reply has to keep pointing at the same
+    # message once either row leaves this database.
+    parent_uid=""
+    if [[ -n "$reply_to" ]]; then
+        parent_uid=$(sql "SELECT COALESCE(uid,'') FROM messages WHERE id=$reply_to;")
+    fi
+    nonce=$(_new_nonce)
+    created=$(date +%s)
+    uid=$(_msg_uid "$nonce" "$cname" "$thread" "$from" "$body" "$created" "$parent_uid")
+
+    # last_insert_rowid() is per-connection and every sql() call opens a new
+    # one, so the SELECT has to ride along in the same invocation.
+    mid=$(sql "INSERT INTO messages (uid, nonce, channel_id, thread_id, from_session, body,
+                                     hops, expect_reply, reply_to_id, created_at)
+         VALUES ('$uid', '$nonce', $cid, $tid, '$efrom', '$(sql_esc "$body")', $hops, $expect,
+                 $( [[ -n "$reply_to" ]] && printf '%s' "$reply_to" || printf 'NULL' ), $created);
+         SELECT last_insert_rowid();")
+
+    # One flag per recipient: the pi watcher polls a file per session.
+    mkdir -p "$NOTIFY_DIR" 2>/dev/null || true
+    local m
+    while IFS= read -r m; do
+        [[ -z "$m" ]] && continue
+        : > "$(_notify_flag "$m")" 2>/dev/null || true
+        if [[ "$m" == "$HUMAN_ID" ]]; then
+            _fire_mail_hook "$from" "$body"
+        fi
+    done <<EOF
+$(sql "SELECT session_id FROM channel_members
+        WHERE channel_id=$cid AND session_id<>'$efrom';")
+EOF
+
+    _update_status
+    _debug_log "posted id=$mid from=$from channel=$cname thread=$thread hops=$hops"
+    printf '%s' "$mid"
 }
 
 cmd_send() {
-    local to="" body="" thread="" from="" expect=0 remote="" hops=0 reply_to=""
+    local to="" channel="" body="" thread="" from="" expect=0 remote="" hops=0 reply_to=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --to)           to="${2:-}"; shift ;;
+            --channel)      channel="${2:-}"; shift ;;
             --message|-m)   body="${2:-}"; shift ;;
             --thread)       thread="${2:-}"; shift ;;
             --from)         from="${2:-}"; shift ;;
@@ -873,7 +1099,8 @@ cmd_send() {
         esac
         shift
     done
-    [[ -n "$to" ]]   || _die "send: --to is required"
+    [[ -n "$to$channel" ]] || _die "send: --to or --channel is required"
+    [[ -n "$to" && -n "$channel" ]] && _die "send: --to and --channel are mutually exclusive"
     [[ -n "$body" ]] || _die "send: --message is required"
     # Both go straight into the INSERT. A non-numeric --hops also makes the cap
     # check's arithmetic throw, and the enclosing `if` reads that as "under the
@@ -888,26 +1115,52 @@ cmd_send() {
 
     if [[ -n "$remote" ]]; then
         local rargs
-        rargs="send --to $(printf '%q' "$to") --message $(printf '%q' "$body")"
+        if [[ -n "$channel" ]]; then
+            rargs="send --channel $(printf '%q' "$channel")"
+        else
+            rargs="send --to $(printf '%q' "$to")"
+        fi
+        rargs="$rargs --message $(printf '%q' "$body")"
         [[ "$expect" -eq 1 ]] && rargs="$rargs --expect-reply"
         [[ -n "$thread" ]] && rargs="$rargs --thread $(printf '%q' "$thread")"
         exec ssh "$remote" "tmux-agent-mesh $rargs"
     fi
 
-    local sender rc target
+    local sender rc target="" cid="" label=""
     sender=$(_self_session "$from")
-    set +e; target=$(_resolve_ref "$to"); rc=$?; set -e
-    [[ "$rc" -eq 2 ]] && exit 2
-    [[ -n "$target" ]] || _die "send: no agent matches '$to' (try: tmux-agent-mesh roster)"
-    [[ "$target" == "$sender" ]] && _die "send: refusing to send to self ($sender)"
+    if [[ -n "$channel" ]]; then
+        cid=$(sql "SELECT id FROM channels
+                    WHERE name='$(sql_esc "$channel")' AND archived_at IS NULL;")
+        [[ -n "$cid" ]] || _die "send: no channel named '$channel' (try: tmux-agent-mesh channel list)"
+        local mine others
+        mine=$(sql "SELECT COUNT(*) FROM channel_members
+                     WHERE channel_id=$cid AND session_id='$(sql_esc "$sender")';")
+        [[ "${mine:-0}" -gt 0 ]] \
+            || _die "send: $(_display_name "$sender") is not in #$channel (try: tmux-agent-mesh channel join $channel)"
+        # Refuse rather than truncate. A silent cap reads as full coverage.
+        others=$(sql "SELECT COUNT(*) FROM channel_members
+                       WHERE channel_id=$cid AND session_id<>'$(sql_esc "$sender")';")
+        [[ "${others:-0}" -eq 0 ]] && _die "send: #$channel has no other members"
+        if [[ "$others" -gt "${MAX_BROADCAST:-8}" ]]; then
+            _die "send: #$channel has $others other members, over @agent-mesh-max-broadcast (${MAX_BROADCAST:-8})"
+        fi
+        label="#$channel"
+    else
+        set +e; target=$(_resolve_ref "$to"); rc=$?; set -e
+        [[ "$rc" -eq 2 ]] && exit 2
+        [[ -n "$target" ]] || _die "send: no agent matches '$to' (try: tmux-agent-mesh roster)"
+        [[ "$target" == "$sender" ]] && _die "send: refusing to send to self ($sender)"
+        label=$(_display_name "$target")
+    fi
 
     [[ -n "$thread" ]] || thread=$(_new_thread_id)
     _check_caps "$thread" "$hops"
+    [[ -n "$cid" ]] || cid=$(_ensure_dm_channel "$sender" "$target")
 
     local mid
-    mid=$(_queue_message "$sender" "$target" "$body" "$thread" "$hops" "$expect" "$reply_to")
+    mid=$(_post_message "$sender" "$cid" "$thread" "$body" "$hops" "$expect" "$reply_to")
     sql "UPDATE agents SET last_seen=unixepoch() WHERE session_id='$(sql_esc "$sender")';"
-    printf 'queued message %s to %s (thread %s)\n' "$mid" "$(_display_name "$target")" "$thread"
+    printf 'queued message %s to %s (thread %s)\n' "$mid" "$label" "$thread"
 }
 
 cmd_broadcast() {
@@ -943,11 +1196,16 @@ cmd_broadcast() {
         _die "broadcast: $count recipients exceeds @agent-mesh-max-broadcast (${MAX_BROADCAST:-8}); narrow with --project or --harness"
     fi
 
-    local thread sid n=0
+    # One DM channel per recipient, sharing a thread name. A broadcast is a
+    # fan-out of direct messages, not a room: a reply goes back to the sender
+    # alone, which is what the caller of a broadcast asked for. `channel create`
+    # plus `send --channel` is the room.
+    local thread sid cid n=0
     thread=$(_new_thread_id)
     while IFS= read -r sid; do
         [[ -z "$sid" ]] && continue
-        _queue_message "$sender" "$sid" "$body" "$thread" 0 0 "" >/dev/null
+        cid=$(_ensure_dm_channel "$sender" "$sid")
+        _post_message "$sender" "$cid" "$thread" "$body" 0 0 "" >/dev/null
         n=$((n + 1))
     done <<EOF
 $recipients
@@ -973,18 +1231,24 @@ cmd_reply() {
         *[!0-9]*) _die "reply: --to-message must be a message id" ;;
     esac
 
-    local row orig_from orig_thread orig_hops orig_to
-    row=$(sql_sep '|' "SELECT from_session, thread_id, hops, to_session FROM messages WHERE id=$mid;")
+    local row orig_from orig_thread orig_hops orig_cid
+    row=$(sql_sep '|' "SELECT m.from_session, t.name, m.hops, m.channel_id
+                         FROM messages m JOIN threads t ON t.id=m.thread_id
+                        WHERE m.id=$mid;")
     [[ -n "$row" ]] || _die "reply: no message with id $mid"
-    IFS='|' read -r orig_from orig_thread orig_hops orig_to <<EOF
+    IFS='|' read -r orig_from orig_thread orig_hops orig_cid <<EOF
 $row
 EOF
 
-    local sender
+    local sender member
     sender=$(_self_session "$from")
-    # Replying to mail that was not addressed to you would forge a thread.
-    if [[ "$sender" != "$orig_to" ]]; then
-        _die "reply: message $mid was addressed to $(_display_name "$orig_to"), not to you ($(_display_name "$sender"))"
+    # Replying into a channel you are not in would forge a conversation. This is
+    # the membership check that used to be "was it addressed to you": a message
+    # now has several recipients and any of them may answer.
+    member=$(sql "SELECT COUNT(*) FROM channel_members
+                   WHERE channel_id=$orig_cid AND session_id='$(sql_esc "$sender")';")
+    if [[ "${member:-0}" -eq 0 ]]; then
+        _die "reply: message $mid is not in a channel $(_display_name "$sender") belongs to"
     fi
     [[ "$orig_from" == "$sender" ]] && _die "reply: refusing to reply to self"
 
@@ -992,7 +1256,7 @@ EOF
     _check_caps "$orig_thread" "$hops"
 
     local new_id
-    new_id=$(_queue_message "$sender" "$orig_from" "$body" "$orig_thread" "$hops" 0 "$mid")
+    new_id=$(_post_message "$sender" "$orig_cid" "$orig_thread" "$body" "$hops" 0 "$mid")
     sql "UPDATE agents SET last_seen=unixepoch() WHERE session_id='$(sql_esc "$sender")';"
     printf 'replied as message %s to %s (thread %s, hop %s)\n' \
         "$new_id" "$(_display_name "$orig_from")" "$orig_thread" "$hops"
@@ -1000,12 +1264,24 @@ EOF
 
 # ── inbox / drain ────────────────────────────────────────────────────
 
+# Mail a session has not been handed yet: posted to a channel it belongs to, by
+# somebody else, with no delivery row. thread_id keeps its name in the output
+# because it is what an agent quotes back to `recv --thread`; it now carries the
+# thread's name rather than a bare tag column.
 _inbox_query() {
-    printf 'SELECT m.id, m.thread_id, COALESCE(a.alias, m.from_session) AS from_name,
+    local esid
+    esid=$(sql_esc "$1")
+    printf "SELECT m.id, t.name AS thread_id, COALESCE(a.alias, m.from_session) AS from_name,
                    m.hops, m.created_at, m.body
-            FROM messages m LEFT JOIN agents a ON a.session_id=m.from_session
-            WHERE m.to_session=%s AND m.delivered_at IS NULL AND m.id > %s
-            ORDER BY m.id' "'$(sql_esc "$1")'" "${2:-0}"
+              FROM messages m
+              JOIN threads t ON t.id=m.thread_id
+              JOIN channel_members cm ON cm.channel_id=m.channel_id AND cm.session_id='%s'
+              LEFT JOIN agents a ON a.session_id=m.from_session
+             WHERE m.from_session<>'%s'
+               AND NOT EXISTS (SELECT 1 FROM deliveries d
+                                WHERE d.message_id=m.id AND d.session_id='%s')
+               AND m.id > %s
+             ORDER BY m.id" "$esid" "$esid" "$esid" "${2:-0}"
 }
 
 _print_inbox() {
@@ -1047,7 +1323,7 @@ cmd_inbox() {
 
     if [[ "$follow" -eq 0 ]]; then
         local n
-        n=$(sql "SELECT COUNT(*) FROM messages WHERE to_session='$(sql_esc "$sid")' AND delivered_at IS NULL;")
+        n=$(_pending_count "$sid")
         printf 'inbox for %s: %s pending\n' "$(_display_name "$sid")" "$n"
         _print_inbox "$sid"
         return 0
@@ -1056,7 +1332,9 @@ cmd_inbox() {
     printf 'following inbox for %s (Ctrl-C to stop)\n' "$(_display_name "$sid")"
     local seen=0 maxid
     while true; do
-        maxid=$(sql "SELECT COALESCE(MAX(id),0) FROM messages WHERE to_session='$(sql_esc "$sid")';")
+        maxid=$(sql "SELECT COALESCE(MAX(m.id),0) FROM messages m
+                       JOIN channel_members cm ON cm.channel_id=m.channel_id
+                                              AND cm.session_id='$(sql_esc "$sid")';")
         if [[ "${maxid:-0}" -gt "$seen" ]]; then
             _print_inbox "$sid" "$seen"
             seen="$maxid"
@@ -1065,26 +1343,39 @@ cmd_inbox() {
     done
 }
 
-# Atomically claim pending mail for a session and stamp it delivered.
+# Atomically claim pending mail for a session and record the delivery.
 # One sqlite3 process inside BEGIN IMMEDIATE, so two concurrent drains
 # cannot both take the same message. Avoids RETURNING, which needs
 # sqlite 3.35+ and would raise the version floor for no benefit.
+#
+# The claim is a row in deliveries, whose primary key is (message_id,
+# session_id), so a double claim is a constraint violation rather than something
+# only the transaction shape prevents. Claiming is also reading: for an agent,
+# the moment the text enters its context is the moment it was read.
 _drain_claim() {
     local sid="$1" via="$2" esid evia
     esid=$(sql_esc "$sid"); evia=$(sql_esc "$via")
     local out
     out=$(printf '.timeout 100\n.mode json\n%s\n' "
+PRAGMA foreign_keys=ON;
 BEGIN IMMEDIATE;
 CREATE TEMP TABLE _claim AS
-    SELECT id FROM messages WHERE to_session='$esid' AND delivered_at IS NULL;
-UPDATE messages SET delivered_at=unixepoch(), delivered_via='$evia'
-    WHERE id IN (SELECT id FROM _claim);
+    SELECT m.id FROM messages m
+      JOIN channel_members cm ON cm.channel_id=m.channel_id AND cm.session_id='$esid'
+     WHERE m.from_session<>'$esid'
+       AND NOT EXISTS (SELECT 1 FROM deliveries d
+                        WHERE d.message_id=m.id AND d.session_id='$esid');
+INSERT OR IGNORE INTO deliveries (message_id, session_id, delivered_via)
+    SELECT id, '$esid', '$evia' FROM _claim;
+INSERT INTO reads (message_id, reader, source)
+    SELECT id, '$esid', 'drain' FROM _claim;
 UPDATE agents SET last_seen=unixepoch() WHERE session_id='$esid';
-SELECT m.id, m.thread_id, m.from_session,
+SELECT m.id, t.name AS thread_id, m.from_session,
        COALESCE(a.alias, substr(m.from_session,1,8)) AS from_name,
        m.body, m.hops, m.expect_reply
   FROM messages m
   JOIN _claim c ON c.id=m.id
+  JOIN threads t ON t.id=m.thread_id
   LEFT JOIN agents a ON a.session_id=m.from_session
  ORDER BY m.id;
 COMMIT;
@@ -1192,7 +1483,15 @@ _set_model() {
 
 _update_status() {
     local n s=""
-    n=$(sql "SELECT COUNT(*) FROM messages WHERE delivered_at IS NULL;" 2>/dev/null || echo 0)
+    # One count per undelivered (message, recipient) pair: a message posted to a
+    # channel of three is three pieces of mail, and the badge says how much is
+    # waiting, not how many rows exist.
+    n=$(sql "SELECT COUNT(*) FROM messages m
+               JOIN channel_members cm ON cm.channel_id=m.channel_id
+              WHERE m.from_session<>cm.session_id
+                AND NOT EXISTS (SELECT 1 FROM deliveries d
+                                 WHERE d.message_id=m.id AND d.session_id=cm.session_id);" \
+        2>/dev/null || echo 0)
     [[ "${n:-0}" -gt 0 ]] && s="${ICON_MAIL:-@}${n}"
     tmux set -gq @agent-mesh-status "$s" 2>/dev/null || true
     # A failed redirect writes to stderr, and harnesses surface hook stderr to
@@ -1413,7 +1712,7 @@ _hook_turn_end() {
     fi
 
     local pending
-    pending=$(sql "SELECT COUNT(*) FROM messages WHERE to_session='$(sql_esc "$sid")' AND delivered_at IS NULL;")
+    pending=$(_pending_count "$sid")
     [[ "${pending:-0}" -eq 0 ]] && return 0
 
     # Budget exhausted: still deliver, but do not force another turn.
@@ -1471,7 +1770,7 @@ cmd_pi_deliver() {
             streak=$(_block_streak "$sid")
             [[ "$streak" -ge "${MAX_BLOCKS:-3}" ]] && return 0
             local pending
-            pending=$(sql "SELECT COUNT(*) FROM messages WHERE to_session='$(sql_esc "$sid")' AND delivered_at IS NULL;")
+            pending=$(_pending_count "$sid")
             [[ "${pending:-0}" -eq 0 ]] && return 0
             local text
             text=$(cmd_drain --session "$sid" --via pi:push)
@@ -1567,15 +1866,23 @@ cmd_recv() {
     [[ -n "$thread" ]] || _die "recv: --thread is required"
     [[ -n "$sid" ]] || sid=$(_self_session "")
 
-    local q q_json
+    local q q_json where esid ethread
+    esid=$(sql_esc "$sid"); ethread=$(sql_esc "$thread")
+    where="WHERE t.name='$ethread' AND m.from_session<>'$esid'
+             AND EXISTS (SELECT 1 FROM channel_members cm
+                          WHERE cm.channel_id=m.channel_id AND cm.session_id='$esid')"
     q="SELECT m.id, COALESCE(a.alias, m.from_session), m.body
-             FROM messages m LEFT JOIN agents a ON a.session_id=m.from_session
-             WHERE m.thread_id='$(sql_esc "$thread")' AND m.to_session='$(sql_esc "$sid")'
+             FROM messages m
+             JOIN threads t ON t.id=m.thread_id
+             LEFT JOIN agents a ON a.session_id=m.from_session
+             $where
              ORDER BY m.id"
     q_json="SELECT m.id, COALESCE(a.alias, m.from_session) AS from_name, m.body,
-              m.thread_id, m.hops, m.created_at
-       FROM messages m LEFT JOIN agents a ON a.session_id=m.from_session
-       WHERE m.thread_id='$(sql_esc "$thread")' AND m.to_session='$(sql_esc "$sid")'
+              t.name AS thread_id, m.hops, m.created_at
+       FROM messages m
+       JOIN threads t ON t.id=m.thread_id
+       LEFT JOIN agents a ON a.session_id=m.from_session
+       $where
        ORDER BY m.id"
 
     local waited=0 out
@@ -1612,10 +1919,10 @@ cmd_watch() {
         done <<EOF
 $(sql_sep '|' "SELECT m.id, m.created_at,
         COALESCE(af.alias, substr(m.from_session,1,8)),
-        COALESCE(at.alias, substr(m.to_session,1,8)), m.body
+        $_TO_NAME_SQL, m.body
    FROM messages m
+   JOIN channels c ON c.id=m.channel_id
    LEFT JOIN agents af ON af.session_id=m.from_session
-   LEFT JOIN agents at ON at.session_id=m.to_session
   WHERE m.id > $seen ORDER BY m.id;")
 EOF
         sleep 1
@@ -1644,27 +1951,42 @@ cmd_mark_read() {
         sid=$(_self_session "")
     fi
 
+    # Reading is a delivery the client performed, so it is recorded the same way
+    # a drain is: a deliveries row for the claim and a reads row for the receipt.
+    local esid claim
+    esid=$(sql_esc "$sid")
+    claim="INSERT OR IGNORE INTO deliveries (message_id, session_id, delivered_via)
+                SELECT m.id, '$esid', 'human:read' FROM messages m
+                  JOIN channel_members cm ON cm.channel_id=m.channel_id
+                                         AND cm.session_id='$esid'
+                 WHERE m.from_session<>'$esid'"
+
     if [[ -n "$mid" ]]; then
         case "$mid" in
             *[!0-9]*) _die "mark-read: --message-id must be a number" ;;
         esac
         local n
-        n=$(sql "UPDATE messages SET delivered_at=unixepoch(), delivered_via='human:read'
-                 WHERE id=$mid AND to_session='$(sql_esc "$sid")' AND delivered_at IS NULL;
-                 SELECT changes();")
+        n=$(sql "$claim AND m.id=$mid; SELECT changes();")
         if [[ "${n:-0}" -eq 0 ]]; then
-            _die "mark-read: message $mid not found, not pending, or not addressed to you"
+            _die "mark-read: message $mid not found, not pending, or not in a channel you belong to"
         fi
+        sql "INSERT INTO reads (message_id, reader, source) VALUES ($mid, '$esid', 'client');"
         printf 'marked message %s as read\n' "$mid"
     else
         local n
-        n=$(sql "SELECT COUNT(*) FROM messages WHERE to_session='$(sql_esc "$sid")' AND delivered_at IS NULL;")
+        n=$(_pending_count "$sid")
         if [[ "${n:-0}" -eq 0 ]]; then
             printf 'no pending messages for %s\n' "$(_display_name "$sid")"
             return 0
         fi
-        sql "UPDATE messages SET delivered_at=unixepoch(), delivered_via='human:read'
-             WHERE to_session='$(sql_esc "$sid")' AND delivered_at IS NULL;"
+        sql "INSERT INTO reads (message_id, reader, source)
+                  SELECT m.id, '$esid', 'client' FROM messages m
+                    JOIN channel_members cm ON cm.channel_id=m.channel_id
+                                           AND cm.session_id='$esid'
+                   WHERE m.from_session<>'$esid'
+                     AND NOT EXISTS (SELECT 1 FROM deliveries d
+                                      WHERE d.message_id=m.id AND d.session_id='$esid');
+             $claim;"
         printf 'marked %s message(s) as read for %s\n' "$n" "$(_display_name "$sid")"
     fi
 }
@@ -1696,9 +2018,13 @@ cmd_history() {
         sid=$(_self_session "")
     fi
 
-    local where
-    where="(m.from_session='$(sql_esc "$sid")' OR m.to_session='$(sql_esc "$sid")')"
-    [[ -n "$thread" ]] && where="$where AND m.thread_id='$(sql_esc "$thread")'"
+    # Everything this session can see: what it sent, plus every channel it is in.
+    local where esid
+    esid=$(sql_esc "$sid")
+    where="(m.from_session='$esid' OR EXISTS (SELECT 1 FROM channel_members cm
+              WHERE cm.channel_id=m.channel_id AND cm.session_id='$esid'))"
+    [[ -n "$channel" ]] && where="$where AND c.name='$(sql_esc "$channel")'"
+    [[ -n "$thread" ]] && where="$where AND t.name='$(sql_esc "$thread")'"
     if [[ -n "$from" ]]; then
         local from_sid frc
         set +e; from_sid=$(_resolve_ref "$from"); frc=$?; set -e
@@ -1707,14 +2033,17 @@ cmd_history() {
     fi
     [[ -n "$since" ]] && where="$where AND m.created_at >= unixepoch('$(sql_esc "$since")')"
 
-    local q="SELECT m.id, m.thread_id,
+    local q="SELECT m.id, t.name,
                 COALESCE(fa.alias, substr(m.from_session,1,8)),
-                COALESCE(ta.alias, substr(m.to_session,1,8)),
+                $_TO_NAME_SQL,
                 m.hops, m.created_at, m.body,
-                m.delivered_at, m.delivered_via
+                (SELECT MIN(d.delivered_at) FROM deliveries d WHERE d.message_id=m.id),
+                (SELECT d.delivered_via FROM deliveries d
+                  WHERE d.message_id=m.id ORDER BY d.delivered_at, d.session_id LIMIT 1)
          FROM messages m
+         JOIN channels c ON c.id=m.channel_id
+         JOIN threads  t ON t.id=m.thread_id
          LEFT JOIN agents fa ON fa.session_id=m.from_session
-         LEFT JOIN agents ta ON ta.session_id=m.to_session
          WHERE $where
          ORDER BY m.id DESC
          LIMIT $limit"
@@ -1767,7 +2096,7 @@ cmd_info() {
     q="SELECT a.session_id, a.alias, a.harness, a.project_name,
                 a.tmux_pane, a.tmux_target, a.turn_state, a.model,
                 a.push_capable, a.block_streak, a.registered_at, a.last_seen,
-                (SELECT COUNT(*) FROM messages m WHERE m.to_session=a.session_id AND m.delivered_at IS NULL) AS pending
+                $_PENDING_FOR_AGENT AS pending
          FROM agents a WHERE a.session_id='$(sql_esc "$sid")'"
 
     if [[ "$as_json" -eq 1 ]]; then
@@ -1817,15 +2146,22 @@ cmd_thread() {
     [[ -n "$tid" ]] || _die "thread: usage: thread <id> [--json] [--limit <n>]"
 
     local q
+    # By name, so an agent can quote back the thread it was told about. A name is
+    # unique per channel, so the same name in two channels shows both, in id
+    # order, which is the order they happened in.
     q="SELECT m.id,
                 COALESCE(a.alias, substr(m.from_session,1,8)) AS from_name,
-                COALESCE(r.alias, substr(m.to_session,1,8)) AS to_name,
+                $_TO_NAME_SQL AS to_name,
                 m.hops, m.created_at, m.body,
-                m.delivered_at, m.delivered_via, m.reply_to_id
+                (SELECT MIN(d.delivered_at) FROM deliveries d WHERE d.message_id=m.id) AS delivered_at,
+                (SELECT d.delivered_via FROM deliveries d
+                  WHERE d.message_id=m.id ORDER BY d.delivered_at, d.session_id LIMIT 1) AS delivered_via,
+                m.reply_to_id
          FROM messages m
+         JOIN channels c ON c.id=m.channel_id
+         JOIN threads  t ON t.id=m.thread_id
          LEFT JOIN agents a ON a.session_id=m.from_session
-         LEFT JOIN agents r ON r.session_id=m.to_session
-         WHERE m.thread_id='$(sql_esc "$tid")'
+         WHERE t.name='$(sql_esc "$tid")'
          ORDER BY m.id ASC"
     [[ -n "$limit" ]] && q="$q LIMIT $limit"
 
@@ -1876,7 +2212,7 @@ cmd_ping() {
 
     local q
     q="SELECT session_id, turn_state, last_seen, model,
-                (SELECT COUNT(*) FROM messages m WHERE m.to_session=a.session_id AND m.delivered_at IS NULL) AS pending
+                $_PENDING_FOR_AGENT AS pending
          FROM agents a WHERE a.session_id='$(sql_esc "$sid")'"
 
     if [[ "$as_json" -eq 1 ]]; then
@@ -2203,23 +2539,11 @@ cmd_dm() {
     sender=$(_self_session "")
     [[ "$sender" == "$target" ]] && _die "dm: refusing to create DM with yourself"
 
-    # DMs are named dm-<shorter_id>-<longer_id> so either direction resolves.
-    local a b
-    if [[ "$sender" < "$target" ]]; then a="$sender"; b="$target"; else a="$target"; b="$sender"; fi
-    local name
-    name=$(printf 'dm-%s-%s' "${a:0:8}" "${b:0:8}")
-
-    local cid
-    cid=$(sql "SELECT id FROM channels WHERE name='$(sql_esc "$name")';")
-    if [[ -z "$cid" ]]; then
-        # Create the DM channel.
-        cid=$(sql "INSERT INTO channels (name, kind, visibility, topic, created_by)
-                    VALUES ('$(sql_esc "$name")', 'dm', 'private', 'DM between $(_display_name "$a") and $(_display_name "$b")', '$(sql_esc "$sender")');
-                    SELECT last_insert_rowid();")
-        # Both participants are members.
-        sql "INSERT OR IGNORE INTO channel_members (channel_id, session_id) VALUES ($cid, '$(sql_esc "$a")');"
-        sql "INSERT OR IGNORE INTO channel_members (channel_id, session_id) VALUES ($cid, '$(sql_esc "$b")');"
-    fi
+    # The same name `send --to` resolves to, or the two would be different
+    # mailboxes for the same pair.
+    local cid name
+    cid=$(_ensure_dm_channel "$sender" "$target")
+    name=$(_dm_channel_name "$sender" "$target")
     printf 'dm channel: #%s (id %s)\n' "$name" "$cid"
 }
 
@@ -2253,19 +2577,16 @@ cmd_search() {
     fi
     [[ -n "$since" ]] && where="$where AND m.created_at >= unixepoch('$(sql_esc "$since")')"
 
-    local q="SELECT m.id, m.thread_id,
+    local q="SELECT m.id, t.name,
                 COALESCE(fa.alias, substr(m.from_session,1,8)),
-                COALESCE(ta.alias, substr(m.to_session,1,8)),
-                COALESCE(c.name, '-'),
+                $_TO_NAME_SQL,
+                c.name,
                 m.created_at,
                 CASE WHEN length(m.body) > 120 THEN substr(m.body,1,120) || '...' ELSE m.body END
          FROM messages m
+         JOIN channels c ON c.id=m.channel_id
+         JOIN threads  t ON t.id=m.thread_id
          LEFT JOIN agents fa ON fa.session_id=m.from_session
-         LEFT JOIN agents ta ON ta.session_id=m.to_session
-         LEFT JOIN channels c ON c.id = (
-             SELECT channel_id FROM channel_members cm
-             WHERE cm.session_id=m.to_session LIMIT 1
-         )
          WHERE $where
          ORDER BY m.id DESC
          LIMIT $limit"
@@ -2431,7 +2752,7 @@ cmd_menu() {
         items+=("$label" "$n" "run-shell '$SCRIPTS_DIR/mesh.sh goto $(printf '%q' "$target")'")
     done <<EOF
 $(sql_sep '|' "SELECT a.alias, a.session_id, a.harness,
-        (SELECT COUNT(*) FROM messages m WHERE m.to_session=a.session_id AND m.delivered_at IS NULL),
+        $_PENDING_FOR_AGENT,
         COALESCE(a.tmux_target,'')
    FROM agents a WHERE a.harness<>'human' ORDER BY a.alias IS NULL, a.alias;")
 EOF
@@ -2472,8 +2793,7 @@ cmd_roster() {
     fi
 
     local q="SELECT a.alias, a.session_id, a.harness, a.project_name, a.push_capable,
-                (SELECT COUNT(*) FROM messages m
-                  WHERE m.to_session=a.session_id AND m.delivered_at IS NULL) AS pending,
+                $_PENDING_FOR_AGENT AS pending,
                 a.turn_state, a.model, a.tmux_target
          FROM agents a ORDER BY (a.harness='human') DESC, a.alias IS NULL, a.alias, a.registered_at"
 
@@ -2579,12 +2899,26 @@ EOF
 $(sql_sep '|' "SELECT id, COALESCE(tmux_pane,'') FROM dispatches WHERE claimed_at IS NULL;")
 EOF
 
-    sql "DELETE FROM messages WHERE delivered_at IS NOT NULL AND delivered_at < unixepoch()-86400;"
+    # Fully delivered mail older than a day. "Delivered" is now per recipient, so
+    # a message is done only when no member is still waiting for it.
+    sql "DELETE FROM messages
+          WHERE created_at < unixepoch()-86400
+            AND NOT EXISTS (
+                SELECT 1 FROM channel_members cm
+                 WHERE cm.channel_id=messages.channel_id
+                   AND cm.session_id<>messages.from_session
+                   AND NOT EXISTS (SELECT 1 FROM deliveries d
+                                    WHERE d.message_id=messages.id
+                                      AND d.session_id=cm.session_id));"
     sql "DELETE FROM dispatches WHERE claimed_at IS NOT NULL AND claimed_at < unixepoch()-86400;"
     # Nothing else ever removes mail for a session that is no longer registered.
-    sql "DELETE FROM messages
-          WHERE delivered_at IS NULL AND to_session NOT IN (SELECT session_id FROM agents);"
-    sql "DELETE FROM threads WHERE thread_id NOT IN (SELECT DISTINCT thread_id FROM messages);"
+    # Membership is what makes a message reachable, so dropping the membership is
+    # what retires the mail; an empty DM channel then has nobody left to read it
+    # and cascades its messages, threads and delivery rows away with it.
+    sql "DELETE FROM channel_members WHERE session_id NOT IN (SELECT session_id FROM agents);"
+    sql "DELETE FROM channels WHERE kind='dm'
+          AND (SELECT COUNT(*) FROM channel_members cm WHERE cm.channel_id=channels.id) < 2;"
+    sql "DELETE FROM threads WHERE id NOT IN (SELECT DISTINCT thread_id FROM messages);"
     _update_status
     return 0
 }
@@ -2849,18 +3183,22 @@ cmd_selftest() {
     _st_has "untrusted-peer envelope present" "untrusted input" "$text"
     _st_has "expect-reply surfaced"           "reply expected"  "$text"
     _st_eq "delivery recorded the mechanism" "$tag:turn-end" \
-        "$(sql "SELECT delivered_via FROM messages WHERE to_session='$b' LIMIT 1;")"
+        "$(sql "SELECT delivered_via FROM deliveries WHERE session_id='$b' LIMIT 1;")"
+    _st_eq "claiming records a read receipt" "1" \
+        "$(sql "SELECT COUNT(*) FROM reads WHERE reader='$b' AND source='drain';")"
     _st_eq "audit line written" "1" \
         "$(grep -c "\"to\":\"$b\"" "$DELIVERY_LOG" 2>/dev/null || printf 0)"
     _st_eq "delivery is at-most-once" "" "$(cmd_drain --session "$b" --via "$tag:turn-end")"
 
     # ── reply accounting ───────────────────────────────────────────────
-    mid=$(sql "SELECT id FROM messages WHERE to_session='$b' LIMIT 1;")
+    mid=$(sql "SELECT id FROM messages WHERE from_session='$a' ORDER BY id LIMIT 1;")
+    _st_eq "every message carries a content address" "64" \
+        "$(sql "SELECT length(COALESCE(uid,'')) FROM messages WHERE id=$mid;")"
     cmd_reply --from "$b" --to-message "$mid" --message "selftest pong" >/dev/null
     _st_eq "reply increments the hop count" "1" \
-        "$(sql "SELECT hops FROM messages WHERE to_session='$a' LIMIT 1;")"
+        "$(sql "SELECT hops FROM messages WHERE from_session='$b' LIMIT 1;")"
     _st_eq "reply records the parent message" "$mid" \
-        "$(sql "SELECT reply_to_id FROM messages WHERE to_session='$a' LIMIT 1;")"
+        "$(sql "SELECT reply_to_id FROM messages WHERE from_session='$b' LIMIT 1;")"
     _st_eq "reply stays on one thread" "1" \
         "$(sql "SELECT COUNT(DISTINCT thread_id) FROM messages WHERE from_session LIKE '$tag%';")"
     cmd_drain --session "$a" --via "$tag:turn-end" >/dev/null
@@ -2870,8 +3208,6 @@ cmd_selftest() {
         cmd_send --from "$a" --to "$b" --message x
     _st_cap "hop cap stops a send" MAX_HOPS 1 \
         cmd_send --from "$a" --to "$b" --message x --hops 2
-    _st_cap "thread cap stops a send" MAX_THREAD_MSGS 0 \
-        cmd_send --from "$a" --to "$b" --message x --thread "$tag-cap"
     # --project scopes it to this run. broadcast otherwise reaches every real
     # agent registered on this machine.
     _st_cap "broadcast cap stops a fan-out" MAX_BROADCAST 1 \
@@ -2880,8 +3216,7 @@ cmd_selftest() {
     cmd_send --from "$a" --to "$b" --message "held at the cap" >/dev/null
     sql "UPDATE agents SET block_streak=99 WHERE session_id='$b';"
     _st_eq "continuation budget stops forcing turns" "" "$(_hook_turn_end claude "$b" '{}')"
-    _st_eq "held mail is kept, not dropped" "1" \
-        "$(sql "SELECT COUNT(*) FROM messages WHERE to_session='$b' AND delivered_at IS NULL;")"
+    _st_eq "held mail is kept, not dropped" "1" "$(_pending_count "$b")"
     sql "UPDATE agents SET block_streak=0 WHERE session_id='$b';"
 
     # ── harness payloads ───────────────────────────────────────────────
@@ -2958,12 +3293,16 @@ cmd_selftest() {
         "$(_claim_dispatch "$a" "$tag-pane2" || true)"
 
     # ── clean up and prove it ──────────────────────────────────────────
-    sql "DELETE FROM messages WHERE from_session LIKE '$tag%' OR to_session LIKE '$tag%';
+    #
+    # Dropping the channels is what drops this run's mail: messages, threads,
+    # deliveries and reads all cascade from it, which is the point of having one
+    # recipient mechanism instead of four places to remember.
+    sql "DELETE FROM channels WHERE name LIKE 'dm:$tag%';
          DELETE FROM dispatches WHERE tmux_pane LIKE '$tag%';"
     cmd_deregister --session "$a" >/dev/null
     cmd_deregister --session "$b" >/dev/null
     cmd_deregister --session "$p" >/dev/null
-    sql "DELETE FROM threads WHERE thread_id NOT IN (SELECT DISTINCT thread_id FROM messages);"
+    sql "DELETE FROM threads WHERE id NOT IN (SELECT DISTINCT thread_id FROM messages);"
     _update_status
 
     _st_eq "agents table restored"     "$n0_agents"  "$(sql "SELECT COUNT(*) FROM agents;")"

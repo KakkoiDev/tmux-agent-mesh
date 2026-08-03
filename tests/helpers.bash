@@ -64,7 +64,6 @@ setup_test_env() {
     export DELIVERY="stop-block"
     export PI_DELIVERY="push"
     export MAX_HOPS="4"
-    export MAX_THREAD_MSGS="12"
     export MAX_BLOCKS="3"
     export MAX_BROADCAST="8"
     export WAKE="off"
@@ -102,7 +101,6 @@ ENABLED='on'
 DELIVERY='stop-block'
 PI_DELIVERY='push'
 MAX_HOPS='4'
-MAX_THREAD_MSGS='12'
 MAX_BLOCKS='3'
 MAX_BROADCAST='8'
 ICON_MAIL='@'
@@ -217,13 +215,35 @@ insert_agent() {
                   '$pane', '$target', '/tmp/test', 'test', $push);"
 }
 
+# A message is posted to a channel, so the fixture opens the pair's DM channel
+# the same way `send --to` does and posts into it. Named `insert_message` still,
+# because what it fixtures is unchanged: one message from A that B has not seen.
 insert_message() {
     local from="$1" to="$2" body="$3" thread="${4:-t1}" hops="${5:-0}"
-    msql "INSERT INTO messages (thread_id, from_session, to_session, body, hops)
-          VALUES ('$thread', '$from', '$to', '$body', $hops);"
+    local name
+    if [[ "$from" < "$to" ]]; then name="dm:$from:$to"; else name="dm:$to:$from"; fi
+    msql "INSERT OR IGNORE INTO channels (name, kind, visibility, created_by)
+               VALUES ('$name', 'dm', 'private', '$from');
+          INSERT OR IGNORE INTO channel_members (channel_id, session_id)
+               SELECT id, '$from' FROM channels WHERE name='$name';
+          INSERT OR IGNORE INTO channel_members (channel_id, session_id)
+               SELECT id, '$to' FROM channels WHERE name='$name';
+          INSERT OR IGNORE INTO threads (channel_id, name, opener_session)
+               SELECT id, '$thread', '$from' FROM channels WHERE name='$name';
+          INSERT INTO messages (uid, channel_id, thread_id, from_session, body, hops)
+               SELECT hex(randomblob(32)), c.id, t.id, '$from', '$body', $hops
+                 FROM channels c JOIN threads t ON t.channel_id=c.id AND t.name='$thread'
+                WHERE c.name='$name';"
 }
 
-pending_for()    { msql "SELECT COUNT(*) FROM messages WHERE to_session='$1' AND delivered_at IS NULL;"; }
+# Pending is the absence of a delivery row, not a column.
+pending_for() {
+    msql "SELECT COUNT(*) FROM messages m
+            JOIN channel_members cm ON cm.channel_id=m.channel_id AND cm.session_id='$1'
+           WHERE m.from_session<>'$1'
+             AND NOT EXISTS (SELECT 1 FROM deliveries d
+                              WHERE d.message_id=m.id AND d.session_id='$1');"
+}
 body_of()        { msql "SELECT body FROM messages WHERE id=$1;"; }
 count_agents()   { msql "SELECT COUNT(*) FROM agents;"; }
 count_messages() { msql "SELECT COUNT(*) FROM messages;"; }

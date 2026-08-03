@@ -106,6 +106,20 @@ CREATE TABLE IF NOT EXISTS threads (
 
 CREATE TABLE IF NOT EXISTS messages (
     id           INTEGER PRIMARY KEY,
+    -- Content address: sha256 over nonce, channel name, thread name, sender,
+    -- body, created_at and the parent's uid. Names rather than ids because ids
+    -- are local to one database, so this is the identity that survives leaving
+    -- the machine. `import` is INSERT OR IGNORE on it, which is what makes
+    -- syncing the same row twice a no-op and sync itself order-independent.
+    --
+    -- Nullable in the DDL only so the v1 backfill can run: sqlite3 has no
+    -- sha256, so uids for existing rows are computed row by row afterwards.
+    -- Every insert path writes one.
+    uid          TEXT UNIQUE,
+    -- Random per message. Two identical bodies posted in the same second by the
+    -- same agent into the same thread are two messages; without this they would
+    -- hash alike and the second would be dropped by that same INSERT OR IGNORE.
+    nonce        TEXT NOT NULL DEFAULT '',
     channel_id   INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
     thread_id    INTEGER NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
     from_session TEXT NOT NULL,

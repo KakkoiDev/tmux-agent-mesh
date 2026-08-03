@@ -323,6 +323,7 @@ tmux-agent-mesh transcript claude-019fb6a   # -> path, or (none)
 ```bash
 tmux-agent-mesh send --to reviewer --message "what file are you in?"
 tmux-agent-mesh send --to reviewer --message "which branch?" --expect-reply
+tmux-agent-mesh send --channel general --message "who is on the migration?"
 tmux-agent-mesh broadcast --message "status?" --harness pi
 tmux-agent-mesh reply --to-message 42 --message "done"
 tmux-agent-mesh inbox --as human --follow
@@ -574,7 +575,7 @@ drive another into running commands. A cross-pane prompt-injection path is the
 natural failure mode of this whole design, and the envelope plus the caps are what
 bound it.
 
-### The five brakes
+### The four brakes
 
 All enforced in the one place every client goes through, so no harness and no
 transport can skip them.
@@ -583,7 +584,6 @@ transport can skip them.
 |---|---|---|
 | `@agent-mesh-enabled` | `on` | everything |
 | `@agent-mesh-max-hops` | `4` | reply ping-pong |
-| `@agent-mesh-max-thread-msgs` | `12` | a conversation that will not end |
 | `@agent-mesh-max-blocks` | `3` | unattended token burn |
 | `@agent-mesh-max-broadcast` | `8` | waking every pane at once |
 
@@ -721,7 +721,6 @@ tmux options, all `set -g`. Read within 60s, or immediately after
 | `@agent-mesh-delivery` | `stop-block` | `stop-block`, `next-prompt`, `off` (Claude/Codex/Gemini) |
 | `@agent-mesh-pi-delivery` | `push` | `push`, `before-start`, `off` |
 | `@agent-mesh-max-hops` | `4` | hops per thread |
-| `@agent-mesh-max-thread-msgs` | `12` | messages per thread |
 | `@agent-mesh-max-blocks` | `3` | consecutive mesh-forced turns |
 | `@agent-mesh-max-broadcast` | `8` | fan-out cap |
 | `@agent-mesh-on-mail` | `""` | shell hook when mail arrives for `human` |

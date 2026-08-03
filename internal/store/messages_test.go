@@ -167,33 +167,66 @@ func TestHopCapRefuses(t *testing.T) {
 	}
 }
 
-func TestThreadCapCountsWithinAThread(t *testing.T) {
+// A name is what an agent can say out loud, so posting into a thread does not
+// require having first read the message that opened it.
+func TestPostingByThreadNameJoinsTheSameThread(t *testing.T) {
 	s := open(t)
 	register(t, s, "a", "claude", "", "")
 	register(t, s, "b", "codex", "", "")
 	ch := channelWith(t, s, "team", "a", "b")
-	caps := DefaultCaps()
-	caps.MaxThreadMsgs = 2
 
-	first := send(t, s, ch, "a", "one")
-	if _, err := s.Send(Post{ChannelID: ch.ID, From: "b", Body: "two", ThreadID: first.ThreadID}, caps); err != nil {
-		t.Fatalf("the second message is within the cap: %v", err)
+	first, err := s.Send(Post{ChannelID: ch.ID, From: "a", Body: "one", Thread: "auth-bug"}, DefaultCaps())
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, err := s.Send(Post{ChannelID: ch.ID, From: "a", Body: "three", ThreadID: first.ThreadID}, caps); err == nil {
-		t.Fatal("the third should be refused")
+	second, err := s.Send(Post{ChannelID: ch.ID, From: "b", Body: "two", Thread: "auth-bug"}, DefaultCaps())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.ThreadID != second.ThreadID {
+		t.Fatalf("same name should be the same thread, got %d and %d", first.ThreadID, second.ThreadID)
+	}
+	if second.ThreadName != "auth-bug" {
+		t.Fatalf("thread name should survive the round trip, got %q", second.ThreadName)
 	}
 }
 
-// Every message belongs to exactly one thread, so the cap always has something
-// to count and a reply never starts a second conversation.
-func TestATopLevelPostThreadsOnItself(t *testing.T) {
+// The same name in two channels is two conversations. A thread is scoped to the
+// channel it lives in, so "auth-bug" in #team and in #ops never merge.
+func TestTheSameThreadNameInTwoChannelsIsTwoThreads(t *testing.T) {
+	s := open(t)
+	register(t, s, "a", "claude", "", "")
+	register(t, s, "b", "codex", "", "")
+	team := channelWith(t, s, "team", "a", "b")
+	ops := channelWith(t, s, "ops", "a", "b")
+
+	one, err := s.Send(Post{ChannelID: team.ID, From: "a", Body: "x", Thread: "auth-bug"}, DefaultCaps())
+	if err != nil {
+		t.Fatal(err)
+	}
+	two, err := s.Send(Post{ChannelID: ops.ID, From: "a", Body: "y", Thread: "auth-bug"}, DefaultCaps())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if one.ThreadID == two.ThreadID {
+		t.Fatalf("threads should not cross channels, both are %d", one.ThreadID)
+	}
+}
+
+// Every message belongs to exactly one thread, so a reply never starts a second
+// conversation and history always has something to group by.
+func TestATopLevelPostOpensItsOwnThread(t *testing.T) {
 	s := open(t)
 	register(t, s, "a", "claude", "", "")
 	register(t, s, "b", "codex", "", "")
 	ch := channelWith(t, s, "team", "a", "b")
 	m := send(t, s, ch, "a", "hello")
-	if m.ThreadID != m.ID {
-		t.Fatalf("thread should be the message itself, got %d want %d", m.ThreadID, m.ID)
+	if m.ThreadID == 0 || m.ThreadName == "" {
+		t.Fatalf("message should carry a thread, got id %d name %q", m.ThreadID, m.ThreadName)
+	}
+	n := send(t, s, ch, "a", "unrelated")
+	if n.ThreadID == m.ThreadID {
+		t.Fatalf("two unnamed posts should not share a thread, both are %d", m.ThreadID)
 	}
 }
 

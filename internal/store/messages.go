@@ -4,27 +4,51 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"time"
 )
+
+// Replaced by tests that need a fixed clock. The row's created_at is written
+// explicitly rather than left to the column default because it is one of the
+// fields the uid hashes, and the two have to agree.
+var nowFn = func() int64 { return time.Now().Unix() }
+
+// Every read of a message goes through the same projection, so a column added
+// here reaches Pending, Claim and History at once rather than two of the three.
+const messageColumns = `
+		SELECT m.id, COALESCE(m.uid, ''), m.channel_id, c.name, m.thread_id, t.name,
+		       m.from_session, COALESCE(a.alias, substr(m.from_session, 1, 8)),
+		       m.body, m.hops, m.expect_reply, COALESCE(m.reply_to_id, 0), m.created_at
+		  FROM messages m
+		  JOIN channels c ON c.id = m.channel_id
+		  JOIN threads  t ON t.id = m.thread_id
+		  LEFT JOIN agents a ON a.session_id = m.from_session`
 
 // Caps are the brakes on a runaway conversation. They are enforced here, in the
 // one place every client has to go through, so no harness and no transport can
 // skip them.
+//
+// There is deliberately no per-thread message cap. It counted human posts as
+// well as automated ones, so it punished exactly the long-lived topic whose
+// accumulated decisions are the most valuable thing the mailbox holds. MaxHops
+// bounds a reply chain and the caller's continuation budget bounds forced turns;
+// both count automated exchanges, which is the thing that runs away.
 type Caps struct {
 	Enabled       bool
 	MaxHops       int
-	MaxThreadMsgs int
 	MaxRecipients int
 }
 
 func DefaultCaps() Caps {
-	return Caps{Enabled: true, MaxHops: 4, MaxThreadMsgs: 12, MaxRecipients: 8}
+	return Caps{Enabled: true, MaxHops: 4, MaxRecipients: 8}
 }
 
 type Message struct {
 	ID          int64
+	UID         string
 	ChannelID   int64
 	ChannelName string
 	ThreadID    int64
+	ThreadName  string
 	From        string
 	FromName    string
 	Body        string
@@ -41,7 +65,10 @@ type Post struct {
 	Hops        int
 	ExpectReply bool
 	ReplyToID   int64
-	ThreadID    int64
+	// Thread names the thread within the channel. Empty opens a new one. A name
+	// can be chosen before the thread exists, which is what lets one agent tell
+	// another where to put its findings.
+	Thread string
 }
 
 // Send posts a message to a channel. The sender must be allowed to read the
@@ -81,25 +108,52 @@ func (s *Store) Send(p Post, caps Caps) (Message, error) {
 
 	var msg Message
 	err = s.tx(func(tx *sql.Tx) error {
-		if p.ThreadID != 0 {
-			var count int
-			if err := tx.QueryRow(
-				`SELECT COALESCE(msg_count, 0) FROM threads WHERE thread_id = ?`,
-				p.ThreadID).Scan(&count); err != nil && !errors.Is(err, sql.ErrNoRows) {
-				return err
-			}
-			if count >= caps.MaxThreadMsgs {
-				return fmt.Errorf("thread %d is at its message limit (%d)",
-					p.ThreadID, caps.MaxThreadMsgs)
-			}
+		var channelName string
+		if err := tx.QueryRow(`SELECT name FROM channels WHERE id = ?`, p.ChannelID).
+			Scan(&channelName); err != nil {
+			return err
 		}
 
+		threadName := p.Thread
+		if threadName == "" {
+			threadName = NewNonce()
+		}
+		if _, err := tx.Exec(`
+			INSERT INTO threads (channel_id, name, opener_session)
+			VALUES (?, ?, ?)
+			ON CONFLICT(channel_id, name) DO NOTHING`,
+			p.ChannelID, threadName, p.From); err != nil {
+			return err
+		}
+		var threadID int64
+		if err := tx.QueryRow(
+			`SELECT id FROM threads WHERE channel_id = ? AND name = ?`,
+			p.ChannelID, threadName).Scan(&threadID); err != nil {
+			return err
+		}
+
+		// The parent's uid, not its row id: a reply has to keep pointing at the
+		// same message once either row leaves this database.
+		var replyToUID string
+		if p.ReplyToID != 0 {
+			var u sql.NullString
+			if err := tx.QueryRow(`SELECT uid FROM messages WHERE id = ?`, p.ReplyToID).
+				Scan(&u); err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return err
+			}
+			replyToUID = u.String
+		}
+
+		nonce := NewNonce()
+		createdAt := nowFn()
+		uid := MessageUID(nonce, channelName, threadName, p.From, p.Body, createdAt, replyToUID)
+
 		res, err := tx.Exec(`
-			INSERT INTO messages (channel_id, thread_id, from_session, body, hops,
-			                      expect_reply, reply_to_id)
-			VALUES (?, ?, ?, ?, ?, ?, ?)`,
-			p.ChannelID, nullInt(p.ThreadID), p.From, p.Body, p.Hops,
-			boolInt(p.ExpectReply), nullInt(p.ReplyToID))
+			INSERT INTO messages (uid, nonce, channel_id, thread_id, from_session, body,
+			                      hops, expect_reply, reply_to_id, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			uid, nonce, p.ChannelID, threadID, p.From, p.Body, p.Hops,
+			boolInt(p.ExpectReply), nullInt(p.ReplyToID), createdAt)
 		if err != nil {
 			return err
 		}
@@ -108,25 +162,10 @@ func (s *Store) Send(p Post, caps Caps) (Message, error) {
 			return err
 		}
 
-		// A top-level post threads on itself, so every message belongs to exactly
-		// one thread and the cap has something to count.
-		thread := p.ThreadID
-		if thread == 0 {
-			thread = id
-			if _, err := tx.Exec(`UPDATE messages SET thread_id = ? WHERE id = ?`, id, id); err != nil {
-				return err
-			}
-		}
-		if _, err := tx.Exec(`
-			INSERT INTO threads (thread_id, channel_id, opener_session, msg_count)
-			VALUES (?, ?, ?, 1)
-			ON CONFLICT(thread_id) DO UPDATE SET msg_count = msg_count + 1`,
-			thread, p.ChannelID, p.From); err != nil {
-			return err
-		}
-
-		msg = Message{ID: id, ChannelID: p.ChannelID, ThreadID: thread, From: p.From,
-			Body: p.Body, Hops: p.Hops, ExpectReply: p.ExpectReply, ReplyToID: p.ReplyToID}
+		msg = Message{ID: id, UID: uid, ChannelID: p.ChannelID, ChannelName: channelName,
+			ThreadID: threadID, ThreadName: threadName, From: p.From, Body: p.Body,
+			Hops: p.Hops, ExpectReply: p.ExpectReply, ReplyToID: p.ReplyToID,
+			CreatedAt: createdAt}
 		// Sending is activity: the roster's liveness column has to move even for
 		// an agent that only talks and never turns.
 		if _, err := tx.Exec(
@@ -145,14 +184,8 @@ func (s *Store) Pending(sessionID string) ([]Message, error) {
 }
 
 func (s *Store) pendingQuery(sessionID string, limit int) ([]Message, error) {
-	q := `
-		SELECT m.id, m.channel_id, c.name, m.thread_id, m.from_session,
-		       COALESCE(a.alias, substr(m.from_session, 1, 8)), m.body, m.hops,
-		       m.expect_reply, COALESCE(m.reply_to_id, 0), m.created_at
-		  FROM messages m
-		  JOIN channels c ON c.id = m.channel_id
+	q := messageColumns + `
 		  JOIN channel_members cm ON cm.channel_id = m.channel_id AND cm.session_id = ?
-		  LEFT JOIN agents a ON a.session_id = m.from_session
 		 WHERE m.from_session <> ?
 		   AND NOT EXISTS (SELECT 1 FROM deliveries d
 		                    WHERE d.message_id = m.id AND d.session_id = ?)
@@ -187,14 +220,8 @@ func (s *Store) Claim(sessionID, via string) ([]Message, error) {
 	}
 	var out []Message
 	err := s.tx(func(tx *sql.Tx) error {
-		rows, err := tx.Query(`
-			SELECT m.id, m.channel_id, c.name, m.thread_id, m.from_session,
-			       COALESCE(a.alias, substr(m.from_session, 1, 8)), m.body, m.hops,
-			       m.expect_reply, COALESCE(m.reply_to_id, 0), m.created_at
-			  FROM messages m
-			  JOIN channels c ON c.id = m.channel_id
+		rows, err := tx.Query(messageColumns+`
 			  JOIN channel_members cm ON cm.channel_id = m.channel_id AND cm.session_id = ?
-			  LEFT JOIN agents a ON a.session_id = m.from_session
 			 WHERE m.from_session <> ?
 			   AND NOT EXISTS (SELECT 1 FROM deliveries d
 			                    WHERE d.message_id = m.id AND d.session_id = ?)
@@ -240,13 +267,7 @@ func (s *Store) History(channelID int64, viewer string, limit int) ([]Message, e
 	if limit <= 0 {
 		limit = 200
 	}
-	rows, err := s.db.Query(`
-		SELECT m.id, m.channel_id, c.name, m.thread_id, m.from_session,
-		       COALESCE(a.alias, substr(m.from_session, 1, 8)), m.body, m.hops,
-		       m.expect_reply, COALESCE(m.reply_to_id, 0), m.created_at
-		  FROM messages m
-		  JOIN channels c ON c.id = m.channel_id
-		  LEFT JOIN agents a ON a.session_id = m.from_session
+	rows, err := s.db.Query(messageColumns+`
 		 WHERE m.channel_id = ?
 		 ORDER BY m.id DESC LIMIT ?`, channelID, limit)
 	if err != nil {
@@ -360,12 +381,11 @@ func scanMessages(rows *sql.Rows) ([]Message, error) {
 	var out []Message
 	for rows.Next() {
 		var m Message
-		var thread sql.NullInt64
-		if err := rows.Scan(&m.ID, &m.ChannelID, &m.ChannelName, &thread, &m.From,
-			&m.FromName, &m.Body, &m.Hops, &m.ExpectReply, &m.ReplyToID, &m.CreatedAt); err != nil {
+		if err := rows.Scan(&m.ID, &m.UID, &m.ChannelID, &m.ChannelName, &m.ThreadID,
+			&m.ThreadName, &m.From, &m.FromName, &m.Body, &m.Hops, &m.ExpectReply,
+			&m.ReplyToID, &m.CreatedAt); err != nil {
 			return nil, err
 		}
-		m.ThreadID = thread.Int64
 		out = append(out, m)
 	}
 	return out, rows.Err()

@@ -74,13 +74,22 @@ EOF
     assert_eq "$(count_messages)" "0"
 }
 
-@test "a CLI send obeys the configured thread cap" {
-    plant_config "MAX_THREAD_MSGS='1'"
-    "$MESH_BIN" send --from A --to human --thread t-cap --message one >/dev/null
-    run "$MESH_BIN" send --from A --to human --thread t-cap --message two
+@test "a CLI send obeys the configured fan-out cap on a channel" {
+    cmd_register --session B --harness claude --cwd /tmp >/dev/null
+    cmd_register --session C --harness claude --cwd /tmp >/dev/null
+    msql "INSERT INTO channels (name, kind, visibility, created_by)
+               VALUES ('team', 'channel', 'public', 'A');
+          INSERT INTO channel_members (channel_id, session_id)
+               SELECT id, 'A' FROM channels WHERE name='team';
+          INSERT INTO channel_members (channel_id, session_id)
+               SELECT id, 'B' FROM channels WHERE name='team';
+          INSERT INTO channel_members (channel_id, session_id)
+               SELECT id, 'C' FROM channels WHERE name='team';"
+    plant_config "MAX_BROADCAST='1'"
+    run "$MESH_BIN" send --from A --channel team --message x
     assert_fail
-    assert_contains "$output" "message limit"
-    assert_eq "$(count_messages)" "1"
+    assert_contains "$output" "max-broadcast"
+    assert_eq "$(count_messages)" "0"
 }
 
 @test "a CLI broadcast obeys the configured fan-out cap" {

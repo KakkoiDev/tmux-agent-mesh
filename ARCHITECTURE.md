@@ -134,16 +134,15 @@ Established by running a real agent, not from documentation:
 
 ## Loop safety
 
-Five independent brakes, all enforced in `send`/`drain`/`pi-deliver` so no
+Four independent brakes, all enforced in `send`/`drain`/`pi-deliver` so no
 harness can bypass them:
 
 | Control | Option | Default | Stops |
 |---|---|---|---|
 | Kill switch | `@agent-mesh-enabled` | `on` | everything |
 | Hops per thread | `@agent-mesh-max-hops` | `4` | reply ping-pong |
-| Messages per thread | `@agent-mesh-max-thread-msgs` | `12` | a long-running conversation (**wrong brake, see below**) |
 | Consecutive auto-continuations | `@agent-mesh-max-blocks` | `3` | unattended token burn |
-| Broadcast fan-out | `@agent-mesh-max-broadcast` | `8` | waking every pane at once |
+| Fan-out | `@agent-mesh-max-broadcast` | `8` | waking every pane at once; also caps `send --channel` |
 
 Refusals are non-zero with a one-line reason on stderr, so the calling agent can
 read why rather than retrying. An oversized broadcast sends to **nobody** rather
@@ -154,25 +153,25 @@ drop the mail. It waits for the next human prompt, where `next-prompt` or
 `before-start` delivery ignores the cap. That is safe because those paths fire
 on a turn that is already happening.
 
-### `max-thread-msgs` is the wrong brake and is being removed
+### `max-thread-msgs` was the wrong brake and is gone
 
-Two different things ended up in one field.
+Two different things had ended up in one field.
 
 A **bounded exchange** must stop: two agents replying to each other forever is the
-runaway this cap was written for. A **topic** must not: a channel that accumulates
+runaway that cap was written for. A **topic** must not: a thread that accumulates
 what was discussed and decided is durable context that any agent joining later can
 read, which is the most valuable thing the mailbox holds. Capping a topic at 12
-messages destroys it to solve a problem the topic does not have.
+messages destroyed it to solve a problem the topic does not have.
 
-The other two brakes already cover the real case. `max-hops` bounds a reply chain,
-and `max-blocks` bounds consecutive mesh-forced turns. Both count *automated*
+The remaining brakes cover the real case. `max-hops` bounds a reply chain, and
+`max-blocks` bounds consecutive mesh-forced turns. Both count *automated*
 exchanges, which is the thing that runs away. A message count over a topic's
-lifetime counts human participation too, so it punishes exactly the conversations
-worth keeping.
+lifetime counted human participation too, so it punished exactly the
+conversations worth keeping.
 
-The replacement, if any is needed at all: count consecutive messages with no human
-and no client participation in the thread, and reset that counter whenever a person
-posts or reads. Until then the cap is a known wart, not a design.
+If a replacement is ever needed: count consecutive messages with no human and no
+client participation in the thread, and reset that counter whenever a person
+posts or reads. Nothing has needed it so far.
 
 ### There is no spend ceiling
 

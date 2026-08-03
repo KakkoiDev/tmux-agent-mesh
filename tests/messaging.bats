@@ -30,16 +30,30 @@ teardown() {
     assert_contains "$output" "queued message 1"
 }
 
-@test "send opens a thread and counts the message" {
+@test "send opens a thread and puts the message in it" {
     cmd_send --from A --to bravo --message "hello"
-    assert_eq "$(msql "SELECT msg_count FROM threads;")" "1"
+    assert_eq "$(msql "SELECT COUNT(*) FROM threads;")" "1"
+    assert_eq "$(msql "SELECT COUNT(*) FROM messages m
+                         JOIN threads t ON t.id=m.thread_id;")" "1"
 }
 
 @test "send reuses an explicit thread id" {
     cmd_send --from A --to bravo --message "one" --thread t-fixed
     cmd_send --from A --to bravo --message "two" --thread t-fixed
     assert_eq "$(msql "SELECT COUNT(*) FROM threads;")" "1"
-    assert_eq "$(msql "SELECT msg_count FROM threads WHERE thread_id='t-fixed';")" "2"
+    assert_eq "$(msql "SELECT COUNT(*) FROM messages m
+                         JOIN threads t ON t.id=m.thread_id
+                        WHERE t.name='t-fixed';")" "2"
+}
+
+# A thread name is scoped to its channel, so two agents independently picking
+# 'review' get one conversation each instead of silently merging.
+@test "the same thread name in two channels is two threads" {
+    cmd_register --session C --harness claude --cwd /tmp/c >/dev/null
+    cmd_send --from A --to bravo  --message "one" --thread review
+    cmd_send --from A --to C      --message "two" --thread review
+    assert_eq "$(msql "SELECT COUNT(*) FROM threads WHERE name='review';")" "2"
+    assert_eq "$(msql "SELECT COUNT(DISTINCT thread_id) FROM messages;")" "2"
 }
 
 @test "send touches the recipient notify flag" {
@@ -129,14 +143,17 @@ teardown() {
     assert_eq "$(count_messages)" "1"
 }
 
-@test "send refuses once a thread hits its message limit" {
-    MAX_THREAD_MSGS=2
-    cmd_send --from A --to bravo --message "1" --thread t-cap
-    cmd_send --from A --to bravo --message "2" --thread t-cap
-    run cmd_send --from A --to bravo --message "3" --thread t-cap
-    assert_fail
-    assert_contains "$output" "message limit"
-    assert_eq "$(count_messages)" "2"
+# There is deliberately no per-thread message cap any more. It counted human
+# posts as well as automated ones, so it punished exactly the long-lived topic
+# whose accumulated decisions are the most valuable thing the mailbox holds.
+# The hop cap and the continuation budget are the brakes, and both count only
+# automated exchanges.
+@test "a long-running thread is not capped" {
+    local i
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+        cmd_send --from A --to bravo --message "msg $i" --thread t-long
+    done
+    assert_eq "$(count_messages)" "15"
 }
 
 # --hops and --reply-to are interpolated straight into the INSERT. A payload
@@ -172,11 +189,15 @@ teardown() {
 
 # ── broadcast ────────────────────────────────────────────────────────
 
+# One row per recipient, because a broadcast is a fan-out of direct messages and
+# a reply to one goes back to the sender alone. The shared thread is what ties
+# them together; it is a name now, one thread row per recipient's channel.
 @test "broadcast fans out one row per recipient on a shared thread" {
     cmd_register --session C --harness pi --cwd /tmp/c >/dev/null
     cmd_broadcast --from A --message "status?"
     assert_eq "$(count_messages)" "2"
-    assert_eq "$(msql "SELECT COUNT(DISTINCT thread_id) FROM messages;")" "1"
+    assert_eq "$(msql "SELECT COUNT(DISTINCT t.name) FROM messages m
+                         JOIN threads t ON t.id=m.thread_id;")" "1"
 }
 
 @test "broadcast excludes the sender" {
@@ -240,8 +261,9 @@ teardown() {
 @test "reply routes back to the original sender on the same thread" {
     cmd_send --from A --to bravo --message "question"
     cmd_reply --from B --to-message 1 --message "answer"
-    assert_eq "$(msql "SELECT to_session FROM messages WHERE id=2;")" "A"
+    assert_eq "$(pending_for A)" "1"
     assert_eq "$(msql "SELECT COUNT(DISTINCT thread_id) FROM messages;")" "1"
+    assert_eq "$(msql "SELECT COUNT(DISTINCT channel_id) FROM messages;")" "1"
 }
 
 @test "reply increments the hop count" {
@@ -256,14 +278,34 @@ teardown() {
     assert_eq "$(msql "SELECT reply_to_id FROM messages WHERE id=2;")" "1"
 }
 
-# Replying to mail addressed to somebody else would forge a thread.
-@test "reply refuses when the message was addressed to another agent" {
+# Replying into a channel you are not in would forge a conversation. A message
+# has several recipients now, so the check is membership rather than "was it
+# addressed to you".
+@test "reply refuses when the message is in a channel the replier is not in" {
     cmd_register --session C --harness claude --cwd /tmp/c >/dev/null
     cmd_send --from A --to bravo --message "for bravo"
     run cmd_reply --from C --to-message 1 --message "not mine"
     assert_fail
-    assert_contains "$output" "not to you"
+    assert_contains "$output" "not in a channel"
     assert_eq "$(count_messages)" "1"
+}
+
+# The other side of the same rule: any member of the channel may answer, not
+# only the one name on the envelope.
+@test "reply is allowed by any member of the channel" {
+    cmd_register --session C --harness claude --cwd /tmp/c >/dev/null
+    msql "INSERT INTO channels (name, kind, visibility, created_by)
+               VALUES ('team', 'channel', 'public', 'A');
+          INSERT INTO channel_members (channel_id, session_id)
+               SELECT id, 'A' FROM channels WHERE name='team';
+          INSERT INTO channel_members (channel_id, session_id)
+               SELECT id, 'B' FROM channels WHERE name='team';
+          INSERT INTO channel_members (channel_id, session_id)
+               SELECT id, 'C' FROM channels WHERE name='team';"
+    cmd_send --from A --channel team --message "who is on this"
+    run cmd_reply --from C --to-message 1 --message "me"
+    assert_ok
+    assert_eq "$(count_messages)" "2"
 }
 
 @test "reply fails on an unknown message id" {
@@ -379,8 +421,9 @@ teardown() {
 @test "drain records --via verbatim and stamps delivered_at" {
     cmd_send --from A --to bravo --message "x"
     cmd_drain --session B --via stop-block >/dev/null
-    assert_eq "$(msql "SELECT delivered_via FROM messages WHERE id=1;")" "stop-block"
-    assert_eq "$(msql "SELECT delivered_at IS NOT NULL FROM messages WHERE id=1;")" "1"
+    assert_eq "$(msql "SELECT delivered_via FROM deliveries WHERE message_id=1;")" "stop-block"
+    assert_eq "$(msql "SELECT COUNT(*) FROM deliveries WHERE message_id=1 AND session_id='B';")" "1"
+    assert_eq "$(msql "SELECT COUNT(*) FROM reads WHERE message_id=1 AND source='drain';")" "1"
 }
 
 @test "drain is at-most-once" {
@@ -403,19 +446,19 @@ teardown() {
 @test "delivered_via names the harness and the mechanism" {
     cmd_send --from A --to bravo --message "x" >/dev/null
     _hook_turn_end claude B '{}' >/dev/null
-    assert_eq "$(msql "SELECT delivered_via FROM messages WHERE id=1;")" "claude:turn-end"
+    assert_eq "$(msql "SELECT delivered_via FROM deliveries WHERE message_id=1;")" "claude:turn-end"
 }
 
 @test "delivered_via distinguishes gemini from claude" {
     cmd_send --from A --to bravo --message "x" >/dev/null
     _hook_turn_end gemini B '{}' >/dev/null
-    assert_eq "$(msql "SELECT delivered_via FROM messages WHERE id=1;")" "gemini:turn-end"
+    assert_eq "$(msql "SELECT delivered_via FROM deliveries WHERE message_id=1;")" "gemini:turn-end"
 }
 
 @test "delivered_via distinguishes the prompt path from the turn-end path" {
     cmd_send --from A --to bravo --message "x" >/dev/null
     _hook_prompt codex B >/dev/null
-    assert_eq "$(msql "SELECT delivered_via FROM messages WHERE id=1;")" "codex:prompt"
+    assert_eq "$(msql "SELECT delivered_via FROM deliveries WHERE message_id=1;")" "codex:prompt"
 }
 
 @test "drain emits nothing when the mesh is disabled" {
@@ -571,7 +614,7 @@ teardown() {
     cmd_send --from A --to bravo --message "queued earlier"
     run _hook_prompt claude B
     echo "$output" | jq -e '.hookSpecificOutput.additionalContext | contains("queued earlier")'
-    assert_eq "$(msql "SELECT delivered_via FROM messages WHERE id=1;")" "claude:prompt"
+    assert_eq "$(msql "SELECT delivered_via FROM deliveries WHERE message_id=1;")" "claude:prompt"
 }
 
 @test "prompt hook resets the block streak" {
