@@ -135,6 +135,47 @@ json_field() { printf '%s' "$1" | jq -r "$2"; }
     assert_eq "$(json_field "$output" '.transcript_path')" "/tmp/a.jsonl"
 }
 
+# ── the read commands name their columns ─────────────────────────────
+#
+# sqlite names an unaliased expression after the expression text, so `history`
+# and `search` came back with the whole `CASE WHEN c.kind='dm' ...` as a key,
+# and `search` selected t.name and c.name into one "name". An agent cannot
+# address a key it would have to rebuild the SQL to spell.
+
+@test "history --json names every column" {
+    "$MESH_BIN" send --from A --to bravo --message hi --thread t1 >/dev/null
+    run "$MESH_BIN" history --as bravo --json
+    assert_ok
+    assert_eq "$(json_field "$output" '.[0] | keys | join(",")')" \
+        "body,created_at,delivered_at,delivered_via,from_name,hops,id,thread_id,to_name"
+}
+
+@test "search --json names every column and keeps the channel separate" {
+    "$MESH_BIN" channel create ops >/dev/null
+    "$MESH_BIN" channel join ops --as bravo >/dev/null
+    "$MESH_BIN" channel join ops --as alpha >/dev/null
+    "$MESH_BIN" send --from B --channel ops --message needle --thread t1 >/dev/null
+    run "$MESH_BIN" search needle --json
+    assert_ok
+    assert_eq "$(json_field "$output" '.[0] | keys | join(",")')" \
+        "body,channel,created_at,from_name,id,thread_id,to_name"
+    assert_eq "$(json_field "$output" '.[0].channel')" "ops"
+    assert_eq "$(json_field "$output" '.[0].thread_id')" "t1"
+}
+
+@test "--json keeps a multi-line body whole while the text output folds it" {
+    "$MESH_BIN" send --from A --to bravo --thread t1 --message "one
+two" >/dev/null
+    run "$MESH_BIN" thread t1 --json
+    assert_ok
+    assert_eq "$(json_field "$output" '.[0].body')" "one
+two"
+    run "$MESH_BIN" history --as bravo --json
+    assert_ok
+    assert_eq "$(json_field "$output" '.[0].body')" "one
+two"
+}
+
 # ── the exit-code table ──────────────────────────────────────────────
 
 @test "exit 1: an unknown flag is a usage error" {

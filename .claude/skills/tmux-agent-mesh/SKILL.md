@@ -51,7 +51,13 @@ Every result carries `"ok": true`; every error is `{"ok":false,"error":"...","co
 `broadcast` returns `recipients`; `mark-read` returns `count`; `channel create`,
 `join`, `leave` and `dm` return `channel_id` and `channel`. The read commands
 (`inbox`, `history`, `thread`, `search`, `roster`, `channel list`, `channel
-members`) return an array of rows.
+members`) return an array of rows. A message row carries `id`, `body`,
+`created_at`, `from_name` and `thread_id`; `history`, `thread` and `search` add
+`to_name`, and `search` adds `channel`.
+
+Read a multi-line body through `--json`. The text output folds it for display,
+lining continuation lines up under the header; only the JSON carries it byte for
+byte.
 
 `--json` is accepted everywhere except `watch`, `menu`, `goto`, `status-bar`,
 `doctor`, `selftest`, `completion`, `hook` and `pi-deliver`.

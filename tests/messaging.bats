@@ -329,6 +329,50 @@ teardown() {
     assert_eq "$(msql "SELECT MAX(hops) FROM messages;")" "2"
 }
 
+# ── multi-line and piped bodies ──────────────────────────────────────
+#
+# sqlite3 in list mode ends every row with a newline, so a body containing one
+# read back as several malformed rows: `thread` printed "#second line" as a
+# message of its own, with empty columns. A `|` in the body stole the column
+# after it the same way. An agent pasting a diff or a stack trace hits both.
+
+@test "thread prints a multi-line body under one header" {
+    cmd_send --from A --to bravo --thread t --message "first
+second | piped
+third"
+    run cmd_thread t
+    assert_contains "$output" "      first"
+    assert_contains "$output" "      second | piped"
+    assert_contains "$output" "      third"
+    refute_contains "$output" "#second"
+}
+
+@test "history prints a multi-line body under one header" {
+    cmd_send --from A --to bravo --message "first
+second | piped"
+    run cmd_history --as bravo
+    assert_contains "$output" "      first"
+    assert_contains "$output" "      second | piped"
+    refute_contains "$output" "#second"
+}
+
+@test "inbox prints a multi-line body under one header" {
+    cmd_send --from A --to bravo --message "first
+second | piped"
+    run cmd_inbox --as bravo
+    assert_contains "$output" "      first"
+    assert_contains "$output" "      second | piped"
+    refute_contains "$output" "#second"
+}
+
+@test "search folds a multi-line hit onto its one line" {
+    cmd_send --from A --to bravo --message "alpha
+beta | gamma"
+    run cmd_search alpha
+    assert_contains "$output" "alpha beta | gamma"
+    refute_contains "$output" "#beta"
+}
+
 # ── inbox ────────────────────────────────────────────────────────────
 
 @test "inbox lists pending mail for a ref" {

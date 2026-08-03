@@ -1107,6 +1107,24 @@ _TO_NAME_SQL="CASE WHEN c.kind='dm' THEN COALESCE((
             '#' || c.name)
         ELSE '#' || c.name END"
 
+# A body holds whatever an agent wrote, including newlines and pipes, and
+# sqlite3 in list mode ends every row with a newline. Read back with
+# `IFS='|' read`, a three-line message became three malformed rows and a body
+# containing a pipe stole the column after it. So the text render paths select
+# the body folded onto one line and split columns on the unit separator: two
+# bytes an agent does not type, unlike `|`.
+#
+# `drain` and every `--json` path go through sqlite's own JSON writer and never
+# had this.
+_BODY_SQL="replace(m.body, char(10), char(30))"
+_COL=$'\037'
+
+# Print a folded body, lining continuation lines up under the first.
+_print_body() {
+    local pad="$1"
+    printf '%s%s\n' "$pad" "${2//$'\036'/$'\n'$pad}"
+}
+
 _pending_count() {
     local esid
     esid=$(sql_esc "$1")
@@ -1360,11 +1378,13 @@ EOF
 # somebody else, with no delivery row. thread_id keeps its name in the output
 # because it is what an agent quotes back to `recv --thread`; it now carries the
 # thread's name rather than a bare tag column.
+# $3 is how the body is selected: verbatim for the JSON writer, folded onto one
+# line for the text renderer, which reads a row per line.
 _inbox_query() {
     local esid
     esid=$(sql_esc "$1")
     printf "SELECT m.id, t.name AS thread_id, COALESCE(a.alias, m.from_session) AS from_name,
-                   m.hops, m.created_at, m.body
+                   m.hops, m.created_at, ${3:-m.body} AS body
               FROM messages m
               JOIN threads t ON t.id=m.thread_id
               JOIN channel_members cm ON cm.channel_id=m.channel_id AND cm.session_id='%s'
@@ -1378,12 +1398,12 @@ _inbox_query() {
 
 _print_inbox() {
     local id thread fname hops created body
-    while IFS='|' read -r id thread fname hops created body; do
+    while IFS="$_COL" read -r id thread fname hops created body; do
         [[ -z "$id" ]] && continue
         printf '#%-5s from %-12s thread %-18s hop %s\n' "$id" "$fname" "$thread" "$hops"
-        printf '      %s\n' "$body"
+        _print_body '      ' "$body"
     done <<EOF
-$(sql_sep '|' "$(_inbox_query "$1" "${2:-0}");")
+$(sql_sep "$_COL" "$(_inbox_query "$1" "${2:-0}" "$_BODY_SQL");")
 EOF
 }
 
@@ -2010,16 +2030,17 @@ cmd_watch() {
     local seen id fname tname body created
     seen=$(sql "SELECT COALESCE(MAX(id),0) FROM messages;")
     while true; do
-        while IFS='|' read -r id created fname tname body; do
+        while IFS="$_COL" read -r id created fname tname body; do
             [[ -z "$id" ]] && continue
+            # One line per message: watch is a ticker, not a reader.
             printf '%s  %-12s -> %-12s  %s\n' \
                 "$(_fmt_time "$created" 2>/dev/null || printf '%8s' '')" \
-                "$fname" "$tname" "$body"
+                "$fname" "$tname" "${body//$'\036'/ }"
             seen="$id"
         done <<EOF
-$(sql_sep '|' "SELECT m.id, m.created_at,
+$(sql_sep "$_COL" "SELECT m.id, m.created_at,
         COALESCE(af.alias, substr(m.from_session,1,8)),
-        $_TO_NAME_SQL, m.body
+        $_TO_NAME_SQL, $_BODY_SQL
    FROM messages m
    JOIN channels c ON c.id=m.channel_id
    LEFT JOIN agents af ON af.session_id=m.from_session
@@ -2136,13 +2157,18 @@ cmd_history() {
     fi
     [[ -n "$since" ]] && where="$where AND m.created_at >= unixepoch('$(sql_esc "$since")')"
 
-    local q="SELECT m.id, t.name,
-                COALESCE(fa.alias, substr(m.from_session,1,8)),
-                $_TO_NAME_SQL,
-                m.hops, m.created_at, m.body,
-                (SELECT MIN(d.delivered_at) FROM deliveries d WHERE d.message_id=m.id),
+    local body_sql="m.body"
+    [[ "$MESH_JSON" -eq 1 ]] || body_sql="$_BODY_SQL"
+    # Every column aliased. sqlite names an unaliased expression after the
+    # expression itself, so --json came back with the whole CASE as a key, and
+    # t.name and c.name both landed on "name".
+    local q="SELECT m.id AS id, t.name AS thread_id,
+                COALESCE(fa.alias, substr(m.from_session,1,8)) AS from_name,
+                $_TO_NAME_SQL AS to_name,
+                m.hops AS hops, m.created_at AS created_at, $body_sql AS body,
+                (SELECT MIN(d.delivered_at) FROM deliveries d WHERE d.message_id=m.id) AS delivered_at,
                 (SELECT d.delivered_via FROM deliveries d
-                  WHERE d.message_id=m.id ORDER BY d.delivered_at, d.session_id LIMIT 1)
+                  WHERE d.message_id=m.id ORDER BY d.delivered_at, d.session_id LIMIT 1) AS delivered_via
          FROM messages m
          JOIN channels c ON c.id=m.channel_id
          JOIN threads  t ON t.id=m.thread_id
@@ -2158,21 +2184,21 @@ cmd_history() {
     fi
 
     local out
-    out=$(sql_sep '|' "$q;")
+    out=$(sql_sep "$_COL" "$q;")
     if [[ -z "$out" ]]; then
         printf 'no messages found\n'
         return 0
     fi
 
     local id tid fname tname hops created body delivered_at delivered_via
-    while IFS='|' read -r id tid fname tname hops created body delivered_at delivered_via; do
+    while IFS="$_COL" read -r id tid fname tname hops created body delivered_at delivered_via; do
         [[ -z "$id" ]] && continue
         local ago dir
         ago=$(_fmt_ago "$created")
         if [[ "$fname" == "$(_display_name "$sid")" ]]; then dir="→" ; else dir="←"; fi
         printf '#%-5s thread %-18s %s %-12s → %-12s  hop %s  %s\n' \
             "$id" "$tid" "$dir" "$fname" "$tname" "$hops" "$ago"
-        printf '      %s\n' "$body"
+        _print_body '      ' "$body"
         if [[ -n "$delivered_at" ]]; then
             printf '      `- read via %s %s\n' "$delivered_via" "$(_fmt_ago "$delivered_at")"
         fi
@@ -2252,10 +2278,12 @@ cmd_thread() {
     # By name, so an agent can quote back the thread it was told about. A name is
     # unique per channel, so the same name in two channels shows both, in id
     # order, which is the order they happened in.
+    local body_sql="m.body"
+    [[ "$MESH_JSON" -eq 1 ]] || body_sql="$_BODY_SQL"
     q="SELECT m.id,
                 COALESCE(a.alias, substr(m.from_session,1,8)) AS from_name,
                 $_TO_NAME_SQL AS to_name,
-                m.hops, m.created_at, m.body,
+                m.hops, m.created_at, $body_sql AS body,
                 (SELECT MIN(d.delivered_at) FROM deliveries d WHERE d.message_id=m.id) AS delivered_at,
                 (SELECT d.delivered_via FROM deliveries d
                   WHERE d.message_id=m.id ORDER BY d.delivered_at, d.session_id LIMIT 1) AS delivered_via,
@@ -2275,7 +2303,7 @@ cmd_thread() {
     fi
 
     local out
-    out=$(sql_sep '|' "$q;")
+    out=$(sql_sep "$_COL" "$q;")
     if [[ -z "$out" ]]; then
         printf 'thread %s: no messages found\n' "$tid"
         return 0
@@ -2283,14 +2311,14 @@ cmd_thread() {
 
     printf 'thread %s\n' "$tid"
     local id fname tname hops created body delivered_at delivered_via reply_to
-    while IFS='|' read -r id fname tname hops created body delivered_at delivered_via reply_to; do
+    while IFS="$_COL" read -r id fname tname hops created body delivered_at delivered_via reply_to; do
         [[ -z "$id" ]] && continue
         local indent=""
         local i
         for ((i=0; i<hops; i++)); do indent="  $indent"; done
         printf '%s#%-5s %-12s → %-12s  hop %s  %s\n' \
             "$indent" "$id" "$fname" "$tname" "$hops" "$(_fmt_ago "$created")"
-        printf '%s      %s\n' "$indent" "$body"
+        _print_body "$indent      " "$body"
         if [[ -n "$delivered_at" ]]; then
             printf '%s      `- read by %s %s\n' "$indent" "$tname" "$(_fmt_ago "$delivered_at")"
         fi
@@ -2708,12 +2736,14 @@ cmd_search() {
     fi
     [[ -n "$since" ]] && where="$where AND m.created_at >= unixepoch('$(sql_esc "$since")')"
 
-    local q="SELECT m.id, t.name,
-                COALESCE(fa.alias, substr(m.from_session,1,8)),
-                $_TO_NAME_SQL,
-                c.name,
-                m.created_at,
-                CASE WHEN length(m.body) > 120 THEN substr(m.body,1,120) || '...' ELSE m.body END
+    local snippet_sql="CASE WHEN length(m.body) > 120 THEN substr(m.body,1,120) || '...' ELSE m.body END"
+    [[ "$MESH_JSON" -eq 1 ]] || snippet_sql="replace($snippet_sql, char(10), char(30))"
+    local q="SELECT m.id AS id, t.name AS thread_id,
+                COALESCE(fa.alias, substr(m.from_session,1,8)) AS from_name,
+                $_TO_NAME_SQL AS to_name,
+                c.name AS channel,
+                m.created_at AS created_at,
+                $snippet_sql AS body
          FROM messages m
          JOIN channels c ON c.id=m.channel_id
          JOIN threads  t ON t.id=m.thread_id
@@ -2729,7 +2759,7 @@ cmd_search() {
     fi
 
     local out
-    out=$(sql_sep '|' "$q;")
+    out=$(sql_sep "$_COL" "$q;")
     if [[ -z "$out" ]]; then
         printf 'no messages match "%s"\n' "$query"
         return 0
@@ -2737,10 +2767,11 @@ cmd_search() {
 
     printf 'search: %s\n' "$query"
     local id tid fname tname created snippet
-    while IFS='|' read -r id tid fname tname _ created snippet; do
+    while IFS="$_COL" read -r id tid fname tname _ created snippet; do
         [[ -z "$id" ]] && continue
+        # A hit is one line, the way grep prints one.
         printf '#%-5s %-12s → %-12s  %s  %s\n' \
-            "$id" "$fname" "$tname" "$(_fmt_ago "$created")" "$snippet"
+            "$id" "$fname" "$tname" "$(_fmt_ago "$created")" "${snippet//$'\036'/ }"
     done <<EOF
 $out
 EOF
