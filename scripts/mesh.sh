@@ -121,7 +121,7 @@ _die() { _fail 1 "$*"; }
 # Keys carrying numbers rather than strings. Listed by key, not inferred from
 # the value: an alias or a thread name made only of digits would otherwise come
 # back unquoted and stop round-tripping through the command that reads it.
-_JSON_NUM_KEYS=" message_id channel_id count recipients hops "
+_JSON_NUM_KEYS=" message_id channel_id count recipients hops messages duplicates channels threads "
 
 # _result <human sentence> [key value]...
 _result() {
@@ -1095,11 +1095,16 @@ _PENDING_FOR_AGENT="(SELECT COUNT(*) FROM messages m
 # other member, so `send --to alice` still reads as "-> alice" and not as the
 # pair's channel name. Requires the enclosing query to alias messages `m` and
 # channels `c`.
-_TO_NAME_SQL="CASE WHEN c.kind='dm' THEN (
+#
+# The COALESCE is for an imported DM: `import` carries no memberships, so the
+# subquery finds nobody and the column came back empty, printing a message with
+# no recipient at all. Falling back to the channel name says what it is.
+_TO_NAME_SQL="CASE WHEN c.kind='dm' THEN COALESCE((
             SELECT COALESCE(a2.alias, substr(cm2.session_id,1,8))
               FROM channel_members cm2
               LEFT JOIN agents a2 ON a2.session_id=cm2.session_id
-             WHERE cm2.channel_id=c.id AND cm2.session_id<>m.from_session LIMIT 1)
+             WHERE cm2.channel_id=c.id AND cm2.session_id<>m.from_session LIMIT 1),
+            '#' || c.name)
         ELSE '#' || c.name END"
 
 _pending_count() {
@@ -2741,6 +2746,209 @@ $out
 EOF
 }
 
+# ── export / import ──────────────────────────────────────────────────
+#
+# The network layer, without a network. Content-addressed ids make syncing two
+# mailboxes a set union: `import` is INSERT OR IGNORE keyed on uid, so appending
+# the same record twice is a no-op and the order records arrive in does not
+# matter. ssh is the transport, and there is no process on either end.
+#
+#   tmux-agent-mesh export --since 2026-08-01 | ssh box 'tmux-agent-mesh import'
+#
+# What travels is the conversation: channels, threads and messages. What does
+# not travel is who is registered, who is a member, and what has been delivered
+# or read. Those are facts about one machine's sessions; carrying them would
+# mark mail as read for an agent that never saw it and put sessions that do not
+# exist here into channels. So imported mail is history, not routing: `thread`
+# and `search` read it, `inbox` and `drain` do not, because nothing on this
+# machine is a member of the channel it arrived in. Reaching an agent on another
+# box is still `send --remote`, which shells out to it.
+
+# sqlite's unixepoch() returns NULL for a bare integer and a NULL comparison
+# matches nothing, so a numeric --since would silently export an empty file.
+_since_epoch_sql() {
+    case "${1:-}" in
+        "")       printf '0' ;;
+        *[!0-9]*) printf "unixepoch('%s')" "$(sql_esc "$1")" ;;
+        *)        printf '%s' "$1" ;;
+    esac
+}
+
+cmd_export() {
+    local since="" channel=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --since)   since="${2:-}"; shift ;;
+            --channel) channel="${2:-}"; shift ;;
+            --json)    ;;  # already the only output shape this has
+            *) _die "export: unknown flag '$1'" ;;
+        esac
+        shift
+    done
+    _need_jq
+
+    local where
+    where="m.created_at >= $(_since_epoch_sql "$since")"
+    [[ -n "$channel" ]] && where="$where AND c.name='$(sql_esc "$channel")'"
+
+    jq -cn --argjson t "$(date +%s)" '{type:"meta",version:1,exported_at:$t}'
+
+    # Only the channels and threads the exported messages reference, so a
+    # narrowed export does not carry the names of the channels it left out.
+    sql_json "SELECT DISTINCT c.name, c.kind, c.visibility, c.topic,
+                     c.created_by, c.created_at
+                FROM channels c JOIN messages m ON m.channel_id=c.id
+               WHERE $where ORDER BY c.name;" \
+        | jq -c '.[] | {type:"channel"} + .'
+
+    sql_json "SELECT DISTINCT c.name AS channel, t.name, t.opener_session AS opener,
+                     t.created_at
+                FROM threads t
+                JOIN channels c ON c.id=t.channel_id
+                JOIN messages m ON m.thread_id=t.id
+               WHERE $where ORDER BY c.name, t.name;" \
+        | jq -c '.[] | {type:"thread"} + .'
+
+    # In id order, so a reply follows the message it answers and the parent uid
+    # already resolves on the far side. Not needed for correctness, since an
+    # unresolved parent lands as NULL, but it means one pass is enough.
+    sql_json "SELECT m.uid, m.nonce, c.name AS channel, t.name AS thread,
+                     m.from_session AS sender, m.body, m.hops, m.expect_reply,
+                     COALESCE(p.uid,'') AS reply_to, m.created_at
+                FROM messages m
+                JOIN channels c ON c.id=m.channel_id
+                JOIN threads  t ON t.id=m.thread_id
+                LEFT JOIN messages p ON p.id=m.reply_to_id
+               WHERE $where AND m.uid IS NOT NULL
+               ORDER BY m.id;" \
+        | jq -c '.[] | {type:"message"} + .'
+}
+
+# The uid preimage, exactly the fields _msg_uid hashes and in the same order,
+# joined by the same unit separator. Emitted as NUL-terminated pairs and read
+# back with `read -d ''` rather than by line, because a body contains newlines.
+_import_preimage_jq() {
+    cat <<'JQ'
+select(.type=="message")
+| .uid + "\u0000"
++ ([.nonce, .channel, .thread, .sender, .body,
+    (.created_at|tostring), .reply_to] | join("\u001f"))
++ "\u0000"
+JQ
+}
+
+# Every insert is OR IGNORE, which is what makes importing the same file twice a
+# no-op. A message carries its own channel and thread, so a truncated file still
+# lands somewhere readable; the export emits both ahead of it, so the guess at
+# kind and visibility only ever applies to a hand-edited one.
+_import_sql_jq() {
+    cat <<'JQ'
+def esc: tostring | gsub("'"; "''");
+def kind: if startswith("dm:") then "dm" else "channel" end;
+def vis:  if startswith("dm:") then "private" else "public" end;
+def ensure_channel($n):
+    "INSERT OR IGNORE INTO channels (name,kind,visibility) VALUES ('\($n|esc)','\($n|kind)','\($n|vis)');\n";
+def ensure_thread($c; $t; $o):
+    "INSERT OR IGNORE INTO threads (channel_id,name,opener_session) SELECT id,'\($t|esc)','\($o|esc)' FROM channels WHERE name='\($c|esc)';\n";
+if .type == "channel" then
+    "INSERT OR IGNORE INTO channels (name,kind,visibility,topic,created_by,created_at) VALUES ('\(.name|esc)','\(.kind|esc)','\(.visibility|esc)','\(.topic|esc)','\(.created_by|esc)',\(.created_at|tonumber));"
+elif .type == "thread" then
+    ensure_channel(.channel) + ensure_thread(.channel; .name; .opener)
+elif .type == "message" then
+    ensure_channel(.channel) + ensure_thread(.channel; .thread; .sender)
+    + "INSERT OR IGNORE INTO messages (uid,nonce,channel_id,thread_id,from_session,body,hops,expect_reply,reply_to_id,created_at) SELECT '\(.uid|esc)','\(.nonce|esc)',c.id,t.id,'\(.sender|esc)','\(.body|esc)',\(.hops|tonumber),\(.expect_reply|tonumber),(SELECT id FROM messages WHERE uid='\(.reply_to|esc)'),\(.created_at|tonumber) FROM channels c JOIN threads t ON t.channel_id=c.id AND t.name='\(.thread|esc)' WHERE c.name='\(.channel|esc)';"
+else empty end
+JQ
+}
+
+cmd_import() {
+    local file=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json) MESH_JSON=1 ;;
+            -)      ;;
+            *)
+                if [[ -z "$file" && "$1" != -* ]]; then file="$1"
+                else _die "import: unknown flag '$1'"; fi ;;
+        esac
+        shift
+    done
+    _need_jq
+    # `ssh box 'tmux-agent-mesh import'` on a box where nothing ran init would
+    # otherwise fail at the temp file, which reads as a disk problem.
+    [[ -f "$DB" ]] || _fail 3 "import: no mailbox at $DB (run: tmux-agent-mesh init)"
+    _ensure_schema
+
+    # Read once into a file. stdin is the normal transport and it cannot be
+    # rewound for the version check, the content-address pass and the SQL pass.
+    # Next to the database rather than in $TMPDIR: same filesystem, and every
+    # path this tool reads from the environment is MESH_ prefixed on purpose.
+    local input
+    input=$(mktemp "$MESH_DIR/mesh-import.XXXXXX") || _die "import: cannot create a temp file"
+    # shellcheck disable=SC2064
+    trap "rm -f '$input' '$input.sql'" EXIT
+    if [[ -n "$file" ]]; then
+        [[ -r "$file" ]] || _fail 3 "import: cannot read '$file'"
+        cat "$file" > "$input"
+    else
+        cat > "$input"
+    fi
+
+    local bad
+    bad=$(jq -R 'select(length > 0) | try (fromjson | empty) catch "x"' "$input" 2>/dev/null | head -1)
+    [[ -z "$bad" ]] || _die "import: input is not newline-delimited JSON"
+
+    local ver
+    ver=$(jq -r 'select(.type=="meta") | .version' "$input" 2>/dev/null | head -1)
+    if [[ -n "$ver" && "$ver" != "1" ]]; then
+        _die "import: export version $ver is newer than this build understands (1)"
+    fi
+
+    # The content address is checked before anything is written. A mismatch means
+    # the file was edited or the two sides disagree on how a message is hashed,
+    # and importing the rest anyway is how one message ends up with two
+    # identities in a mailbox whose whole dedup story rests on that hash.
+    local want pre got n=0
+    while IFS= read -r -d '' want && IFS= read -r -d '' pre; do
+        got=$(printf '%s' "$pre" | _sha256)
+        if [[ "$got" != "$want" ]]; then
+            _die "import: content address does not match its content (record claims $want, computed $got)"
+        fi
+        n=$((n + 1))
+    done < <(jq -j "$(_import_preimage_jq)" "$input")
+
+    # Rendered to a file rather than piped straight into sqlite3. Piped, jq's
+    # exit status is lost inside the group, so a record with a non-numeric
+    # `hops` killed jq mid-stream, sqlite3 read a transaction that never reached
+    # COMMIT and rolled back, and import still exited 0 reporting every message
+    # as already present. Those three fields are outside the content address, so
+    # nothing earlier catches them.
+    local stmts="$input.sql"
+    jq -r "$(_import_sql_jq)" "$input" > "$stmts" \
+        || _die "import: a record is malformed (hops, expect_reply and created_at must be numbers)"
+
+    local ch0 th0 msg0 ch1 th1 msg1
+    ch0=$(sql "SELECT COUNT(*) FROM channels;")
+    th0=$(sql "SELECT COUNT(*) FROM threads;")
+    msg0=$(sql "SELECT COUNT(*) FROM messages;")
+
+    { printf 'PRAGMA foreign_keys=ON;\nBEGIN IMMEDIATE;\n'
+      cat "$stmts"
+      printf 'COMMIT;\n'
+    } | sqlite3 "$DB" || _die "import: the database refused the records"
+
+    ch1=$(sql "SELECT COUNT(*) FROM channels;")
+    th1=$(sql "SELECT COUNT(*) FROM threads;")
+    msg1=$(sql "SELECT COUNT(*) FROM messages;")
+
+    local added=$((msg1 - msg0))
+    _update_status
+    _result "$(printf 'imported %s of %s messages, %s already present (%s channels, %s threads)' \
+                "$added" "$n" "$((n - added))" "$((ch1 - ch0))" "$((th1 - th0))")" \
+        messages "$added" duplicates "$((n - added))" \
+        channels "$((ch1 - ch0))" threads "$((th1 - th0))"
+}
+
 # ── completion ───────────────────────────────────────────────────────
 
 cmd_completion() {
@@ -3048,8 +3256,13 @@ EOF
     # what retires the mail; an empty DM channel then has nobody left to read it
     # and cascades its messages, threads and delivery rows away with it.
     sql "DELETE FROM channel_members WHERE session_id NOT IN (SELECT session_id FROM agents);"
+    # Exactly one member, not fewer than two. A DM with one member left is a
+    # conversation whose other side is gone and whose mail can never be read. A
+    # DM with *no* members is imported history: nobody here is in it, so there
+    # is nothing to retire, and dropping it would cascade away the messages
+    # `import` was run to bring in.
     sql "DELETE FROM channels WHERE kind='dm'
-          AND (SELECT COUNT(*) FROM channel_members cm WHERE cm.channel_id=channels.id) < 2;"
+          AND (SELECT COUNT(*) FROM channel_members cm WHERE cm.channel_id=channels.id) = 1;"
     sql "DELETE FROM threads WHERE id NOT IN (SELECT DISTINCT thread_id FROM messages);"
     _update_status
     if [[ "$MESH_JSON" -eq 1 ]]; then
@@ -3493,6 +3706,8 @@ case "${1:-}" in
     channel)        shift; cmd_channel "$@" ;;
     dm)             shift; cmd_dm "$@" ;;
     search)         shift; cmd_search "$@" ;;
+    export)         shift; cmd_export "$@" ;;
+    import)         shift; cmd_import "$@" ;;
     dispatch)       shift; cmd_dispatch "$@" ;;
     claim-dispatch) shift; cmd_claim_dispatch "$@" ;;
     menu)           shift; cmd_menu "$@" ;;
@@ -3559,6 +3774,11 @@ Messaging
   channel archive <name>
   dm <ref>                          find or create a DM channel
   search <query> [--channel <name>] [--from <ref>] [--since <iso>] [--limit <n>]
+
+Sync
+  export [--since <iso|epoch>] [--channel <name>]
+                                    NDJSON of channels, threads and messages
+  import [<file>]                   INSERT OR IGNORE by content address
 
 Spawning
   dispatch --task <t> [--harness <h>] [--alias <a>] [--worktree <branch>]

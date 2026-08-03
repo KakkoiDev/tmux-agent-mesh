@@ -8,7 +8,8 @@ dependencies, not preference.
 Running: peer messaging on the channel model, delivery into a working agent's
 turn for Claude, Codex and Gemini, idle wake for Pi, `dispatch`, the four brakes,
 the untrusted-peer envelope, the tmux menu and status bar, content-addressed
-message ids, and `--json` with a structured exit-code table. 382 bash tests.
+message ids, `--json` with a structured exit-code table, and `export`/`import`
+sync between machines. 403 bash tests.
 
 Wired: the Go store runs on the same schema as bash, generated from
 `internal/store/schema.sql`, with interop tests that open one `mesh.db` from both
@@ -32,11 +33,16 @@ mesh <command>        the client the hooks and the TUI both call
 ssh with `ControlMaster` for the remote transport: no port, no tokens, credentials
 already exist, and a hook costs roughly 20ms rather than a full handshake.
 
-2026-08-03: the schema fix this step was gated on has landed. `messages` is on
-the channel model, delivery and reads are append-only rows, every message carries
-a content address, and `max-thread-msgs` is gone (see ARCHITECTURE.md). The
-server itself is deferred: `mesh export` / `mesh import` over ssh reaches two
-machines without a resident process.
+2026-08-03: **deferred, and the reason it was gated on is gone.** The schema fix
+landed (`messages` is on the channel model, delivery and reads are append-only
+rows, every message carries a content address, `max-thread-msgs` is gone), and
+`mesh export` / `mesh import` over ssh now reaches two machines without a
+resident process, so the NFS/SSHFS corruption argument no longer forces a daemon.
+
+What remains genuinely blocked on a server is *enforcement*: while agents run as
+your uid and can open `mesh.db` directly, a private channel is advisory. That is
+step 5's problem, not a transport problem, so this step waits until private
+channels have to be real.
 
 ## 2. Client, hook rewiring, budget ledger
 
@@ -120,7 +126,7 @@ it once and it misdirects everyone who consults it.
 A thread retains who said what, when, and what was decided. That is strictly more
 than a vector store of chunks, which keeps similarity and throws provenance away.
 Worth designing deliberately: thread summaries, search, and "what did we decide
-about X". Blocked on removing the message cap first.
+about X". The message cap that blocked this is gone.
 
 ### Worktrees stay visible
 
@@ -167,5 +173,8 @@ represent a peer that is not local. A `host` column, defaulting to empty for
 local, is what makes a genuinely distributed roster possible without reshaping
 every row later. `tk_identity_list` already reserves the field for this reason.
 
-Neither is worth building until the message cap comes off and there is a second
-machine in play.
+2026-08-03: the first has landed. The second is now the open one: `import`
+carries no memberships and no agents precisely because there is nowhere to say
+which machine a session belongs to, so imported mail is history rather than
+something an agent can be a recipient of. `agents.host` exists in the schema and
+nothing writes it.

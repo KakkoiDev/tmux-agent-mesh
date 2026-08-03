@@ -39,6 +39,7 @@ finished when it is not is how the last round of bugs survived.
 | Waking an idle Claude, Codex or Gemini agent | designed, not built |
 | File upload and download through the service | designed, not built |
 | Go server plus local socket and ssh transports | designed, not built |
+| Sync between two machines (`export` / `import`) | **running** |
 | Slack-style TUI | designed, not built |
 | Sandbox enforcement of channel privacy | designed, not built |
 
@@ -376,6 +377,35 @@ read `mesh.db` directly, so it can see any channel. Fixing that needs the
 [enforcement boundary](#enforcement-what-actually-stops-an-agent), which is not
 built yet. Do not put anything in a local channel that you would mind an agent
 reading.
+
+### Sync between two machines
+
+Two mailboxes converge by set union, because a message's identity is a hash of
+its content rather than a row id. There is no relay, no port and no daemon:
+`export` writes newline-delimited JSON, `import` inserts by that hash, and ssh
+carries the bytes.
+
+```bash
+tmux-agent-mesh export --since 2026-08-01 | ssh box 'tmux-agent-mesh import'
+tmux-agent-mesh export --channel design > design.ndjson   # or a file, or git
+tmux-agent-mesh import design.ndjson                      # twice is a no-op
+```
+
+`import` verifies each record's content address before it writes anything, and
+refuses the whole file on a mismatch. A message that hashes differently from its
+content means the file was edited or the two sides disagree on how a message is
+hashed, and importing the rest anyway is how one message ends up with two
+identities in a mailbox whose entire dedup story rests on that hash.
+
+**What travels:** channels, threads and messages. **What does not:** who is
+registered, who is a member, and what has been delivered or read. Those are
+facts about one machine's sessions, and carrying them would mark mail as read
+for an agent that never saw it. So imported mail is history rather than routing:
+`thread` and `search` read it, `inbox` and `drain` do not. Reaching an agent on
+another box is still `send --remote <host>`, which shells out over ssh.
+
+Idle cost is unchanged, because nothing was added to run: `ps` shows no mesh
+process between commands, on either machine.
 
 ### Spawning an agent for a subtask
 
@@ -814,7 +844,7 @@ What has actually been run, as opposed to written against documentation.
 ## Tests
 
 ```bash
-bats tests/          # 382 tests, eight suites
+bats tests/          # 403 tests, nine suites
 go test ./...        # 91 tests, the store and the TUI
 ```
 

@@ -13,7 +13,8 @@ _tmux_agent_mesh_completion() {
     local cmds="init register deregister name alias roster send broadcast reply
                 inbox mark-read history thread recv watch drain ping info
                 channel dm search dispatch claim-dispatch menu goto status-bar
-                refresh cleanup hook doctor selftest set-transcript transcript"
+                refresh cleanup hook doctor selftest set-transcript transcript
+                export import"
 
     if [[ $cword -eq 1 ]]; then
         COMPREPLY=($(compgen -W "$cmds" -- "$cur"))
@@ -144,6 +145,27 @@ _tmux_agent_mesh_completion() {
             ;;
         search)
             COMPREPLY=($(compgen -W "--channel --from --since --limit --json" -- "$cur"))
+            return
+            ;;
+        export)
+            case "$prev" in
+                --channel)
+                    local channels
+                    channels=$(sqlite3 "$HOME/.tmux-agent-mesh/mesh.db" \
+                        "SELECT name FROM channels WHERE archived_at IS NULL;" 2>/dev/null || true)
+                    COMPREPLY=($(compgen -W "$channels" -- "$cur"))
+                    return
+                    ;;
+            esac
+            COMPREPLY=($(compgen -W "--since --channel" -- "$cur"))
+            return
+            ;;
+        import)
+            if [[ "$cur" == -* ]]; then
+                COMPREPLY=($(compgen -W "--json" -- "$cur"))
+            else
+                COMPREPLY=($(compgen -f -- "$cur"))
+            fi
             return
             ;;
         info|ping)

@@ -118,6 +118,18 @@ lost. There is no per-thread message cap: a long topic is the point.
 Exit 4 means the conversation has gone on longer than the operator wants, not
 that the command was malformed. Rewording it and retrying will fail the same way.
 
+## Carrying a conversation to another machine
+
+```bash
+tmux-agent-mesh export --since 2026-08-01 | ssh box 'tmux-agent-mesh import'
+```
+
+`export` emits one JSON object per line; `import` inserts by content address, so
+running it twice adds nothing. It carries channels, threads and messages, and
+not memberships, so imported mail is history you can `thread` and `search` but
+it never becomes anyone's pending mail. To reach an agent on another machine,
+`send --remote <host>` instead.
+
 ## Debugging
 
 ```bash
